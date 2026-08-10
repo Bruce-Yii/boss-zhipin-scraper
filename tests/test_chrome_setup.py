@@ -893,6 +893,83 @@ class ChromeSetupTests(unittest.TestCase):
 
     REQUIRED_JOB_FIELDS = ["job_id", "title", "location", "job_link", "company_name"]
 
+    def test_flush_jobs_emits_job_count(self):
+        """规格 meta 必填 job_count（现有 total 保留兼容）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            module.flush_jobs(target, {"keyword": "AI"}, [{"job_id": "a"}])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["job_count"], 1)
+            self.assertEqual(data["total"], 1, "total 保留向后兼容")
+
+    # ----- 单进程互斥（规格 §3.6 代码强制）-----
+
+    def test_scrape_lock_acquire_and_release(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock):
+                self.assertTrue(module.acquire_scrape_lock(), "无锁应可获取")
+                self.assertTrue(os.path.exists(lock), "应创建锁文件")
+                module.release_scrape_lock()
+                self.assertFalse(os.path.exists(lock), "释放后锁文件删除")
+
+    def test_scrape_lock_rejects_when_other_process_holds(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True) as running:
+                self.assertTrue(module.acquire_scrape_lock())
+                self.assertFalse(module.acquire_scrape_lock(),
+                                 "其他存活进程持锁时应拒绝")
+                running.assert_called()
+
+    def test_scrape_lock_takes_over_stale_lock(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with open(lock, "w", encoding="utf-8") as f:
+                f.write("99999")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=False):
+                self.assertTrue(module.acquire_scrape_lock(),
+                                "持锁进程已死应接管")
+                with open(lock, encoding="utf-8") as f:
+                    self.assertNotEqual(f.read().strip(), "99999")
+
+    def test_scrape_lock_release_keeps_other_lock(self):
+        """只释放自己的锁：锁内容不是本进程 pid 时不删除。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock):
+                with open(lock, "w", encoding="utf-8") as f:
+                    f.write("88888")
+                module.release_scrape_lock()
+                self.assertTrue(os.path.exists(lock), "他人锁不应被删")
+
+    def test_scrape_list_aborts_when_lock_held(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "acquire_scrape_lock",
+                                      return_value=False), \
+                    mock.patch.object(module, "resolve_city",
+                                      return_value=("上海", "101020100")), \
+                    mock.patch("sys.stdout",
+                               new_callable=__import__("io").StringIO) as out:
+                result = module.scrape_list("AI", "上海", 1, {}, None)
+            self.assertIn("EXPORT_FAIL reason=lock_held", out.getvalue())
+            self.assertEqual(result["jobs"], [])
+
     def test_flush_jobs_emits_contract_meta(self):
         module = load_module()
         with tempfile_profile() as paths:

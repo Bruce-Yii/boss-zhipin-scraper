@@ -70,6 +70,7 @@ DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保�
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 FORMAT_VERSION = 1              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；契约变更时递增）
+SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -1366,8 +1367,68 @@ def flush_jobs(path, meta, jobs):
     merged = merge_unique(existing_jobs, jobs)
     meta["format_version"] = FORMAT_VERSION
     meta["total"] = len(merged)
+    meta["job_count"] = len(merged)
     meta["jobs"] = [_sanitize_job(j) for j in merged]
     _atomic_write_json(path, meta)
+
+
+# ============================================================
+# 单进程互斥（规格 §3.6：防止多任务并发启动超频/竞争 Chrome）
+# ============================================================
+def _pid_is_running(pid):
+    """检查 pid 对应进程是否存活（跨平台）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        if platform.system() == "Windows":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, timeout=5)
+            return bool(r.stdout.strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def acquire_scrape_lock():
+    """获取单进程互斥锁；锁被存活进程持有时返回 False。
+
+    锁文件内容为持有者 pid；持有者已死（进程崩溃遗留）则接管。
+    """
+    try:
+        os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
+        if os.path.exists(SCRAPE_LOCK_PATH):
+            try:
+                with open(SCRAPE_LOCK_PATH, "r", encoding="utf-8") as f:
+                    holder = f.read().strip()
+            except (OSError, UnicodeDecodeError):
+                holder = ""
+            if holder and _pid_is_running(holder):
+                return False
+        with open(SCRAPE_LOCK_PATH, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        return True
+    except OSError:
+        return False
+
+
+def release_scrape_lock():
+    """释放单进程互斥锁；只释放自己的锁（他人锁不删）。"""
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return
+        with open(SCRAPE_LOCK_PATH, "r", encoding="utf-8") as f:
+            holder = f.read().strip()
+        if holder == str(os.getpid()):
+            os.remove(SCRAPE_LOCK_PATH)
+    except OSError:
+        pass
 
 
 # ============================================================
@@ -1563,6 +1624,11 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 max_jobs=None):
     city_name, city_code = resolve_city(city_input)
+    # 单进程互斥（规格 §3.6）：已有抓取任务运行时拒绝启动，防超频/竞争 Chrome
+    if not acquire_scrape_lock():
+        print("❌ 已有抓取任务在运行（单进程互斥），本次拒绝启动。")
+        print(f"EXPORT_FAIL reason=lock_held city={city_name} keyword={keyword}")
+        return {"keyword": keyword, "city": city_name, "total": 0, "jobs": []}
     cdp = CDPSession(cdp_port)
     all_jobs = []
     seen = set()
@@ -1764,6 +1830,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     finally:
         cdp.send("Target.closeTarget", {"targetId": tid})
         cdp.close()
+        release_scrape_lock()
 
     print(f"\n{'='*60}")
     print(f"完成: {len(all_jobs)} 条")
