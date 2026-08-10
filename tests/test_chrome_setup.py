@@ -1539,15 +1539,16 @@ class ChromeSetupTests(unittest.TestCase):
     def test_fetch_boss_json_rejects_nonzero_business_code(self):
         """HTTP 200 下的 code: 35 不能静默当作空城市表。"""
         module = load_module()
-        response = mock.MagicMock()
-        response.read.return_value = json.dumps({
+        fake_requests = mock.Mock()
+        resp = mock.Mock()
+        resp.json.return_value = {
             "code": 35,
             "message": "您的IP地址存在异常行为.",
             "zpData": {},
-        }).encode("utf-8")
-        response.__enter__.return_value = response
+        }
+        fake_requests.get.return_value = resp
 
-        with mock.patch.object(module, "urlopen", return_value=response):
+        with mock.patch.object(module, "requests", fake_requests):
             with self.assertRaisesRegex(module.CityAPIResponseError,
                                         "code=35"):
                 module.fetch_boss_json(module.HOT_CITY_URL)

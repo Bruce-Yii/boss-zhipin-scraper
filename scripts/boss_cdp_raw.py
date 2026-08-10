@@ -45,7 +45,6 @@ from datetime import datetime
 from collections import Counter
 from enum import Enum
 from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
-from urllib.request import Request, urlopen
 
 websocket = None
 requests = None
@@ -806,9 +805,9 @@ class CityResolutionError(ValueError):
 
 
 def fetch_boss_json(url, timeout=10):
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
 
     if not isinstance(data, dict):
         raise CityAPIResponseError(f"BOSS 城市接口返回非对象响应: {url}")
@@ -3584,8 +3583,10 @@ def main():
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
 
-    # --list-cities 模式（无需 Chrome/网络依赖，本地静态码表兜底）
+    # --list-cities 模式（无需 Chrome/CDP，仅需 requests 拉取在线码表；拉取失败回退本地静态码表）
     if args.list_cities is not None:
+        if not require_runtime_dependencies("requests"):
+            sys.exit(1)
         list_cities(keyword=args.list_cities or None)
         sys.exit(0)
 
