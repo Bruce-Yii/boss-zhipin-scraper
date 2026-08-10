@@ -63,6 +63,7 @@ CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 MAX_PAGES = 10          # 单次最大页数
 MAX_API_REQUESTS = 500  # 单次最大 API 请求数
 API_ATTEMPT_LIMIT = 3   # 列表 API 单页最大尝试次数（凭证自愈重试）
+MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -1803,7 +1804,16 @@ def scrape_details(list_data, max_details=None, output_path=None,
         output_path = default_output_path("details")
 
     print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
+    # 断点续抓：先加载已有结果文件，避免"跳过已抓 + 全量覆盖"把旧数据冲掉
     results = []
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                results = data
+        except (json.JSONDecodeError, OSError, ValueError):
+            log.warning(f"加载已有详情文件失败，从空开始: {output_path}")
     seen_links = set()
     # 历史 job_id 预加载：已抓过的详情直接跳过（省请求、降风控触发概率）
     existing_ids = load_existing_detail_ids(output_path)
@@ -1813,6 +1823,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
     pending = set(pending_ids) if pending_ids is not None else load_pending_ids(output_path)
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
+
+    consecutive_cdp_errors = 0
 
     for idx, job in enumerate(jobs):
         link = job.get("job_link", "")
@@ -1839,8 +1851,29 @@ def scrape_details(list_data, max_details=None, output_path=None,
         incr_request()
 
         # 每个详情页用新 session 避免检测；自动化 target 默认后台创建。
-        ws = CDPSession(cdp_port)
-        tid, sid = create_page_session(ws)
+        # 会话建立失败视为单条失败：记录 pending 继续；连续失败熔断停止。
+        ws = None
+        try:
+            ws = CDPSession(cdp_port)
+            tid, sid = create_page_session(ws)
+        except _cdp_exception_types() as exc:
+            consecutive_cdp_errors += 1
+            print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {exc}")
+            if job_id:
+                pending.add(job_id)
+                save_pending_ids(output_path, pending)
+            if ws is not None:
+                try:
+                    ws.close()
+                except _cdp_exception_types():
+                    log.debug("关闭失败会话连接出错", exc_info=True)
+            if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
+                print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
+                print("   可运行 --stop-chrome 后重新 --setup-chrome 再继续（已抓数据保留，剩余自动重试）。")
+                break
+            continue
+        else:
+            consecutive_cdp_errors = 0
 
         detail_url = build_detail_url(job)
         ws.send("Page.navigate", {"url": detail_url}, sid)

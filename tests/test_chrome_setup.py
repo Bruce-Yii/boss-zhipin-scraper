@@ -335,6 +335,38 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertFalse(os.path.exists(module.pending_path_for(out)),
                              "空集合时应删除 pending 文件")
 
+    # ----- 详情会话失败防护 -----
+
+    def _sample_jobs(self, n=3):
+        return {"jobs": [
+            {"job_id": f"job-{i}", "title": f"t{i}", "job_link": f"https://x/{i}"}
+            for i in range(n)
+        ]}
+
+    def test_scrape_details_records_pending_and_continues_on_session_failure(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "CDPSession",
+                                   side_effect=TimeoutError("cdp down")), \
+                    mock.patch.object(module.time, "sleep"):
+                results = module.scrape_details(self._sample_jobs(2), output_path=out)
+            self.assertEqual(results, [], "单条会话失败不应崩溃，应跳过并记录")
+            self.assertEqual(module.load_pending_ids(out), {"job-0", "job-1"})
+
+    def test_scrape_details_breaks_after_consecutive_session_failures(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "CDPSession",
+                                   side_effect=TimeoutError("cdp down")), \
+                    mock.patch.object(module.time, "sleep"):
+                # 5 个 job、阈值 3 → 连续 3 次失败后熔断停止
+                results = module.scrape_details(self._sample_jobs(5), output_path=out)
+            self.assertEqual(results, [])
+            self.assertEqual(len(module.load_pending_ids(out)), 3,
+                             "熔断后不应继续尝试剩余 job")
+
     def test_wait_for_login_explicitly_uses_foreground_target(self):
         module = load_module()
         cdp = mock.Mock()
