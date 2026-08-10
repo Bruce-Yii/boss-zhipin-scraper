@@ -2257,6 +2257,21 @@ class ChromeSetupTests(unittest.TestCase):
 
             self.assertEqual(module.find_latest_detail_file(str(result_dir)), str(newer))
 
+    def test_find_latest_detail_file_ignores_pending_files(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            result_dir = paths["cdp_profile"] / "job-result"
+            result_dir.mkdir(parents=True)
+            detail = result_dir / "boss_details_20260612_1100.json"
+            pending = result_dir / "boss_details_20260612_1100.json.pending.json"
+            detail.write_text("[]", encoding="utf-8")
+            pending.write_text("[]", encoding="utf-8")
+            os.utime(pending, (3000, 3000))
+            os.utime(detail, (2000, 2000))
+
+            self.assertEqual(module.find_latest_detail_file(str(result_dir)), str(detail),
+                             "pending 是活动文件，不应被当作最新详情")
+
     def test_existing_detail_loader_prefers_sibling_detail_file(self):
         module = load_module()
         with tempfile_profile() as paths:

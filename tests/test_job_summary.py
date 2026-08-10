@@ -186,14 +186,39 @@ class JobSummaryTests(unittest.TestCase):
                 ),
             },
         ]
-
-        summary = module.build_summary([], details, search_keyword="Python")
+        summary = module.build_summary([], details, search_keyword="Go AI")
         terms = {term for term, _ in summary["jd_terms"]}
 
-        # 真实技能应保留
+        self.assertNotIn("职位描述", terms)
+        self.assertNotIn("安全提示", terms)
+        self.assertNotIn("工商信息", terms)
+        self.assertNotIn("上海", terms)
         self.assertIn("Python", terms)
         self.assertIn("LLM", terms)
         self.assertIn("RAG", terms)
+
+    def test_jd_function_words_are_filtered_as_noise(self):
+        """JD 动态高频词中的纯功能词（需要/落地/具备等）不应冒充技能词。
+
+        回归:真实数据（上海 AI 209 条）JD 高频词混入「需要(12)/落地(11)」等
+        非技能词，稀释了摘要的技术含量。产品/设计等岗位方向词保留（有信息量）。
+        """
+        module = load_summary_module()
+        # 英文/标点打断让「需要/落地/具备/负责/产品/设计」成为独立 2 字块
+        # （与真实 JD 中 AI 产品 等英文打断后的切片一致）
+        details = [
+            {"skill_tags": [], "jd": "需要 X，落地 Y，具备 Z，负责 AI 产品，设计 AI"},
+            {"skill_tags": [], "jd": "需要 M，落地 N，具备 W，负责 AI 产品，设计 AI"},
+        ]
+        summary = module.build_summary([], details, search_keyword="")
+        terms = {term for term, _ in summary["jd_terms"]}
+
+        self.assertNotIn("需要", terms)
+        self.assertNotIn("落地", terms)
+        self.assertNotIn("具备", terms)
+        self.assertNotIn("负责", terms)
+        self.assertIn("产品", terms, "岗位方向词应保留")
+        self.assertIn("设计", terms)
         # 页面噪音应被全部过滤
         for noise in ("职位描述", "安全提示", "直聘严禁用人", "工商信息",
                       "公司名称", "法定代表人", "注册资金", "精选职位",
@@ -251,6 +276,8 @@ class JobSummaryTests(unittest.TestCase):
             "total_jobs": 3,
             "total_details": 2,
             "salary_ranges": [("30-60K", 2)],
+            "salary_market": {"parsed": 3, "unparsed": 0, "median_k": 30,
+                              "mean_k": 35, "low_k": 20, "high_k": 60},
             "experience": [("3-5年", 2)],
             "degrees": [("本科", 2)],
             "districts": [("浦东新区", 2)],
@@ -264,9 +291,32 @@ class JobSummaryTests(unittest.TestCase):
         self.assertIn("岗位市场摘要", prompt)
         self.assertIn("Python", prompt)
         self.assertIn("RAG", prompt)
+        self.assertNotIn("LLM", prompt, "JD 高频词是语义弱替代，应交给 agent 读完整 JD")
         self.assertIn("不要虚构经历", prompt)
         self.assertNotIn("匹配分", prompt)
         self.assertNotIn("分数", prompt)
+
+    def test_build_prompt_mentions_full_data_files_for_agent(self):
+        module = load_summary_module()
+        summary = {
+            "keyword": "AI Agent", "city": "上海",
+            "total_jobs": 3, "total_details": 2,
+            "salary_ranges": [], "salary_market": {"parsed": 0, "unparsed": 3},
+            "experience": [], "degrees": [], "districts": [],
+            "companies": [], "skill_tags": [], "jd_terms": [],
+        }
+
+        prompt = module.build_prompt(
+            summary,
+            jobs_path=r"C:\x\boss_jobs_ai.json",
+            details_path=r"C:\x\boss_details_ai.json",
+        )
+        self.assertIn("boss_jobs_ai.json", prompt)
+        self.assertIn("boss_details_ai.json", prompt)
+        self.assertIn("完整", prompt)
+
+        bare = module.build_prompt(summary)
+        self.assertNotIn("数据文件", bare, "无路径时不应出现数据文件行")
 
     def test_summary_script_is_documented_and_packaged(self):
         readme = (ROOT_PATH / "README.md").read_text(encoding="utf-8")
@@ -279,6 +329,78 @@ class JobSummaryTests(unittest.TestCase):
             self.assertIn("提示词", document)
         self.assertIn("cp boss-zhipin-scraper/scripts/job_summary.py", skill)
         self.assertIn('boss-summary = "scripts.job_summary:main"', pyproject)
+
+
+    def test_parse_salary_monthly_supports_k_and_daily_formats(self):
+        module = load_summary_module()
+        self.assertEqual(module.parse_salary_monthly("30-60K"), (30, 60))
+        self.assertEqual(module.parse_salary_monthly("20-40K·15薪"), (20, 40))
+        self.assertEqual(module.parse_salary_monthly("25-45K·13薪"), (25, 45))
+        self.assertIsNone(module.parse_salary_monthly("未标注"))
+        self.assertIsNone(module.parse_salary_monthly("面议"))
+        self.assertIsNone(module.parse_salary_monthly(""))
+        self.assertEqual(module.parse_salary_monthly("350-500元/天"), (7.7, 11.0),
+                         "日薪按 22 工作日折算为月薪")
+
+    def test_salary_stats_computes_market_rates(self):
+        module = load_summary_module()
+        jobs = [
+            {"salary": "30-60K"},     # mid 45
+            {"salary": "20-40K·15薪"}, # mid 30
+            {"salary": "10-20K"},     # mid 15
+            {"salary": "未标注"},      # unparsed
+        ]
+        stats = module.salary_stats(jobs)
+        self.assertEqual(stats["parsed"], 3)
+        self.assertEqual(stats["unparsed"], 1)
+        self.assertEqual(stats["median_k"], 30, "中位月薪 30K")
+        self.assertEqual(stats["mean_k"], 30, "均值 (45+30+15)/3 = 30")
+        self.assertEqual(stats["low_k"], 10)
+        self.assertEqual(stats["high_k"], 60)
+
+    def test_salary_stats_handles_all_unparsed(self):
+        module = load_summary_module()
+        stats = module.salary_stats([{"salary": "未标注"}, {"salary": ""}])
+        self.assertEqual(stats["parsed"], 0)
+        self.assertEqual(stats["unparsed"], 2)
+        self.assertIsNone(stats["median_k"])
+
+    def test_build_summary_adds_market_and_company_dimensions(self):
+        module = load_summary_module()
+        jobs = [
+            {"job_id": "a", "title": "T", "salary": "30-60K",
+             "boss_name": "甲公司", "company_scale": "1000-9999人",
+             "company_stage": "已上市"},
+            {"job_id": "b", "title": "T", "salary": "20-40K",
+             "boss_name": "乙公司", "company_scale": "100-499人",
+             "company_stage": "B轮"},
+            {"job_id": "c", "title": "T", "salary": "20-40K",
+             "boss_name": "丙公司", "company_scale": "100-499人",
+             "company_stage": "B轮"},
+        ]
+        summary = module.build_summary(jobs, search_keyword="AI", top=5)
+        self.assertEqual(summary["salary_market"]["median_k"], 30, "中位 (30,30,45)")
+        self.assertEqual(summary["salary_market"]["mean_k"], 35, "均值 (45+30+30)/3")
+        self.assertEqual(summary["salary_market"]["parsed"], 3)
+        self.assertIn(("100-499人", 2), summary["company_scales"])
+        self.assertIn(("已上市", 1), summary["company_stages"])
+        self.assertIn(("B轮", 2), summary["company_stages"])
+
+    def test_format_summary_includes_market_and_company_lines(self):
+        module = load_summary_module()
+        jobs = [
+            {"title": "T", "salary": "30-60K", "boss_name": "甲公司",
+             "company_scale": "1000-9999人", "company_stage": "已上市"},
+        ]
+        summary = module.build_summary(jobs, search_keyword="AI", city="上海", top=3)
+        text = module.format_summary(summary)
+        self.assertIn("薪资行情", text)
+        self.assertIn("中位", text)
+        self.assertIn("30", text)
+        self.assertIn("公司规模", text)
+        self.assertIn("1000-9999人", text)
+        self.assertIn("融资阶段", text)
+        self.assertIn("已上市", text)
 
 
 if __name__ == "__main__":

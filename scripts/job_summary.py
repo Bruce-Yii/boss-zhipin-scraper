@@ -92,6 +92,65 @@ def _most_common(counter, top):
     return counter.most_common(max(top, 1))
 
 
+_SALARY_K_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*K", re.IGNORECASE)
+_SALARY_DAY_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*元/天")
+
+
+def parse_salary_monthly(salary):
+    """把薪资字符串解析为月薪范围（千元）；无法解析返回 None。
+
+    支持 "20-40K" / "20-40K·15薪"（K 后缀月薪）与 "350-500元/天"
+    （按 22 个工作日折算月薪千元）。
+    """
+    text = str(salary or "").strip()
+    if not text:
+        return None
+    m = _SALARY_K_RE.search(text)
+    if m:
+        return float(m.group(1)), float(m.group(2))
+    m = _SALARY_DAY_RE.search(text)
+    if m:
+        return round(float(m.group(1)) * 22 / 1000, 1), round(float(m.group(2)) * 22 / 1000, 1)
+    return None
+
+
+def salary_stats(jobs):
+    """汇总岗位薪资行情：中位/均值/区间（月薪千元）与解析覆盖率。
+
+    Returns:
+        dict: {"parsed", "unparsed", "median_k", "mean_k", "low_k", "high_k"}；
+            无任何可解析样本时 median/mean/low/high 为 None
+    """
+    mids = []
+    lows = []
+    highs = []
+    unparsed = 0
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        parsed = parse_salary_monthly(job.get("salary"))
+        if parsed is None:
+            unparsed += 1
+            continue
+        low, high = parsed
+        mids.append((low + high) / 2)
+        lows.append(low)
+        highs.append(high)
+
+    if not mids:
+        return {"parsed": 0, "unparsed": unparsed,
+                "median_k": None, "mean_k": None, "low_k": None, "high_k": None}
+    ordered = sorted(mids)
+    return {
+        "parsed": len(mids),
+        "unparsed": unparsed,
+        "median_k": ordered[len(ordered) // 2],
+        "mean_k": round(sum(mids) / len(mids), 1),
+        "low_k": min(lows),
+        "high_k": max(highs),
+    }
+
+
 def filter_details_for_jobs(jobs, details):
     job_ids = {
         str(job.get("job_id")).strip()
@@ -141,6 +200,10 @@ JD_NOISE_TERMS = {
     # 常见地名/泛词（不是技能）
     "上海", "北京", "深圳", "杭州", "广州", "成都", "南京", "苏州",
     "工程师", "开发工程师", "研发工程师",
+    # JD 动态高频词里的纯功能词（动词/虚词/套话，不是技能）
+    "需要", "落地", "具备", "能够", "包括", "以及", "根据", "进行",
+    "提供", "负责", "熟悉", "了解", "掌握", "完成", "参与", "协助",
+    "保证", "确保", "结合", "不断", "持续", "推动", "跟进", "配合",
 }
 JD_NOISE_TERMS_EN = {"BOSS", "boss", "PDD", "https", "http", "www", "com", "cn"}
 
@@ -164,6 +227,8 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
     degrees = Counter()
     districts = Counter()
     companies = Counter()
+    company_scales = Counter()
+    company_stages = Counter()
     skill_tags = Counter()
     jd_terms = Counter()
 
@@ -181,6 +246,14 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         company = str(job.get("boss_name") or job.get("company") or "").strip()
         if company:
             companies[company] += 1
+
+        scale = str(job.get("company_scale") or "").strip()
+        if scale:
+            company_scales[scale] += 1
+
+        stage = str(job.get("company_stage") or "").strip()
+        if stage:
+            company_stages[stage] += 1
 
         for tag in split_tags(job.get("tags", "")):
             if is_experience_tag(tag):
@@ -233,10 +306,13 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         "total_jobs": len([job for job in jobs if isinstance(job, dict)]),
         "total_details": len([detail for detail in details if isinstance(detail, dict)]),
         "salary_ranges": _most_common(salary_ranges, top),
+        "salary_market": salary_stats(jobs),
         "experience": _most_common(experience, top),
         "degrees": _most_common(degrees, top),
         "districts": _most_common(districts, top),
         "companies": _most_common(companies, top),
+        "company_scales": _most_common(company_scales, top),
+        "company_stages": _most_common(company_stages, top),
         "skill_tags": _most_common(skill_tags, top),
         "jd_terms": _most_common(jd_terms, top),
     }
@@ -248,6 +324,15 @@ def _format_items(items, empty="暂无"):
     return "、".join(f"{name}({count})" for name, count in items)
 
 
+def _salary_market_line(summary):
+    market = summary.get("salary_market") or {}
+    if not market.get("parsed"):
+        return f"薪资行情: 无法解析（未标注 {market.get('unparsed', 0)} 条）"
+    return (f"薪资行情: {market['parsed']} 条可解析，中位 {market['median_k']}K，"
+            f"均值 {market['mean_k']}K，区间 {market['low_k']}-{market['high_k']}K"
+            f"（未标注 {market.get('unparsed', 0)} 条）")
+
+
 def format_summary(summary):
     title_parts = [summary.get("keyword") or "岗位", summary.get("city") or ""]
     title = " @ ".join(part for part in title_parts if part)
@@ -256,10 +341,13 @@ def format_summary(summary):
         f"列表岗位: {summary['total_jobs']} 条；详情 JD: {summary['total_details']} 条",
         "",
         f"薪资区间: {_format_items(summary['salary_ranges'])}",
+        _salary_market_line(summary),
         f"经验要求: {_format_items(summary['experience'])}",
         f"学历要求: {_format_items(summary['degrees'])}",
         f"地区分布: {_format_items(summary['districts'])}",
         f"高频公司: {_format_items(summary['companies'])}",
+        f"公司规模: {_format_items(summary.get('company_scales'))}",
+        f"融资阶段: {_format_items(summary.get('company_stages'))}",
         f"技能标签: {_format_items(summary['skill_tags'])}",
         f"JD 高频词: {_format_items(summary['jd_terms'])}",
     ]
@@ -281,32 +369,38 @@ def _dedupe(items):
     return result
 
 
-def build_prompt(summary):
-    skill_context = _dedupe(
-        _names(summary.get("skill_tags", []), 12)
-        + _names(summary.get("jd_terms", []), 12)
-    )
+def build_prompt(summary, jobs_path=None, details_path=None):
+    # 语义提炼（技能/能力/画像）交给 agent 从完整 JD 中灵活分析；
+    # 脚本只提供可靠的聚合统计（数字类）与结构化技能标签。
+    skill_context = _dedupe(_names(summary.get("skill_tags", []), 12))
     salary_context = _format_items(summary.get("salary_ranges", [])[:5])
     exp_context = _format_items(summary.get("experience", [])[:5])
     degree_context = _format_items(summary.get("degrees", [])[:5])
     district_context = _format_items(summary.get("districts", [])[:5])
+
+    data_line = ""
+    if jobs_path or details_path:
+        data_line = f"完整数据文件: 列表 {jobs_path or '未提供'}；详情 {details_path or '未提供'}（可读取文件做深度调研，如高薪岗位的技能画像、岗位类型聚类等）"
 
     return "\n".join([
         "请基于下面的 BOSS 直聘岗位市场摘要，帮我优化求职材料和面试准备。",
         "",
         f"岗位市场摘要: {summary.get('keyword') or '未指定关键词'} @ {summary.get('city') or '未指定城市'}",
         f"样本规模: 列表 {summary.get('total_jobs', 0)} 条，详情 JD {summary.get('total_details', 0)} 条",
-        f"高频技能/关键词: {', '.join(skill_context) if skill_context else '暂无'}",
+        _salary_market_line(summary),
+        f"高频技能标签: {', '.join(skill_context) if skill_context else '暂无'}",
         f"常见薪资区间: {salary_context}",
         f"主流经验要求: {exp_context}",
         f"主流学历要求: {degree_context}",
         f"岗位集中地区: {district_context}",
+        data_line,
         "",
         "请输出：",
         "1. 简历技能关键词补齐建议",
         "2. 项目经历和工作经历的改写方向",
         "3. 面试准备清单",
         "4. 投递时需要避开的岗位特征",
+        "5. 基于薪资行情的薪酬预期建议",
         "",
         "要求：不要虚构经历，只把真实经历改写得更贴近这些岗位；结论要引用上面的统计依据。",
     ])
@@ -383,12 +477,20 @@ def main(argv=None):
     city = args.city if args.city is not None else metadata.get("city", "")
     summary = build_summary(jobs, details, search_keyword=keyword, city=city, top=args.top)
 
+    # 详情文件路径：--details 优先，否则复用 boss 的自动查找逻辑（供提示词引用）
+    details_path = args.details
+    if not details_path:
+        for candidate in boss.detail_candidate_paths(input_path, None, args.result_dir):
+            if os.path.exists(candidate):
+                details_path = candidate
+                break
+
     if not args.prompt_only:
         print(format_summary(summary))
     if not args.summary_only:
         if not args.prompt_only:
             print("\n--- 可复制提示词 ---")
-        print(build_prompt(summary))
+        print(build_prompt(summary, jobs_path=input_path, details_path=details_path))
 
     return 0
 

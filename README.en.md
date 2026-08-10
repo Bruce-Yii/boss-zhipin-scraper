@@ -188,7 +188,9 @@ python3 scripts/job_summary.py --top 15
 
 ## Post-Scrape Summary & Prompt
 
-`scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, does simple aggregation, and produces a copy-paste prompt. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
+`scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, computes **reliable aggregate stats** (salary market/experience/degree/district/company/scale/stage/skill tags) and produces a copy-paste prompt. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
+
+> Design split: the script only computes number-based stats (100% accurate); **semantic analysis is left to the AI agent** — the prompt references the full list/detail data file paths so the agent can read the complete JDs for deep research (skill profile of high-paying jobs, job-type clustering, job-search strategy, etc.).
 
 ```bash
 # Read the newest boss_jobs_*.json under the default result dir and auto-match the same-timestamp or newest detail file

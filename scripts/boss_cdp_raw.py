@@ -1469,7 +1469,8 @@ def build_detail_url(job):
 
 def find_latest_detail_file(result_dir=DEFAULT_RESULT_DIR):
     pattern = os.path.join(result_dir, "boss_details_*.json")
-    files = [path for path in glob.glob(pattern) if os.path.isfile(path)]
+    files = [path for path in glob.glob(pattern)
+             if os.path.isfile(path) and not path.endswith(".pending.json")]
     if not files:
         return None
     return max(files, key=lambda path: (os.path.getmtime(path), path))
