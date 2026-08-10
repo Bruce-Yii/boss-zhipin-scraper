@@ -1,4 +1,4 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.2（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.3（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 

@@ -1,4 +1,4 @@
-# BOSS Zhipin Scraper · Job Crawler v2.2 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.3 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
