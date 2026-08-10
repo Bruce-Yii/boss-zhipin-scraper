@@ -1894,7 +1894,8 @@ def _latest_details_path(list_path):
     candidates = []
     try:
         for name in os.listdir(base):
-            if name.startswith("boss_details_") and name.endswith(".json"):
+            if name.startswith("boss_details_") and name.endswith(".json") \
+                    and not name.endswith(".pending.json"):
                 path = os.path.join(base, name)
                 candidates.append((os.path.getmtime(path), path))
     except OSError:

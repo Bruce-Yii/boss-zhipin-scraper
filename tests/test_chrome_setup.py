@@ -528,6 +528,19 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertFalse(report["ok"])
             self.assertTrue(any("未找到" in i for i in report["issues"]))
 
+    def test_verify_latest_details_ignores_pending_files(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            list_path = paths["cdp_profile"] / "boss_jobs_x.json"
+            with open(list_path, "w", encoding="utf-8") as f:
+                json.dump({"jobs": [{"job_id": "a", "title": "A"}]}, f)
+            pending = paths["cdp_profile"] / "boss_details_x.json.pending.json"
+            with open(pending, "w", encoding="utf-8") as f:
+                json.dump([{"job_id": "a", "attempts": 1}], f)
+            self.assertIsNone(module._latest_details_path(str(list_path)),
+                              "pending 文件不应被当作详情文件")
+
     # ----- 详情会话失败防护 -----
 
     def _sample_jobs(self, n=3):
