@@ -612,6 +612,39 @@ class ChromeSetupTests(unittest.TestCase):
 
     # ----- 阶段进度汇报（每 10 条 / 总量>200 时每 5% 一报）-----
 
+    def test_resume_hint_empty_when_no_pending(self):
+        module = load_module()
+        self.assertEqual(module.resume_hint({}, "C:/x/details.json"), "")
+
+    def test_resume_hint_mentions_count_path_and_rerun(self):
+        module = load_module()
+        hint = module.resume_hint({"a": 2, "b": 1}, "C:/x/details.json")
+        self.assertIn("2 个详情待重试", hint)
+        self.assertIn("details.json.pending.json", hint)
+        self.assertIn("重跑刚才的命令", hint)
+
+    def test_run_summary_empty_when_no_jobs(self):
+        module = load_module()
+        self.assertEqual(module.run_summary(0, 0, 0, {}), "")
+
+    def test_run_summary_reports_rate_and_reason_breakdown(self):
+        module = load_module()
+        line = module.run_summary(180, 30, 27, {"invalid_detail": 2,
+                                                "cdp_session": 1})
+        self.assertIn("完成 30 条", line)
+        self.assertIn("成功 27", line)
+        self.assertIn("失败 3", line)
+        self.assertIn("invalid_detail:2", line)
+        self.assertIn("cdp_session:1", line)
+        self.assertIn("3 分 0 秒", line)
+        self.assertIn("6s/条", line)
+
+    def test_run_summary_formats_short_elapsed(self):
+        module = load_module()
+        line = module.run_summary(45, 10, 10, {})
+        self.assertIn("45 秒", line)
+        self.assertIn("5s/条", line)
+
     def test_progress_step_scales_with_total(self):
         module = load_module()
         self.assertEqual(module.progress_step(30), 10, "小任务固定每 10 条")
@@ -680,6 +713,141 @@ class ChromeSetupTests(unittest.TestCase):
             printed = outbuf.getvalue()
             self.assertIn("[进度 10/12", printed, "串行第 10 条应出阶段汇总")
             self.assertIn("[进度 12/12", printed, "串行完成时应出最终汇总")
+
+    # ----- 结果文件管理（--list-results / --archive）-----
+
+    def _make_result_files(self, paths, jobs=2, details=1, pending=1, csv=1):
+        root = paths["cdp_profile"]
+        root.mkdir(parents=True, exist_ok=True)
+        files = []
+        for i in range(jobs):
+            p = root / f"boss_jobs_{i}.json"
+            p.write_text(json.dumps({"jobs": [{"job_id": str(i)}]}), encoding="utf-8")
+            files.append(p)
+        for i in range(details):
+            p = root / f"boss_details_{i}.json"
+            p.write_text(json.dumps([{"job_id": "a"}]), encoding="utf-8")
+            files.append(p)
+        if pending:
+            p = root / "boss_details_0.json.pending.json"
+            p.write_text(json.dumps([{"job_id": "a", "attempts": 1}]), encoding="utf-8")
+            files.append(p)
+        if csv:
+            p = root / "boss_jobs_0.csv"
+            p.write_text("a,b\n", encoding="utf-8")
+            files.append(p)
+        return files
+
+    def test_list_results_classifies_files(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            self._make_result_files(paths)
+            entries = module.list_results(str(paths["cdp_profile"]))
+            kinds = [e["kind"] for e in entries]
+            self.assertIn("jobs", kinds)
+            self.assertIn("details", kinds)
+            self.assertIn("pending", kinds)
+            self.assertNotIn("csv", kinds, "CSV 不单列")
+            self.assertGreaterEqual(len(entries), 4)
+
+    def test_archive_results_keeps_latest_and_moves_rest(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            self._make_result_files(paths, jobs=3, details=2, pending=1, csv=0)
+            module.archive_results(str(paths["cdp_profile"]), keep_latest=1)
+            root = paths["cdp_profile"]
+            archive = root / "archive"
+            self.assertTrue(archive.exists(), "应创建 archive 子目录")
+            jobs_left = [f for f in root.glob("boss_jobs_*.json")]
+            details_left = [
+                f for f in root.glob("boss_details_*.json")
+                if not f.name.endswith(".pending.json")]
+            self.assertEqual(len(jobs_left), 1, "jobs 保留最新 1 个")
+            self.assertEqual(len(details_left), 1, "details 保留最新 1 个")
+            self.assertEqual(len(list(archive.glob("boss_jobs_*.json"))), 2,
+                             "其余 jobs 移入 archive")
+            self.assertTrue((root / "boss_details_0.json.pending.json").exists(),
+                            "pending 是活动文件，不归档")
+
+    def test_archive_results_noop_when_nothing_to_archive(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            self._make_result_files(paths, jobs=1, details=0, pending=0, csv=0)
+            module.archive_results(str(paths["cdp_profile"]), keep_latest=1)
+            self.assertFalse((paths["cdp_profile"] / "archive").exists(),
+                             "无需归档时不建目录")
+
+    # ----- --batch 批量任务编排 -----
+
+    def _write_batch(self, paths, content):
+        p = paths["cdp_profile"] / "batch.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+        return str(p)
+
+    def test_load_batch_config_parses_tasks_with_defaults(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI产品经理", "city": "上海", "pages": 4, "scale": 305},
+                {"keyword": "AI Agent"},
+            ])
+            tasks, errors = module.load_batch_config(path)
+            self.assertEqual(errors, [])
+            self.assertEqual(len(tasks), 2)
+            self.assertEqual(tasks[0]["keyword"], "AI产品经理")
+            self.assertEqual(tasks[0]["city"], "上海")
+            self.assertEqual(tasks[0]["pages"], 4)
+            self.assertEqual(tasks[0]["scale"], 305)
+            self.assertEqual(tasks[1]["pages"], 3, "缺省页数用默认")
+            self.assertEqual(tasks[1]["city"], module.DEFAULT_CITY_INPUT, "缺省城市用默认")
+
+    def test_load_batch_config_rejects_bad_entries(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                "not-a-dict",
+                {"city": "上海"},
+                {"keyword": "ok", "pages": "abc"},
+                {"keyword": "ok2"},
+            ])
+            tasks, errors = module.load_batch_config(path)
+            self.assertEqual(len(tasks), 1, "仅合法任务进入列表")
+            self.assertEqual(tasks[0]["keyword"], "ok2")
+            self.assertEqual(len(errors), 3, "非法任务各记一条错误")
+
+    def test_load_batch_config_missing_or_not_array(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            missing = str(paths["cdp_profile"] / "no.json")
+            tasks, errors = module.load_batch_config(missing)
+            self.assertEqual(tasks, [])
+            self.assertEqual(len(errors), 1)
+            path = self._write_batch(paths, {"keyword": "x"})
+            tasks, errors = module.load_batch_config(path)
+            self.assertEqual(errors, ["配置必须是 JSON 数组（每个元素一个任务）"])
+
+    def test_run_batch_executes_tasks_with_gaps(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 4, "sleep": 5},
+                {"keyword": "Java", "city": "杭州", "pages": 2},
+            ])
+            calls = []
+            with mock.patch.object(module, "scrape_list",
+                                   side_effect=lambda *a, **k: calls.append((a, k))), \
+                    mock.patch.object(module.time, "sleep") as sleep, \
+                    mock.patch.object(module, "resolve_city") as rc:
+                rc.side_effect = lambda city: (city, "101020100")
+                code = module.run_batch(path)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(calls), 2, "两个任务各抓一次列表")
+            self.assertEqual(calls[0][0][0], "AI")
+            self.assertEqual(calls[0][0][1], "上海")
+            self.assertEqual(calls[0][0][2], 4)
+            self.assertEqual(calls[0][1]["max_jobs"], None)
+            self.assertEqual(sleep.call_count, 1, "两个任务之间只等一次")
 
     # ----- 详情会话失败防护 -----
 

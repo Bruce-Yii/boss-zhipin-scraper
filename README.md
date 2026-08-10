@@ -171,6 +171,9 @@ python3 scripts/job_summary.py --top 15
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
 | `--verify` | 校验已抓取结果文件完整性（列表/详情可解析、字段齐全、JD 完整、覆盖率；只校验不抓取，不依赖 Chrome） |
+| `--list-results` | 列出结果目录中的历史抓取结果文件（分类 + 时间 + 大小） |
+| `--archive [KEEP]` | 归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 `archive/` 子目录；pending 活动文件不归档 |
+| `--batch CONFIG.json` | 批量列表抓取：配置文件为 JSON 数组，每个元素一个任务（keyword 必填；city/pages/sleep/筛选字段可选），逐任务执行、任务间自动等待防风控 |
 | `--smoke-test` | 用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test，不写结果文件 |
 | `--setup-chrome` | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile（默认、首次启动、重复启动都不复制） |

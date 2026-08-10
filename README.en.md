@@ -169,6 +169,9 @@ python3 scripts/job_summary.py --top 15
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
 | `--check` | Environment check (CDP + deps + login state) |
 | `--verify` | Verify scraped result files (list/detail parseability, required fields, JD completeness, coverage; verification only, no scraping, no Chrome needed) |
+| `--list-results` | List historical result files in the result dir (kind + time + size) |
+| `--archive [KEEP]` | Archive historical results: keep the newest KEEP files per kind (default 1), move the rest into `archive/`; active pending files are never archived |
+| `--batch CONFIG.json` | Batch list scraping: config is a JSON array, one task per element (keyword required; city/pages/sleep/filter fields optional), runs tasks sequentially with anti-risk gaps |
 | `--smoke-test` | Run one real Chrome/CDP BOSS search API smoke test, writes no result files |
 | `--setup-chrome` | One-shot launch of Chrome CDP (persistent isolated profile) |
 | `--copy-login-state` | Manually import the main Chrome's Local State + cookie-related files into the isolated profile (never copied by default, on first run, or on repeated runs) |

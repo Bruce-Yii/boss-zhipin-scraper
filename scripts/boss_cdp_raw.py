@@ -1875,6 +1875,193 @@ def save_pending_ids(output_path, ids):
 # ============================================================
 # --verify 结果文件校验
 # ============================================================
+def _classify_result_file(name):
+    """按文件名分类结果目录条目：jobs / details / pending / other。"""
+    if name.endswith(".pending.json"):
+        return "pending"
+    if name.startswith("boss_jobs_"):
+        return "jobs"
+    if name.startswith("boss_details_"):
+        return "details"
+    return "other"
+
+
+def list_results(result_dir=DEFAULT_RESULT_DIR):
+    """列出结果目录中的结果文件（按修改时间倒序）。
+
+    Returns:
+        list of dict: {"path", "kind", "size", "modified"}
+    """
+    entries = []
+    try:
+        names = os.listdir(result_dir)
+    except OSError:
+        return entries
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(result_dir, name)
+        kind = _classify_result_file(name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        entries.append({
+            "path": path, "kind": kind,
+            "size": st.st_size, "modified": st.st_mtime,
+        })
+    entries.sort(key=lambda e: e["modified"], reverse=True)
+    return entries
+
+
+def archive_results(result_dir=DEFAULT_RESULT_DIR, keep_latest=1, archive_dir=None):
+    """归档结果目录中的历史结果文件。
+
+    jobs 与 details 各自保留最新的 keep_latest 个，其余移到 archive 子目录；
+    pending 是断点续抓的活动文件，不归档；CSV 不移动。
+
+    Args:
+        result_dir: 结果目录
+        keep_latest: 每个类型保留的最新文件数
+        archive_dir: 归档目录（默认 result_dir/archive）
+
+    Returns:
+        int: 归档的文件数
+    """
+    archive_dir = archive_dir or os.path.join(result_dir, "archive")
+    moved = 0
+    for kind in ("jobs", "details"):
+        candidates = [e for e in list_results(result_dir) if e["kind"] == kind]
+        for entry in candidates[keep_latest:]:
+            os.makedirs(archive_dir, exist_ok=True)
+            dst = os.path.join(archive_dir, os.path.basename(entry["path"]))
+            shutil.move(entry["path"], dst)
+            moved += 1
+            print(f"  📦 归档 {os.path.basename(entry['path'])}")
+    return moved
+
+
+def run_list_results(result_dir=DEFAULT_RESULT_DIR):
+    """打印 --list-results 报告并返回退出码。"""
+    entries = list_results(result_dir)
+    if not entries:
+        print(f"结果目录为空: {result_dir}")
+        return 0
+    print(f"\n=== 抓取结果文件（{len(entries)} 个）===")
+    for e in entries:
+        modified = datetime.fromtimestamp(e["modified"]).strftime("%Y-%m-%d %H:%M")
+        print(f"  [{e['kind']:>7}] {modified}  {e['size']:>9} B  {os.path.basename(e['path'])}")
+    print()
+    return 0
+
+
+def run_archive(result_dir=DEFAULT_RESULT_DIR, keep_latest=1):
+    """执行 --archive 并返回退出码。"""
+    print(f"\n=== 归档历史结果（保留每个类型最新 {keep_latest} 个）===")
+    moved = archive_results(result_dir, keep_latest=keep_latest)
+    if moved == 0:
+        print("  ℹ️  无需归档")
+    else:
+        print(f"  ✅ 已归档 {moved} 个文件到 {os.path.join(result_dir, 'archive')}")
+    print()
+    return 0
+
+
+# ============================================================
+# --batch 批量任务编排
+# ============================================================
+FILTER_KEYS = ["scale", "stage", "salary", "experience", "degree", "industry"]
+
+
+def load_batch_config(path):
+    """加载 --batch 任务配置（JSON 数组）；返回 (tasks, errors)。
+
+    每个任务支持字段：keyword(必填)、city(默认上海)、pages(默认 3，
+    自动限制在 1..MAX_PAGES)、sleep(任务间等待秒数，缺省随机 30-60)、
+    scale/stage/salary/experience/degree/industry（筛选）。非法任务
+    跳过并记录错误，不中断其余任务。
+
+    Args:
+        path: 配置文件路径
+
+    Returns:
+        (list, list): 合法任务列表与错误信息列表
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        return [], [f"配置文件无法读取: {e}"]
+    if not isinstance(data, list):
+        return [], ["配置必须是 JSON 数组（每个元素一个任务）"]
+
+    tasks = []
+    errors = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            errors.append(f"任务 {i + 1}: 不是对象，已跳过")
+            continue
+        keyword = str(item.get("keyword") or "").strip()
+        if not keyword:
+            errors.append(f"任务 {i + 1}: 缺少 keyword，已跳过")
+            continue
+        try:
+            pages = int(item.get("pages") or 3)
+        except (TypeError, ValueError):
+            errors.append(f"任务 {i + 1}: pages 必须是整数，已跳过")
+            continue
+        task = {
+            "keyword": keyword,
+            "city": str(item.get("city") or DEFAULT_CITY_INPUT).strip(),
+            "pages": min(max(pages, 1), MAX_PAGES),
+        }
+        if item.get("sleep") is not None:
+            try:
+                task["sleep"] = max(float(item["sleep"]), 0)
+            except (TypeError, ValueError):
+                errors.append(f"任务 {i + 1}: sleep 必须是数字，已忽略该字段")
+        for key in FILTER_KEYS:
+            if item.get(key):
+                task[key] = item[key]
+        tasks.append(task)
+    return tasks, errors
+
+
+def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT):
+    """逐任务执行批量列表抓取；任务间按 sleep（缺省随机 30-60s）防风控。
+
+    Returns:
+        int: 退出码（0 全成功 / 1 有任务失败或配置错误）
+    """
+    tasks, errors = load_batch_config(config_path)
+    for err in errors:
+        print(f"⚠️  {err}")
+    if not tasks:
+        print("❌ 没有可执行的批量任务")
+        return 1
+
+    print(f"\n=== 批量列表抓取（{len(tasks)} 个任务）===")
+    failed = 0
+    for i, task in enumerate(tasks):
+        filters = {k: task[k] for k in FILTER_KEYS if k in task}
+        print(f"\n[{i + 1}/{len(tasks)}] {task['keyword']} @ {task['city']} "
+              f"（{task['pages']} 页）")
+        try:
+            scrape_list(
+                task["keyword"], task["city"], task["pages"], filters, None,
+                cdp_port=cdp_port, max_jobs=None,
+            )
+        except Exception as e:
+            failed += 1
+            print(f"  ❌ 任务失败: {e}")
+        if i < len(tasks) - 1:
+            gap = task.get("sleep") or random.uniform(30, 60)
+            print(f"任务间等待 {gap:.0f}s 防风控...")
+            time.sleep(gap)
+    print(f"\n✅ 批量任务完成：成功 {len(tasks) - failed}/{len(tasks)}")
+    return 0 if failed == 0 else 1
+
+
 def latest_results_file(kind):
     """默认结果目录下最新文件（kind: "jobs" / "details"）；目录缺失返回 None。"""
     prefix = "boss_jobs_" if kind == "jobs" else "boss_details_"
@@ -2050,6 +2237,57 @@ def progress_step(total):
         int: 汇报间隔（条数，至少 10）
     """
     return max(10, int(math.ceil(total * 0.05)))
+
+
+def resume_hint(pending, output_path):
+    """生成断点续抓提示；pending 为空返回空串。
+
+    详情输出路径不变时，pending 文件会被自动加载，重跑原命令即自动
+    跳过已抓、只补失败详情，无需拼写任何参数。
+
+    Args:
+        pending: {job_id: attempts} 待重试映射
+        output_path: 详情输出路径
+
+    Returns:
+        str: 提示文本（可能为空串）
+    """
+    if not pending:
+        return ""
+    path = pending_path_for(output_path)
+    return (f"ℹ️  {len(pending)} 个详情待重试（已记录到 {path}）。"
+            f"续抓：重跑刚才的命令即可——输出路径不变时自动跳过已抓、"
+            f"只补这 {len(pending)} 条")
+
+
+def _format_elapsed(seconds):
+    """耗时格式化：≥60 秒显示"X 分 Y 秒"，否则"Y 秒"。"""
+    seconds = int(seconds)
+    if seconds >= 60:
+        return f"{seconds // 60} 分 {seconds % 60} 秒"
+    return f"{seconds} 秒"
+
+
+def run_summary(elapsed_sec, total, ok_count, reason_counts):
+    """生成详情抓取结束统计行；无任务返回空串。
+
+    Args:
+        elapsed_sec: 已耗时（秒）
+        total: 处理总数
+        ok_count: 成功数
+        reason_counts: 失败原因分类 {reason: count}（不含成功）
+
+    Returns:
+        str: 统计行（可能为空串）
+    """
+    if total <= 0:
+        return ""
+    failed = total - ok_count
+    reason_txt = "，".join(
+        f"{k}:{v}" for k, v in sorted(reason_counts.items())) if reason_counts else "—"
+    rate = math.ceil(elapsed_sec / total)
+    return (f"  ✅ 完成 {total} 条：成功 {ok_count}，失败 {failed}（{reason_txt}）"
+            f"| 耗时 {_format_elapsed(elapsed_sec)}，平均 {rate}s/条")
 
 
 def progress_line(completed, total, ok_count):
@@ -2307,7 +2545,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             existing_ids=existing_ids, pending_ids=pending,
             existing_results=results, output_path=output_path)
         if pending:
-            print(f"ℹ️  {len(pending)} 个详情待重试（已记录到 {pending_path_for(output_path)}，下次运行自动重试）")
+            print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
         if fmt == "csv":
             csv_path = output_path.rsplit(".", 1)[0] + ".csv"
@@ -2316,6 +2554,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
     consecutive_cdp_errors = 0
     serial_ok = 0
+    serial_done = 0
+    serial_reasons = {}
+    start_time = time.time()
 
     for idx, job in enumerate(jobs):
         link = job.get("job_link", "")
@@ -2348,6 +2589,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             detail = result["detail"]
             results.append(detail)
             serial_ok += 1
+            serial_done += 1
             # 抓取成功：从待重试清单移除
             if job_id:
                 pending.pop(job_id, None)
@@ -2365,6 +2607,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             )
         elif reason == "cdp_session":
             consecutive_cdp_errors += 1
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
             print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {result['message']}")
             if job_id:
                 pending[job_id] = pending.get(job_id, 0) + 1
@@ -2377,6 +2621,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
         elif reason == "stopped":
             break
         else:
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
             print(f"  跳过无效详情页: {result['message']}")
             if job_id:
                 pending[job_id] = pending.get(job_id, 0) + 1
@@ -2393,8 +2639,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
     _atomic_write_json(output_path, results)
     save_pending_ids(output_path, pending)
+    if serial_done:
+        print(run_summary(time.time() - start_time,
+                          serial_done, serial_ok, serial_reasons))
     if pending:
-        print(f"ℹ️  {len(pending)} 个详情待重试（已记录到 {pending_path_for(output_path)}，下次运行自动重试）")
+        print(resume_hint(pending, output_path))
     print(f"\n详情已保存: {output_path}")
 
     if fmt == "csv":
@@ -2449,6 +2698,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
     results = list(existing_results) if existing_results is not None else []
     stop_event = threading.Event()
     consecutive_cdp_errors = 0
+    start_time = time.time()
 
     def persist():
         if output_path:
@@ -2505,6 +2755,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         fill_window()
         completed = 0
         parallel_ok = 0
+        parallel_reasons = {}
         while in_flight:
             done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
             for future in done:
@@ -2518,6 +2769,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 completed += 1
                 if result["ok"]:
                     parallel_ok += 1
+                else:
+                    reason = result["reason"] or "unknown"
+                    parallel_reasons[reason] = parallel_reasons.get(reason, 0) + 1
                 mark = "✓" if result["ok"] else f"✗ {result['reason']}"
                 print(f"  [并发 {completed}/{total}] {job.get('title', '')} {mark}")
                 progress = progress_line(completed, total, parallel_ok)
@@ -2526,6 +2780,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 if output_path and completed % write_every == 0:
                     persist()
             fill_window()
+        if completed:
+            print(run_summary(time.time() - start_time,
+                              completed, parallel_ok, parallel_reasons))
     if output_path:
         persist()
     return results, pending
@@ -3245,6 +3502,14 @@ def main():
     p.add_argument("--check", action="store_true", help="运行环境诊断检查")
     p.add_argument("--verify", action="store_true",
                    help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
+    p.add_argument("--list-results", action="store_true",
+                   help="列出结果目录中的历史抓取结果文件")
+    p.add_argument("--batch", default=None, metavar="CONFIG.json",
+                   help="批量列表抓取：从配置文件（JSON 数组，每个元素一个任务："
+                        "keyword/city/pages/sleep/筛选字段）逐任务执行，任务间自动等待防风控")
+    p.add_argument("--archive", nargs="?", const="1", default=None,
+                   metavar="KEEP",
+                   help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
     p.add_argument("--retry-job", action="append", default=[],
                    metavar="JOB_ID",
                    help="强制重试指定 job_id（可重复指定；无视 pending 重试上限，未记录的也会重抓）")
@@ -3292,6 +3557,25 @@ def main():
                 print(f"未找到列表文件（--input 或 {DEFAULT_RESULT_DIR} 下的 boss_jobs_*.json）")
                 sys.exit(1)
         sys.exit(run_verify(list_path, args.detail_output))
+
+    # --list-results 模式（列出历史结果文件）
+    if args.list_results:
+        sys.exit(run_list_results())
+
+    # --archive 模式（归档历史结果文件）
+    if args.archive is not None:
+        try:
+            keep = int(args.archive)
+        except ValueError:
+            print(f"❌ --archive 参数必须是正整数: {args.archive}")
+            sys.exit(1)
+        sys.exit(run_archive(keep_latest=keep))
+
+    # --batch 模式（批量列表抓取）
+    if args.batch:
+        if not require_runtime_dependencies("requests", "websocket"):
+            sys.exit(1)
+        sys.exit(run_batch(args.batch, cdp_port=args.cdp_port))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
