@@ -575,6 +575,27 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "stopped")
 
+    def test_scrape_one_detail_verbose_prints_progress(self):
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (_ws, _url), \
+                mock.patch("builtins.print") as print_mock:
+            module._scrape_one_detail(self._detail_job(), cdp_port=9222, verbose=True)
+        texts = " ".join(
+            str(c[0][0]) for c in print_mock.call_args_list if c[0]
+        )
+        self.assertIn("加载页面", texts)
+        self.assertIn("模拟滚动", texts)
+
+    def test_scrape_one_detail_non_verbose_stays_quiet(self):
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (_ws, _url), \
+                mock.patch("builtins.print") as print_mock:
+            module._scrape_one_detail(self._detail_job(), cdp_port=9222, verbose=False)
+        texts = " ".join(
+            str(c[0][0]) for c in print_mock.call_args_list if c[0]
+        )
+        self.assertNotIn("模拟滚动", texts)
+
     # ----- 并发详情抓取：并行执行层 -----
 
     def _fake_parallel_worker(self, active_state, ok_ids, fail_ids=()):
@@ -657,6 +678,54 @@ class ChromeSetupTests(unittest.TestCase):
         # 连续失败熔断后不再执行剩余任务（部分任务可能已提交）
         self.assertLessEqual(len(pending_out), 6)
 
+    def test_parallel_writes_progressively_and_keeps_existing(self):
+        module = load_module()
+        jobs = self._sample_jobs(5)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        old_detail = {"job_id": "old", "title": "old", "jd": "x" * 200}
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=self._fake_parallel_worker(state, set())), \
+                    mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                    mock.patch.object(module, "_atomic_write_json",
+                                      wraps=module._atomic_write_json) as atomic, \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module.time, "sleep"):
+                results, pending_out = module._scrape_details_parallel(
+                    jobs, cdp_port=9222, concurrency=2,
+                    limiter=limiter_cls.return_value,
+                    existing_results=[old_detail], output_path=out, write_every=2)
+            self.assertEqual(len(results), 6, "返回应包含已有 + 本次新增")
+            self.assertGreaterEqual(atomic.call_count, 3,
+                                    "write_every=2、5 个任务应至少 3 次渐进写盘")
+            with open(out, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(len(saved), 6, "落盘文件应含已有 + 本次新增")
+
+    def test_parallel_prints_progress_per_completion(self):
+        module = load_module()
+        jobs = self._sample_jobs(3)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=self._fake_parallel_worker(state, set())), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids",
+                                  return_value=set()), \
+                mock.patch.object(module, "load_pending_ids",
+                                  return_value=set()), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch("builtins.print") as print_mock:
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                limiter=limiter_cls.return_value)
+        progress_lines = [c[0][0] for c in print_mock.call_args_list
+                          if isinstance(c[0][0], str) and "并发" in c[0][0]]
+        self.assertGreaterEqual(len(progress_lines), 3, "每个任务完成都应打印进度")
+
     # ----- 并发详情抓取：CLI 分派 -----
 
     def test_scrape_details_uses_parallel_path_when_concurrency_gt_1(self):
@@ -665,8 +734,20 @@ class ChromeSetupTests(unittest.TestCase):
         fake_detail = {"job_id": "job-0", "title": "t0", "jd": "x" * 200}
         with tempfile_profile() as paths:
             out = str(paths["cdp_profile"] / "details.json")
+            captured = {}
+
+            def fake_parallel(jobs, cdp_port, concurrency, limiter=None,
+                              existing_ids=None, pending_ids=None,
+                              existing_results=None, output_path=None,
+                              write_every=5):
+                # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
+                captured["concurrency"] = concurrency
+                merged = list(existing_results or []) + [fake_detail]
+                module._atomic_write_json(output_path, merged)
+                return merged, set()
+
             with mock.patch.object(module, "_scrape_details_parallel",
-                                   return_value=([fake_detail], set())) as parallel, \
+                                   new=fake_parallel), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
                     mock.patch.object(module, "load_pending_ids",
@@ -675,8 +756,7 @@ class ChromeSetupTests(unittest.TestCase):
                 results = module.scrape_details(list_data, output_path=out,
                                                 cdp_port=9222, concurrency=3)
             self.assertEqual(len(results), 1, "并发路径应返回新抓详情（与已有合并）")
-            parallel.assert_called_once()
-            self.assertEqual(parallel.call_args[0][2], 3, "并发度应透传")
+            self.assertEqual(captured["concurrency"], 3, "并发度应透传")
             # 并发结果应已落盘
             with open(out, "r", encoding="utf-8") as f:
                 saved = json.load(f)

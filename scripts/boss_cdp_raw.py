@@ -1896,7 +1896,8 @@ class AdaptiveRateLimiter:
         self._bucket.acquire()
 
 
-def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None, limiter=None):
+def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
+                       limiter=None, verbose=False):
     """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
 
     Args:
@@ -1928,6 +1929,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None, limiter=
         if limiter is not None:
             limiter.acquire()
         ws.send("Page.navigate", {"url": detail_url}, sid)
+        if verbose:
+            print("  加载页面...")
         time.sleep(random.uniform(5, 10))
 
         # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入
@@ -1938,6 +1941,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None, limiter=
 
         # 模拟人类阅读详情页的滚动行为
         scroll_count = random.randint(3, 7)
+        if verbose:
+            print(f"  模拟滚动 ({scroll_count} 次)...")
         for _ in range(scroll_count):
             if stop_event is not None and stop_event.is_set():
                 return {"ok": False, "detail": None, "job_id": job_id,
@@ -2018,15 +2023,13 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
 
-    # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/落盘/pending
+    # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/渐进落盘/pending
     if concurrency > 1:
         print(f"⚡ 并发详情抓取（--concurrency {concurrency}，全局限速 + 错误率自适应降速）")
-        new_results, pending = _scrape_details_parallel(
+        results, pending = _scrape_details_parallel(
             jobs, cdp_port, concurrency,
-            existing_ids=existing_ids, pending_ids=pending)
-        results = results + new_results
-        _atomic_write_json(output_path, results)
-        save_pending_ids(output_path, pending)
+            existing_ids=existing_ids, pending_ids=pending,
+            existing_results=results, output_path=output_path)
         if pending:
             print(f"ℹ️  {len(pending)} 个详情待重试（已记录到 {pending_path_for(output_path)}，下次运行自动重试）")
         print(f"\n详情已保存: {output_path}")
@@ -2061,7 +2064,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
         incr_request()
 
-        result = _scrape_one_detail(job, cdp_port)
+        result = _scrape_one_detail(job, cdp_port, verbose=True)
         reason = result["reason"]
 
         if result["ok"]:
@@ -2120,8 +2123,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
 
 def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
-                             existing_ids=None, pending_ids=None):
-    """并发详情抓取：worker 只取数，主线程统一合并结果与 pending。
+                             existing_ids=None, pending_ids=None,
+                             existing_results=None, output_path=None,
+                             write_every=5):
+    """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
         jobs: 列表 job dict 列表
@@ -2130,16 +2135,21 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         limiter: 可选 AdaptiveRateLimiter（全局限速）；None 时按并发度自建
         existing_ids: 历史已抓 job_id 集合（跳过）
         pending_ids: 待重试 job_id 集合（优先重抓）
+        existing_results: 已有详情列表（断点续抓），并入返回与落盘
+        output_path: 非 None 时每 write_every 条渐进原子写盘（中断最多丢
+            write_every 条，与串行"每条写盘"的可靠性差距收敛）
+        write_every: 渐进写盘间隔（条数）
 
     Returns:
-        (results, pending): results 为本次抓取的详情列表；
-            pending 为待重试 job_id 集合（调用方负责落盘）
+        (results, pending): results 为全量详情（含 existing_results）；
+            pending 为待重试 job_id 集合
     """
     existing_ids = existing_ids if existing_ids is not None else set()
     pending = set(pending_ids) if pending_ids is not None else set()
     if limiter is None:
-        # 默认全局限速：每 worker 约 0.5 请求/秒（含加载等待），
-        # 失败率升高时由 AdaptiveRateLimiter 自动降速/暂停
+        # 默认全局限速：令牌桶仅提供弱错峰（容量=并发，错开同时导航的瞬时
+        # 突发）；实际请求间隔主要由每条详情固有的加载/滚动等待（约 20-30s）
+        # 决定。失败率升高时由 AdaptiveRateLimiter 降半/暂停兜底。
         limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
 
     # 过滤已抓/重复（与串行路径同一套去重逻辑）
@@ -2155,20 +2165,24 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             continue
         todo.append(job)
 
-    results = []
+    results = list(existing_results) if existing_results is not None else []
     stop_event = threading.Event()
     consecutive_cdp_errors = 0
-    lock = threading.Lock()
+
+    def persist():
+        if output_path:
+            _atomic_write_json(output_path, results)
+            save_pending_ids(output_path, pending)
 
     def handle_result(job, result):
+        # 仅主线程（as_completed 循环）调用，results/pending 无并发访问，无需加锁
         nonlocal consecutive_cdp_errors
         job_id = job.get("job_id", "")
         if result["ok"]:
             limiter.record_success()
-            with lock:
-                results.append(result["detail"])
-                if job_id:
-                    pending.discard(job_id)
+            results.append(result["detail"])
+            if job_id:
+                pending.discard(job_id)
             return
         limiter.record_failure()
         reason = result["reason"]
@@ -2179,14 +2193,16 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 stop_event.set()
         if job_id:
-            with lock:
-                pending.add(job_id)
+            pending.add(job_id)
+            if output_path:
+                save_pending_ids(output_path, pending)
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
             pool.submit(_scrape_one_detail, job, cdp_port, stop_event, limiter): job
             for job in todo
         }
+        completed = 0
         for future in as_completed(futures):
             job = futures[future]
             try:
@@ -2196,6 +2212,13 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                           "job_id": job.get("job_id", ""),
                           "reason": "cdp_session", "message": str(exc)}
             handle_result(job, result)
+            completed += 1
+            mark = "✓" if result["ok"] else f"✗ {result['reason']}"
+            print(f"  [并发 {completed}/{len(todo)}] {job.get('title', '')} {mark}")
+            if output_path and completed % write_every == 0:
+                persist()
+    if output_path:
+        persist()
     return results, pending
 
 
