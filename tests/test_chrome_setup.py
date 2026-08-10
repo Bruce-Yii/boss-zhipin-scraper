@@ -717,7 +717,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
                 mock.patch.object(module, "load_pending_ids",
-                                  return_value=set()), \
+                                  return_value={}), \
                 mock.patch.object(module.time, "sleep"):
             module._scrape_details_parallel(
                 jobs, cdp_port=9222, concurrency=2,
@@ -725,6 +725,25 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertLess(len(calls), 20,
                         "熔断后不应继续提交剩余任务（有界提交窗口）")
         self.assertGreaterEqual(len(calls), 3, "至少执行到熔断阈值")
+
+    def test_parallel_counts_requests_against_budget(self):
+        module = load_module()
+        jobs = self._sample_jobs(3)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=self._fake_parallel_worker(state, set())), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "incr_request") as incr_mock, \
+                mock.patch.object(module, "load_existing_detail_ids",
+                                  return_value=set()), \
+                mock.patch.object(module, "load_pending_ids",
+                                  return_value={}), \
+                mock.patch.object(module.time, "sleep"):
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                limiter=limiter_cls.return_value)
+        self.assertEqual(incr_mock.call_count, 3,
+                         "每个提交的详情都应计入全局请求预算（与串行一致）")
 
     def test_parallel_writes_progressively_and_keeps_existing(self):
         module = load_module()

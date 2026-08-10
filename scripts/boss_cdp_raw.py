@@ -2247,6 +2247,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     job = next(todo_iter)
                 except StopIteration:
                     return
+                # 与串行路径一致：每个提交的详情计入全局请求预算（500 上限）
+                incr_request()
                 in_flight.add(pool.submit(run_one, job))
 
         fill_window()
