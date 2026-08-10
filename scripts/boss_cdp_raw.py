@@ -62,6 +62,7 @@ CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 # 请求频率保护
 MAX_PAGES = 10          # 单次最大页数
 MAX_API_REQUESTS = 500  # 单次最大 API 请求数
+API_ATTEMPT_LIMIT = 3   # 列表 API 单页最大尝试次数（凭证自愈重试）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -388,6 +389,118 @@ def create_page_session(cdp, background=True):
             session_id,
         )
     return target_id, session_id
+
+
+# ============================================================
+# 页面级风控/验证码检测与人工介入
+#
+# API 层风控（code 31/37 等）由 classify_login_probe_response 处理；
+# 这里补"页面级"判据：滑块验证、安全验证页、登录墙等需要人工介入的场景。
+# 判据参考 nothing248/boss-scrapy 的四重检测思路。
+# ============================================================
+DEFAULT_RISK_WAIT_TIMEOUT = 120   # 等待人工处理的最长秒数
+RISK_WAIT_INTERVAL = 5            # 轮询间隔秒数
+
+RISK_PROBE_JS = """
+(function(){
+    var title = document.title || '';
+    var url = location.href || '';
+    var bodyText = document.body ? (document.body.innerText || '') : '';
+    var slider = document.querySelector(
+        '.nc_scale, .captcha-slider, .puzzle-captcha, .geetest_slider, ' +
+        '.yidun_slider, .captcha_verify_box, .verify-captcha'
+    );
+    return JSON.stringify({
+        url: url,
+        title: title,
+        hasSlider: !!slider,
+        hasLoginWall: bodyText.indexOf('登录查看完整内容') !== -1
+    });
+})()
+"""
+
+RISK_TITLE_KEYWORDS = ("安全验证", "安全检查", "滑块验证", "验证码", "安全校验")
+RISK_URL_KEYWORDS = ("security-check", "security.html", "verify", "captcha")
+
+
+def _cdp_exception_types():
+    """返回 CDP 层可预期异常的元组。
+
+    websocket-client 是 lazy 导入（模块顶部 websocket=None），且测试环境中是
+    Mock（其属性不是异常类）。这里动态解析真实异常类，避免 except 元组里出现
+    非异常类型导致 TypeError。
+    """
+    types = (RuntimeError, TimeoutError, KeyError, OSError)
+    ws_exc = getattr(websocket, "WebSocketException", None) if websocket is not None else None
+    if isinstance(ws_exc, type) and issubclass(ws_exc, BaseException) and ws_exc not in types:
+        types += (ws_exc,)
+    return types
+
+
+def probe_risk_page(cdp, sid):
+    """通过注入 JS 探测当前页面是否存在风控/验证码痕迹。
+
+    Returns:
+        dict: {"url", "title", "hasSlider", "hasLoginWall"}；探测失败返回 {}。
+    """
+    try:
+        val = cdp.eval_js(RISK_PROBE_JS, sid)
+    except _cdp_exception_types():
+        log.debug("风控页面探测失败", exc_info=True)
+        return {}
+    if not val:
+        return {}
+    try:
+        probe = json.loads(val) if isinstance(val, str) else val
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    return probe if isinstance(probe, dict) else {}
+
+
+def classify_risk_page(probe):
+    """判断页面探测结果是否命中风控/验证码判据。
+
+    Args:
+        probe: probe_risk_page 返回的 dict
+
+    Returns:
+        (is_risk, reason): is_risk 为 True 时 reason 说明命中的判据
+    """
+    if not isinstance(probe, dict):
+        return False, ""
+    url = str(probe.get("url") or "")
+    title = str(probe.get("title") or "")
+    if any(kw in url.lower() for kw in RISK_URL_KEYWORDS):
+        return True, "访问到验证/安全页面"
+    if any(kw in title for kw in RISK_TITLE_KEYWORDS):
+        return True, f"页面标题含验证关键词「{title}」"
+    if probe.get("hasSlider"):
+        return True, "检测到滑块验证元素"
+    if probe.get("hasLoginWall"):
+        return True, "页面出现登录墙"
+    return False, ""
+
+
+def wait_for_risk_clear(cdp, sid, timeout=DEFAULT_RISK_WAIT_TIMEOUT,
+                        interval=RISK_WAIT_INTERVAL):
+    """页面命中风控时提示用户人工处理，轮询直到恢复或超时。
+
+    Returns:
+        True: 风控已解除（判据消失）；False: 等待超时。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = probe_risk_page(cdp, sid)
+        is_risk, reason = classify_risk_page(probe)
+        if not is_risk:
+            return True
+        remaining = int(deadline - time.time())
+        print(f"⚠️ 检测到风控/验证码：{reason}。")
+        print(f"   请在专用 Chrome 中完成人工验证（滑动/点选等），等待恢复（剩余 {remaining}s）...")
+        time.sleep(min(interval, remaining) if remaining > 0 else interval)
+    print(f"❌ 等待人工处理超时（{timeout}s），已停止当前任务。")
+    print("   可稍后重试；如果频繁出现，请检查网络环境（代理/VPN 出口 IP 可能触发风控）。")
+    return False
 
 
 # ============================================================
@@ -983,6 +1096,10 @@ def describe_login_probe_result(result):
 def check_login_state(cdp_port=DEFAULT_CDP_PORT):
     """通过 CDP 检测 BOSS直聘登录状态。
 
+    用多组关键词/城市轮换探测：单次探测可能因关键词恰好 0 结果而误判
+    （EMPTY），轮换可降低误判；未登录（UNAUTHENTICATED）与风控（RESTRICTED）
+    是确定状态，命中直接返回，不继续轮换。
+
     Returns:
         LoginProbeResult: 登录探测的结构化状态
     """
@@ -996,7 +1113,20 @@ def check_login_state(cdp_port=DEFAULT_CDP_PORT):
         cdp.send("Page.navigate", {"url": "https://www.zhipin.com/"}, sid)
         time.sleep(4)
 
-        return probe_login_state(cdp, sid)
+        last_result = None
+        for query, city_code in LOGIN_PROBE_TARGETS:
+            result = probe_login_state(cdp, sid, query=query, city_code=city_code)
+            if result.status in (
+                LoginProbeStatus.AVAILABLE,
+                LoginProbeStatus.UNAUTHENTICATED,
+                LoginProbeStatus.RESTRICTED,
+            ):
+                return result
+            last_result = result
+        return last_result if last_result is not None else LoginProbeResult(
+            LoginProbeStatus.RESPONSE_ERROR,
+            message="全部探测均无结果",
+        )
     except (requests.ConnectionError, requests.Timeout, KeyError,
             json.JSONDecodeError, websocket.WebSocketException,
             TimeoutError, RuntimeError) as e:
@@ -1389,7 +1519,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             if v == filters["industry"]:
                 filter_desc.append(f"行业={k}")
 
-    print(f"=== BOSS直聘抓取 ===")
+    print("=== BOSS直聘抓取 ===")
     print(f"关键词: {keyword} | 城市: {city_name} | 页数: {max_pages}")
     if filter_desc:
         print(f"筛选: {' | '.join(filter_desc)}")
@@ -1432,10 +1562,19 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 url = build_search_url(keyword, city_code, pg, filters)
                 cdp.send("Page.navigate", {"url": url}, sid)
                 time.sleep(random.uniform(6, 10))
+                # 页面级风控检测：滑块/验证页/登录墙命中时提示人工介入
+                is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                if is_risk:
+                    print(f"⚠️ 搜索页 {reason}，等待人工处理...")
+                    if not wait_for_risk_clear(cdp, sid):
+                        print("列表页风控未解除，停止抓取（保留已抓数据）。")
+                        return {"keyword": keyword, "city": city_name,
+                                "total": len(all_jobs), "jobs": all_jobs}
                 human_scroll(cdp, sid)
                 human_mouse_jitter(cdp, sid)
 
-            # 优先用 API 获取明文数据
+            # 优先用 API 获取明文数据；失败时刷新页面重试（凭证自愈），
+            # 让浏览器重新完成挑战/刷新 stoken，最多 API_ATTEMPT_LIMIT 次。
             api_params = {
                 "scene": "1",
                 "query": keyword,
@@ -1447,10 +1586,26 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 if v:
                     api_params[k] = v
             api_url = f"{API_JOB_LIST_PATH}?{urlencode(api_params)}"
-            api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
-            val = cdp.eval_js(api_js, sid)
 
-            jobs = parse_api_jobs_eval_value(val)
+            jobs = []
+            for attempt in range(API_ATTEMPT_LIMIT):
+                api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
+                val = cdp.eval_js(api_js, sid)
+                jobs = parse_api_jobs_eval_value(val)
+                if jobs:
+                    break
+                if attempt < API_ATTEMPT_LIMIT - 1:
+                    print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
+                    cdp.send("Page.navigate",
+                             {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
+                    time.sleep(random.uniform(6, 10))
+                    is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                    if is_risk:
+                        print(f"⚠️ 刷新后 {reason}，等待人工处理...")
+                        if not wait_for_risk_clear(cdp, sid):
+                            print("风控未解除，停止抓取（保留已抓数据）。")
+                            jobs = []
+                            break
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
             if should_use_dom_fallback(jobs, allow_dom_fallback):
@@ -1465,7 +1620,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     try:
                         jobs = json.loads(val) if isinstance(val, str) else val
                     except (json.JSONDecodeError, ValueError):
-                        print(f"  ⚠️ JSON 解析失败")
+                        print("  ⚠️ JSON 解析失败")
                         jobs = []
             elif not jobs:
                 log.warning("⚠️ API 未返回职位数据，已跳过 DOM fallback；如需强制降级可加 --allow-dom-fallback")
@@ -1565,8 +1720,82 @@ def build_detail_record(job, extracted):
     }
 
 
+def eval_detail_with_retry(ws, sid, detail_url, retries=1):
+    """提取详情页 JS；完全为空时刷新页面重试（凭证自愈）。
+
+    Returns:
+        解析后的 dict（{jd, page_text, tags, url}）；全部失败返回 {"jd": "", "tags": []}。
+    """
+    def _extract_once():
+        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
+        try:
+            return json.loads(val) if isinstance(val, str) else {"jd": "", "tags": []}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {"jd": "", "tags": []}
+
+    d = _extract_once()
+    for _ in range(max(retries, 0)):
+        if d.get("jd") or d.get("page_text"):
+            break
+        print("  ⚠️ 提取为空，刷新页面重试一次...")
+        ws.send("Page.navigate", {"url": detail_url}, sid)
+        time.sleep(random.uniform(5, 10))
+        d = _extract_once()
+    return d
+
+
+def load_existing_detail_ids(output_path=None):
+    """读取已有详情文件中的 job_id 集合，用于跨运行跳过已抓详情。
+
+    Returns:
+        set: 已有 job_id；文件不存在或损坏返回空集合。
+    """
+    if not output_path or not os.path.exists(output_path):
+        return set()
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return set()
+    items = data if isinstance(data, list) else []
+    return {d.get("job_id", "") for d in items if isinstance(d, dict) and d.get("job_id")}
+
+
+def pending_path_for(output_path):
+    """待重试详情 job_id 清单文件路径（与输出文件同目录）。"""
+    return f"{output_path}.pending.json"
+
+
+def load_pending_ids(output_path):
+    """读取上次抓取失败、待重试的详情 job_id 集合。"""
+    path = pending_path_for(output_path)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {str(item).strip() for item in data if str(item).strip()}
+
+
+def save_pending_ids(output_path, ids):
+    """原子写回待重试详情 job_id 列表；空集合时删除文件。"""
+    path = pending_path_for(output_path)
+    if not ids:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return
+    _atomic_write_json(path, sorted(ids))
+
+
 def scrape_details(list_data, max_details=None, output_path=None,
-                   cdp_port=DEFAULT_CDP_PORT, fmt="json"):
+                   cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None):
     jobs = list_data.get("jobs", [])
     if max_details:
         jobs = jobs[:max_details]
@@ -1576,11 +1805,20 @@ def scrape_details(list_data, max_details=None, output_path=None,
     print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
     results = []
     seen_links = set()
+    # 历史 job_id 预加载：已抓过的详情直接跳过（省请求、降风控触发概率）
+    existing_ids = load_existing_detail_ids(output_path)
+    if existing_ids:
+        print(f"ℹ️  已加载 {len(existing_ids)} 个历史详情 job_id，命中直接跳过")
+    # 断点续跑：上次失败待重试的 job_id（即使已在结果文件里也重新抓取）
+    pending = set(pending_ids) if pending_ids is not None else load_pending_ids(output_path)
+    if pending:
+        print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
 
     for idx, job in enumerate(jobs):
         link = job.get("job_link", "")
         title = job.get("title", "")
         company = job.get("boss_name", "")
+        job_id = job.get("job_id", "")
         if not link:
             continue
 
@@ -1589,6 +1827,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
             print(f"[{idx+1}/{len(jobs)}] 跳过重复: {company} - {title}")
             continue
         seen_links.add(link)
+
+        # 跨运行跳过已抓详情（pending 中的例外，待重试）
+        if job_id and job_id in existing_ids and job_id not in pending:
+            print(f"[{idx+1}/{len(jobs)}] 跳过已抓详情: {company} - {title}")
+            continue
 
         t0 = time.time()
         print(f"[{idx+1}/{len(jobs)}] {company} - {title}")
@@ -1601,8 +1844,21 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
         detail_url = build_detail_url(job)
         ws.send("Page.navigate", {"url": detail_url}, sid)
-        print(f"  加载页面...")
+        print("  加载页面...")
         time.sleep(random.uniform(5, 10))
+
+        # 页面级风控检测：滑块/验证页/登录墙命中时提示人工介入
+        is_risk, reason = classify_risk_page(probe_risk_page(ws, sid))
+        if is_risk:
+            print(f"⚠️ 详情页 {reason}，等待人工处理...")
+            if not wait_for_risk_clear(ws, sid):
+                print(f"  风控未解除，跳过该详情: {title}")
+                if job_id:
+                    pending.add(job_id)
+                    save_pending_ids(output_path, pending)
+                ws.send("Target.closeTarget", {"targetId": tid})
+                ws.close()
+                continue
 
         # 模拟人类阅读详情页的滚动行为
         scroll_count = random.randint(3, 7)
@@ -1629,12 +1885,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             }, sid)
             time.sleep(random.uniform(0.5, 1.5))
 
-        print(f"  提取 JD...")
-        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
-        try:
-            d = json.loads(val) if isinstance(val, str) else {"jd": "", "tags": []}
-        except (json.JSONDecodeError, ValueError, TypeError):
-            d = {"jd": "", "tags": []}
+        print("  提取 JD...")
+        d = eval_detail_with_retry(ws, sid, detail_url)
 
         try:
             fields = extract_detail_fields(d)
@@ -1651,12 +1903,18 @@ def scrape_details(list_data, max_details=None, output_path=None,
             ) from exc
         except DetailExtractionError as exc:
             print(f"  跳过无效详情页: {exc}")
+            if job_id:
+                pending.add(job_id)
+                save_pending_ids(output_path, pending)
             ws.send("Target.closeTarget", {"targetId": tid})
             ws.close()
             continue
 
         detail = build_detail_record(job, d)
         results.append(detail)
+        # 抓取成功：从待重试清单移除
+        if job_id:
+            pending.discard(job_id)
 
         if d.get("tags"):
             print(f"  技能: {', '.join(d['tags'])}")
@@ -1677,6 +1935,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
     _atomic_write_json(output_path, results)
+    save_pending_ids(output_path, pending)
+    if pending:
+        print(f"ℹ️  {len(pending)} 个详情待重试（已记录到 {pending_path_for(output_path)}，下次运行自动重试）")
     print(f"\n详情已保存: {output_path}")
 
     if fmt == "csv":
@@ -1768,7 +2029,7 @@ def analyze(list_data, details=None, search_keyword=""):
     print(f"{'='*60}")
 
     # 1. 薪资分析
-    print(f"\n--- 薪资分布 ---")
+    print("\n--- 薪资分布 ---")
     salary_ranges = Counter()
     for j in jobs:
         s = j.get("salary", "")
@@ -1783,7 +2044,7 @@ def analyze(list_data, details=None, search_keyword=""):
         print(f"  {s:<20} {c:>3}  {bar}")
 
     # 2. 经验要求
-    print(f"\n--- 经验要求 ---")
+    print("\n--- 经验要求 ---")
     exp_count = Counter()
     for j in jobs:
         tags = j.get("tags", "")
@@ -1794,7 +2055,7 @@ def analyze(list_data, details=None, search_keyword=""):
         print(f"  {e:<15} {c}")
 
     # 3. 学历要求
-    print(f"\n--- 学历要求 ---")
+    print("\n--- 学历要求 ---")
     edu_count = Counter()
     for j in jobs:
         tags = j.get("tags", "")
@@ -1805,7 +2066,7 @@ def analyze(list_data, details=None, search_keyword=""):
         print(f"  {e:<10} {c}")
 
     # 4. 地区分布
-    print(f"\n--- 地区分布 ---")
+    print("\n--- 地区分布 ---")
     loc_count = Counter()
     for j in jobs:
         loc = j.get("location", "")
@@ -1815,11 +2076,11 @@ def analyze(list_data, details=None, search_keyword=""):
             loc_count[parts[1]] += 1
         elif loc:
             loc_count[loc] += 1
-    for l, c in loc_count.most_common(10):
-        print(f"  {l:<15} {c}")
+    for loc, count in loc_count.most_common(10):
+        print(f"  {loc:<15} {count}")
 
     # 5. 公司分布
-    print(f"\n--- 高频公司 ---")
+    print("\n--- 高频公司 ---")
     company_count = Counter()
     for j in jobs:
         c = j.get("boss_name", "")
@@ -1831,7 +2092,7 @@ def analyze(list_data, details=None, search_keyword=""):
     # 6. 详情页的技能标签（如有）
     body_freq = Counter()
     if details:
-        print(f"\n--- 技能要求频次（来自 JD 标签）---")
+        print("\n--- 技能要求频次（来自 JD 标签）---")
         skill_freq = Counter()
         for d in details:
             for tag in d.get("skill_tags", []):
@@ -1841,7 +2102,7 @@ def analyze(list_data, details=None, search_keyword=""):
             print(f"  {s:<20} {c:>3}/{len(details)}  {bar}")
 
         # 7. JD 正文关键词（动态提取）
-        print(f"\n--- JD 正文高频技术词 ---")
+        print("\n--- JD 正文高频技术词 ---")
         tech_terms = extract_tech_terms_from_jds(details, search_keyword)
         for d in details:
             jd_lower = d.get("jd", "").lower()
@@ -1854,7 +2115,7 @@ def analyze(list_data, details=None, search_keyword=""):
             print(f"  {t:<20} {c:>3}/{len(details)} ({pct:.0f}%)  {bar}")
 
     # 8. 简历建议
-    print(f"\n--- 简历建议 ---")
+    print("\n--- 简历建议 ---")
     if details and body_freq:
         noise_list = {'BOSS直聘', 'boss', 'BOSS', '来自BOSS直聘', '金', '金币'}
         top_skills = [s for s, _ in Counter(
@@ -1940,18 +2201,18 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
     print("[1/3] Python 依赖...")
     deps_ok = require_runtime_dependencies("websocket", "requests")
     if requests is not None:
-        print(f"  ✅ requests 可导入")
+        print("  ✅ requests 可导入")
     if websocket is not None:
-        print(f"  ✅ websocket 可导入")
+        print("  ✅ websocket 可导入")
     if deps_ok:
-        print(f"  ✅ 依赖完整")
+        print("  ✅ 依赖完整")
     else:
         all_pass = False
 
     # 检查 2: CDP 端口连通性
     print("[2/3] CDP 端口连通性...")
     if requests is None:
-        print(f"  ❌ 跳过 — 缺少 requests")
+        print("  ❌ 跳过 — 缺少 requests")
         all_pass = False
     else:
         try:
@@ -1970,13 +2231,13 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
     # 检查 3: BOSS直聘登录状态
     print("[3/3] BOSS直聘登录状态...")
     if not deps_ok:
-        print(f"  ❌ 跳过 — 缺少运行依赖")
+        print("  ❌ 跳过 — 缺少运行依赖")
         all_pass = False
     else:
         try:
             login_result = check_login_state(cdp_port)
             if login_result.status is LoginProbeStatus.AVAILABLE:
-                print(f"  ✅ 已登录")
+                print("  ✅ 已登录")
             elif login_result.status is LoginProbeStatus.EMPTY:
                 print(f"  ⚠️  {describe_login_probe_result(login_result)}")
                 all_pass = False
@@ -2248,7 +2509,7 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
                 return 0 if wait_for_login(cdp_port, timeout=login_timeout) else 1
             return 0
         print(f"\n❌ 端口 {cdp_port} 已被其他 Chrome CDP profile 占用")
-        print(f"   请关闭旧 CDP Chrome，或改用 --cdp-port 指定其他端口")
+        print("   请关闭旧 CDP Chrome，或改用 --cdp-port 指定其他端口")
         return 1
 
     stopped = stop_cdp_chrome(cdp_data_dir)
@@ -2276,10 +2537,10 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
         if not wait_for_login(cdp_port, timeout=login_timeout):
             return 1
     print()
-    print(f"示例:")
-    print(f"  uv run python3 scripts/boss_cdp_raw.py --keyword \"AI Agent\" --city 上海 --pages 3")
-    print(f"  uv run python3 scripts/boss_cdp_raw.py --check")
-    print(f"  uv run python3 scripts/boss_cdp_raw.py --stop-chrome   # 抓完关闭专用 Chrome")
+    print("示例:")
+    print("  uv run python3 scripts/boss_cdp_raw.py --keyword \"AI Agent\" --city 上海 --pages 3")
+    print("  uv run python3 scripts/boss_cdp_raw.py --check")
+    print("  uv run python3 scripts/boss_cdp_raw.py --stop-chrome   # 抓完关闭专用 Chrome")
     print()
     return 0
 
@@ -2412,8 +2673,14 @@ def main():
                    help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
     p.add_argument("--close-chrome", action="store_true",
                    help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="输出 DEBUG 级别日志（调试 CDP 消息、探测详情等）")
 
     args = p.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        log.debug("已开启 DEBUG 日志")
 
     # --check 模式
     if args.check:
@@ -2475,7 +2742,7 @@ def main():
         login_result = check_login_state(args.cdp_port)
         if login_result.status is LoginProbeStatus.UNAUTHENTICATED:
             print("❌ 未检测到 BOSS直聘登录状态。请先在 Chrome 中登录 zhipin.com。")
-            print(f"   可运行 --check 检查环境，或 --setup-chrome 启动 Chrome。")
+            print("   可运行 --check 检查环境，或 --setup-chrome 启动 Chrome。")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.RESTRICTED:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
@@ -2548,7 +2815,7 @@ def main():
         if stopped:
             print(f"\n🧹 已按 --close-chrome 关闭 BOSS 专用 Chrome 进程：{stopped} 个")
         else:
-            print(f"\nℹ️  --close-chrome 未发现运行中的 BOSS 专用 Chrome 进程")
+            print("\nℹ️  --close-chrome 未发现运行中的 BOSS 专用 Chrome 进程")
 
 
 if __name__ == "__main__":

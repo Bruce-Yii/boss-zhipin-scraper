@@ -113,6 +113,228 @@ class ChromeSetupTests(unittest.TestCase):
             ],
         )
 
+    # ----- 页面级风控/验证码检测 -----
+
+    def test_classify_risk_page_clean_page_is_not_risk(self):
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/job_detail/x.html",
+                 "title": "职位详情", "hasSlider": False, "hasLoginWall": False}
+        self.assertEqual(module.classify_risk_page(probe), (False, ""))
+
+    def test_classify_risk_page_detects_verify_url(self):
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/security-check/security.html",
+                 "title": "BOSS直聘", "hasSlider": False, "hasLoginWall": False}
+        is_risk, reason = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertIn("验证", reason)
+
+    def test_classify_risk_page_detects_slider_element(self):
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/", "title": "",
+                 "hasSlider": True, "hasLoginWall": False}
+        is_risk, reason = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertIn("滑块", reason)
+
+    def test_classify_risk_page_detects_login_wall(self):
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/", "title": "",
+                 "hasSlider": False, "hasLoginWall": True}
+        is_risk, reason = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertIn("登录墙", reason)
+
+    def test_classify_risk_page_tolerates_bad_input(self):
+        module = load_module()
+        self.assertEqual(module.classify_risk_page(None), (False, ""))
+        self.assertEqual(module.classify_risk_page({}), (False, ""))
+        self.assertEqual(module.classify_risk_page("not-a-dict"), (False, ""))
+
+    def test_probe_risk_page_returns_empty_on_eval_failure(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = TimeoutError("cdp timeout")
+        self.assertEqual(module.probe_risk_page(cdp, "sid"), {})
+
+    def test_probe_risk_page_parses_json_value(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.return_value = json.dumps(
+            {"url": "x", "title": "安全验证", "hasSlider": True, "hasLoginWall": False}
+        )
+        probe = module.probe_risk_page(cdp, "sid")
+        self.assertEqual(probe["title"], "安全验证")
+        self.assertTrue(probe["hasSlider"])
+
+    def test_wait_for_risk_clear_returns_true_when_risk_resolved(self):
+        module = load_module()
+        cdp = mock.Mock()
+        # 第一次命中风控，第二次恢复
+        probes = [
+            {"url": "security-check", "title": "", "hasSlider": True, "hasLoginWall": False},
+            {"url": "https://www.zhipin.com/job_detail/x.html", "title": "职位详情",
+             "hasSlider": False, "hasLoginWall": False},
+        ]
+        with mock.patch.object(module, "probe_risk_page", side_effect=probes), \
+                mock.patch.object(module.time, "sleep"):
+            self.assertTrue(module.wait_for_risk_clear(cdp, "sid", timeout=30, interval=1))
+
+    def test_wait_for_risk_clear_returns_false_on_timeout(self):
+        module = load_module()
+        cdp = mock.Mock()
+        probe = {"url": "security-check", "title": "安全验证",
+                 "hasSlider": True, "hasLoginWall": False}
+        with mock.patch.object(module, "probe_risk_page", return_value=probe), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.time, "time", side_effect=[0, 1, 2, 999, 1000]):
+            self.assertFalse(module.wait_for_risk_clear(cdp, "sid", timeout=30, interval=1))
+
+    # ----- 凭证自愈 -----
+
+    def test_eval_detail_with_retry_uses_first_success(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"jd": "职位描述\nBuild AI agents", "page_text": "职位描述\nBuild AI agents",
+             "tags": ["Python"], "url": "https://x"})
+        with mock.patch.object(module.time, "sleep"):
+            d = module.eval_detail_with_retry(ws, "sid", "https://x")
+        self.assertEqual(d["jd"], "职位描述\nBuild AI agents")
+        self.assertEqual(ws.eval_js.call_count, 1)
+        ws.send.assert_not_called()
+
+    def test_eval_detail_with_retry_refreshes_on_empty_and_recovers(self):
+        module = load_module()
+        ws = mock.Mock()
+        empty = json.dumps({"jd": "", "page_text": "", "tags": [], "url": "https://x"})
+        good = json.dumps({"jd": "职位描述\nOK", "page_text": "职位描述\nOK",
+                           "tags": [], "url": "https://x"})
+        ws.eval_js.side_effect = [empty, good]
+        with mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0):
+            d = module.eval_detail_with_retry(ws, "sid", "https://x")
+        self.assertEqual(d["jd"], "职位描述\nOK")
+        self.assertEqual(ws.eval_js.call_count, 2)
+        ws.send.assert_called_once_with(
+            "Page.navigate", {"url": "https://x"}, "sid")
+
+    def test_eval_detail_with_retry_gives_up_after_retries(self):
+        module = load_module()
+        ws = mock.Mock()
+        empty = json.dumps({"jd": "", "page_text": "", "tags": [], "url": "https://x"})
+        ws.eval_js.return_value = empty
+        with mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0):
+            d = module.eval_detail_with_retry(ws, "sid", "https://x", retries=2)
+        self.assertEqual(d["jd"], "")
+        self.assertEqual(ws.eval_js.call_count, 3)
+
+    # ----- 历史 job_id 预加载 -----
+
+    def test_load_existing_detail_ids_missing_file_returns_empty(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            self.assertEqual(
+                module.load_existing_detail_ids(str(paths["cdp_profile"] / "none.json")), set())
+
+    def test_load_existing_detail_ids_corrupt_file_returns_empty(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "details.json")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write("{corrupt")
+            self.assertEqual(module.load_existing_detail_ids(target), set())
+
+    def test_load_existing_detail_ids_returns_job_ids(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "details.json")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            payload = [{"job_id": "a", "title": "x"}, {"job_id": "b"},
+                       "not-a-dict", {"title": "no-id"}]
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            self.assertEqual(module.load_existing_detail_ids(target), {"a", "b"})
+
+    # ----- 登录校验轮换探测 -----
+
+    def test_check_login_state_rotates_on_empty_results(self):
+        module = load_module()
+        cdp = mock.Mock()
+        EMPTY = module.LoginProbeResult(module.LoginProbeStatus.EMPTY)
+        AVAILABLE = module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE)
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_login_state",
+                                  side_effect=[EMPTY, EMPTY, AVAILABLE]) as probe_mock, \
+                mock.patch.object(module.time, "sleep"):
+            result = module.check_login_state(cdp_port=9333)
+            # 三组探测目标全部轮换
+            self.assertEqual(probe_mock.call_count, 3)
+        self.assertEqual(result.status, module.LoginProbeStatus.AVAILABLE)
+
+    def test_check_login_state_stops_on_unauthenticated(self):
+        module = load_module()
+        cdp = mock.Mock()
+        UNAUTH = module.LoginProbeResult(module.LoginProbeStatus.UNAUTHENTICATED)
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_login_state", return_value=UNAUTH) as probe_mock, \
+                mock.patch.object(module.time, "sleep"):
+            result = module.check_login_state(cdp_port=9333)
+            # 确定状态直接返回，不轮换
+            self.assertEqual(probe_mock.call_count, 1)
+        self.assertEqual(result.status, module.LoginProbeStatus.UNAUTHENTICATED)
+
+    def test_check_login_state_returns_last_result_when_all_rotations_fail(self):
+        module = load_module()
+        cdp = mock.Mock()
+        RESP_ERR = module.LoginProbeResult(module.LoginProbeStatus.RESPONSE_ERROR,
+                                           message="boom", retryable=True)
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_login_state", return_value=RESP_ERR) as probe_mock, \
+                mock.patch.object(module.time, "sleep"):
+            result = module.check_login_state(cdp_port=9333)
+            self.assertEqual(probe_mock.call_count, len(module.LOGIN_PROBE_TARGETS))
+        self.assertEqual(result.status, module.LoginProbeStatus.RESPONSE_ERROR)
+
+    # ----- 断点续跑（pending 清单）-----
+
+    def test_pending_path_for_appends_suffix(self):
+        module = load_module()
+        self.assertEqual(
+            module.pending_path_for("C:/x/details.json"),
+            "C:/x/details.json.pending.json",
+        )
+
+    def test_load_pending_ids_handles_missing_and_corrupt(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            missing = str(paths["cdp_profile"] / "no.json")
+            self.assertEqual(module.load_pending_ids(missing), set())
+            corrupt = str(paths["cdp_profile"] / "bad.json")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with open(corrupt, "w", encoding="utf-8") as f:
+                f.write("not json")
+            self.assertEqual(module.load_pending_ids(corrupt), set())
+
+    def test_save_and_load_pending_ids_roundtrip(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            module.save_pending_ids(out, {"a", "b"})
+            self.assertEqual(module.load_pending_ids(out), {"a", "b"})
+            module.save_pending_ids(out, set())
+            self.assertEqual(module.load_pending_ids(out), set())
+            self.assertFalse(os.path.exists(module.pending_path_for(out)),
+                             "空集合时应删除 pending 文件")
+
     def test_wait_for_login_explicitly_uses_foreground_target(self):
         module = load_module()
         cdp = mock.Mock()
@@ -1366,6 +1588,7 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("--login-timeout", result.stdout)
         self.assertIn("--stop-chrome", result.stdout)
         self.assertIn("--close-chrome", result.stdout)
+        self.assertIn("--verbose", result.stdout)
 
 
 class tempfile_profile:
