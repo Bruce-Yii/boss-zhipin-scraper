@@ -2255,7 +2255,7 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
             print(f"  ✅ 通过 — CDP 服务: {browser}")
         except (requests.ConnectionError, requests.Timeout):
             print(f"  ❌ 失败 — 无法连接 127.0.0.1:{cdp_port}")
-            print(f"     请先启动 Chrome CDP: python3 {__file__} --setup-chrome")
+            print(f"     请先启动 Chrome CDP: {sys.executable} {__file__} --setup-chrome")
             all_pass = False
         except (json.JSONDecodeError, KeyError) as e:
             print(f"  ❌ 失败 — CDP 响应异常: {e}")
