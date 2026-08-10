@@ -403,5 +403,75 @@ class JobSummaryTests(unittest.TestCase):
         self.assertIn("已上市", text)
 
 
+    def test_experience_bucket_normalizes_tags(self):
+        module = load_summary_module()
+        self.assertEqual(module.experience_bucket("应届"), "应届/在校")
+        self.assertEqual(module.experience_bucket("在校生"), "应届/在校")
+        self.assertEqual(module.experience_bucket("1年以内"), "1-3年")
+        self.assertEqual(module.experience_bucket("1-3年"), "1-3年")
+        self.assertEqual(module.experience_bucket("3-5年"), "3-5年")
+        self.assertEqual(module.experience_bucket("5-10年"), "5-10年")
+        self.assertEqual(module.experience_bucket("10年以上"), "10年以上")
+        self.assertEqual(module.experience_bucket("经验不限"), "经验不限")
+        self.assertEqual(module.experience_bucket("不限经验"), "经验不限")
+        self.assertEqual(module.experience_bucket("乱七八糟"), "未标注")
+
+    def test_salary_by_experience_groups_medians(self):
+        module = load_summary_module()
+        jobs = [
+            {"title": "a", "salary": "30-60K", "tags": "3-5年 | 本科"},
+            {"title": "b", "salary": "20-40K", "tags": "3-5年 | 本科"},
+            {"title": "c", "salary": "10-20K", "tags": "1-3年 | 大专"},
+            {"title": "d", "salary": "未标注", "tags": "3-5年"},
+            {"title": "e", "salary": "25-45K", "tags": ""},
+        ]
+        by_exp = module.salary_by_experience(jobs)
+        self.assertEqual(by_exp["3-5年"]["count"], 3, "a/b/d 三条均带 3-5年")
+        self.assertEqual(by_exp["3-5年"]["median_k"], 45, "解析值 [30,45] 上中位")
+        self.assertEqual(by_exp["3-5年"]["unparsed"], 1, "d 薪资未标注")
+        self.assertEqual(by_exp["1-3年"]["median_k"], 15)
+        self.assertEqual(by_exp["未标注"]["count"], 1, "无经验标签的归未标注")
+        self.assertEqual(by_exp["未标注"]["median_k"], 35)
+        self.assertEqual(by_exp["3-5年"]["unparsed"], 1, "薪资未标注计入组内 unparsed")
+
+    def test_top_salary_jobs_ranks_by_upper_bound(self):
+        module = load_summary_module()
+        jobs = [
+            {"title": "高薪A", "salary": "100-200K", "boss_name": "甲",
+             "location": "上海·浦东"},
+            {"title": "中薪B", "salary": "30-60K", "boss_name": "乙",
+             "location": "上海·徐汇"},
+            {"title": "低薪C", "salary": "10-20K", "boss_name": "丙",
+             "location": "上海·静安"},
+        ]
+        top = module.top_salary_jobs(jobs, 2)
+        self.assertEqual([t["title"] for t in top], ["高薪A", "中薪B"])
+        self.assertEqual(top[0]["salary"], "100-200K")
+
+    def test_build_summary_adds_screening_dimensions(self):
+        module = load_summary_module()
+        jobs = [
+            {"title": "a", "salary": "30-60K", "tags": "3-5年 | 本科",
+             "boss_name": "甲", "location": "上海·浦东"},
+            {"title": "b", "salary": "20-40K", "tags": "3-5年",
+             "boss_name": "乙", "location": "上海·徐汇"},
+        ]
+        summary = module.build_summary(jobs, search_keyword="AI", top=3)
+        self.assertIn("3-5年", summary["salary_by_experience"])
+        self.assertEqual(summary["top_salary"][0]["title"], "a")
+
+    def test_format_summary_includes_screening_lines(self):
+        module = load_summary_module()
+        jobs = [
+            {"title": "a", "salary": "30-60K", "tags": "3-5年",
+             "boss_name": "甲", "location": "上海·浦东"},
+        ]
+        summary = module.build_summary(jobs, search_keyword="AI", city="上海", top=3)
+        text = module.format_summary(summary)
+        self.assertIn("经验薪资", text)
+        self.assertIn("高薪岗位", text)
+        self.assertIn("30-60K", text)
+
+
 if __name__ == "__main__":
     unittest.main()

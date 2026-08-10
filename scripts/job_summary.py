@@ -151,6 +151,90 @@ def salary_stats(jobs):
     }
 
 
+def experience_bucket(tag):
+    """把经验要求标签归一为档位（用于薪资×经验交叉统计）。"""
+    tag = str(tag or "").strip()
+    if tag in {"应届", "在校生"}:
+        return "应届/在校"
+    if tag in {"1年以内", "1-3年"}:
+        return "1-3年"
+    if tag in {"3-5年", "5-10年"}:
+        return tag
+    if tag == "10年以上":
+        return "10年以上"
+    if tag in {"经验不限", "不限经验"}:
+        return "经验不限"
+    return "未标注"
+
+
+def salary_by_experience(jobs):
+    """薪资×经验交叉统计：各经验档位的岗位数、薪资中位数与未标注数。
+
+    对应求职者核心问题"我这个经验水平大概什么价位"（参考开源招聘分析
+    平台 dreamhole 的 salary_median_for_comparison 实践）。
+
+    Returns:
+        dict: {经验档位: {"count", "median_k", "unparsed"}}；档位按
+            应届→10年以上→经验不限→未标注 固定顺序
+    """
+    buckets = {b: [] for b in
+               ("应届/在校", "1-3年", "3-5年", "5-10年", "10年以上",
+                "经验不限", "未标注")}
+    unparsed = {b: 0 for b in buckets}
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        bucket = "未标注"
+        for tag in split_tags(job.get("tags", "")):
+            if is_experience_tag(tag):
+                bucket = experience_bucket(tag)
+                break
+        parsed = parse_salary_monthly(job.get("salary"))
+        if parsed is None:
+            unparsed[bucket] += 1
+            continue
+        low, high = parsed
+        buckets[bucket].append((low + high) / 2)
+
+    result = {}
+    for bucket, mids in buckets.items():
+        if not mids and unparsed[bucket] == 0:
+            continue
+        ordered = sorted(mids)
+        result[bucket] = {
+            "count": len(mids) + unparsed[bucket],
+            "median_k": ordered[len(ordered) // 2] if mids else None,
+            "unparsed": unparsed[bucket],
+        }
+    return result
+
+
+def top_salary_jobs(jobs, n=10):
+    """高薪岗位榜单：按可解析薪资上限降序取前 n 个（纯统计，可靠）。
+
+    Returns:
+        list of dict: {"title", "salary", "company", "location"}；无可解析
+            薪资返回空列表
+    """
+    ranked = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        parsed = parse_salary_monthly(job.get("salary"))
+        if parsed is None:
+            continue
+        ranked.append({
+            "title": str(job.get("title") or "").strip(),
+            "salary": str(job.get("salary") or "").strip(),
+            "company": str(job.get("boss_name") or job.get("company") or "").strip(),
+            "location": str(job.get("location") or "").strip(),
+            "_high": parsed[1],
+        })
+    ranked.sort(key=lambda item: item["_high"], reverse=True)
+    return [{k: v for k, v in item.items() if k != "_high"}
+            for item in ranked[:n]]
+
+
 def filter_details_for_jobs(jobs, details):
     job_ids = {
         str(job.get("job_id")).strip()
@@ -307,6 +391,8 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         "total_details": len([detail for detail in details if isinstance(detail, dict)]),
         "salary_ranges": _most_common(salary_ranges, top),
         "salary_market": salary_stats(jobs),
+        "salary_by_experience": salary_by_experience(jobs),
+        "top_salary": top_salary_jobs(jobs, top),
         "experience": _most_common(experience, top),
         "degrees": _most_common(degrees, top),
         "districts": _most_common(districts, top),
@@ -333,6 +419,33 @@ def _salary_market_line(summary):
             f"（未标注 {market.get('unparsed', 0)} 条）")
 
 
+def _salary_by_experience_line(summary):
+    by_exp = summary.get("salary_by_experience") or {}
+    parts = []
+    for bucket in ("应届/在校", "1-3年", "3-5年", "5-10年", "10年以上",
+                   "经验不限", "未标注"):
+        stat = by_exp.get(bucket)
+        if not stat:
+            continue
+        median = f"{stat['median_k']}K" if stat["median_k"] is not None else "无"
+        parts.append(f"{bucket}:{median}（{stat['count']} 条）")
+    if not parts:
+        return "经验薪资: 暂无"
+    return "经验薪资: " + "、".join(parts)
+
+
+def _top_salary_line(summary, n=5):
+    top = (summary.get("top_salary") or [])[:n]
+    if not top:
+        return "高薪岗位: 暂无"
+    items = []
+    for job in top:
+        company = f"｜{job['company']}" if job["company"] else ""
+        location = f"｜{job['location']}" if job["location"] else ""
+        items.append(f"{job['title']}({job['salary']}){company}{location}")
+    return "高薪岗位: " + "；".join(items)
+
+
 def format_summary(summary):
     title_parts = [summary.get("keyword") or "岗位", summary.get("city") or ""]
     title = " @ ".join(part for part in title_parts if part)
@@ -342,6 +455,8 @@ def format_summary(summary):
         "",
         f"薪资区间: {_format_items(summary['salary_ranges'])}",
         _salary_market_line(summary),
+        _salary_by_experience_line(summary),
+        _top_salary_line(summary),
         f"经验要求: {_format_items(summary['experience'])}",
         f"学历要求: {_format_items(summary['degrees'])}",
         f"地区分布: {_format_items(summary['districts'])}",
