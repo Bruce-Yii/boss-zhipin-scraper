@@ -2080,6 +2080,35 @@ class ChromeSetupTests(unittest.TestCase):
             "https://www.zhipin.com/job_detail/abc.html?lid=lid-123&securityId=sec+value",
         )
 
+    def test_detail_url_rejects_non_zhipin_hosts(self):
+        """job_link 来自外部数据（--merge/--input 不可信文件）时，防止导航到
+        任意站点（对照开源 boss-agent-cli 的 hostname 精确校验实践）。"""
+        module = load_module()
+        for bad in (
+            "https://evil.example/job_detail/abc.html",
+            "https://zhipin.com.evil.example/job",
+            "http://localhost:8080/job",
+            "file:///C:/windows/temp/evil.json",
+        ):
+            self.assertEqual(
+                module.build_detail_url({"job_link": bad}),
+                "",
+                f"非 zhipin.com 主机应拒绝: {bad}",
+            )
+        self.assertEqual(module.build_detail_url({"job_link": ""}), "")
+        self.assertEqual(
+            module.build_detail_url(
+                {"job_link": "https://www.zhipin.com/job_detail/abc.html"}),
+            "https://www.zhipin.com/job_detail/abc.html",
+            "合法 zhipin 链接不受影响",
+        )
+        self.assertEqual(
+            module.build_detail_url(
+                {"job_link": "https://hz.zhipin.com/job/x"}),
+            "https://hz.zhipin.com/job/x",
+            "zhipin 子域合法",
+        )
+
     def test_api_extraction_keeps_detail_context_fields(self):
         module = load_module()
 

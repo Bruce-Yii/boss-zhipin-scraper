@@ -1449,10 +1449,31 @@ def parse_api_jobs_eval_value(value):
     return jobs
 
 
+def is_zhipin_host(url):
+    """精确校验 URL 主机为 zhipin.com 或其子域（防伪造 host 的钓鱼导航）。
+
+    对照开源 boss-agent-cli 实践：不做子串判断（"zhipin.com" in url 会被
+    zhipin.com.evil.example 这类伪造 host 骗过）。
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    host = host.rstrip(".").lower()
+    return host == "zhipin.com" or host.endswith(".zhipin.com")
+
+
 def build_detail_url(job):
-    """Build the URL used for detail navigation without mutating job_link."""
+    """Build the URL used for detail navigation without mutating job_link.
+
+    仅接受 zhipin.com 主机：job_link 可能来自外部文件（--merge/--input），
+    拒绝导航到任意站点。
+    """
     link = job.get("job_link", "")
     if not link:
+        return ""
+    if not is_zhipin_host(link):
+        log.warning(f"跳过非 zhipin.com 详情链接（防外部导航）: {link}")
         return ""
 
     parsed = urlparse(link)
