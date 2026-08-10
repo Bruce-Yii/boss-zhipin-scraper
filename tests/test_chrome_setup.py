@@ -678,6 +678,32 @@ class ChromeSetupTests(unittest.TestCase):
         # 连续失败熔断后不再执行剩余任务（部分任务可能已提交）
         self.assertLessEqual(len(pending_out), 6)
 
+    def test_parallel_bounded_submission_after_circuit_break(self):
+        module = load_module()
+        # 20 个任务、并发 2 → 提交窗口 4；熔断后不应把剩余任务全部提交
+        jobs = self._sample_jobs(20)["jobs"]
+        calls = []
+
+        def always_fail(job, cdp_port, stop_event=None, limiter=None):
+            calls.append(job["job_id"])
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "cdp_session", "message": "boom"}
+
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=always_fail), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids",
+                                  return_value=set()), \
+                mock.patch.object(module, "load_pending_ids",
+                                  return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                limiter=limiter_cls.return_value)
+        self.assertLess(len(calls), 20,
+                        "熔断后不应继续提交剩余任务（有界提交窗口）")
+        self.assertGreaterEqual(len(calls), 3, "至少执行到熔断阈值")
+
     def test_parallel_writes_progressively_and_keeps_existing(self):
         module = load_module()
         jobs = self._sample_jobs(5)["jobs"]

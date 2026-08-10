@@ -38,7 +38,7 @@ import signal
 import logging
 import ntpath
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime
 from collections import Counter
@@ -2198,25 +2198,45 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 save_pending_ids(output_path, pending)
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {
-            pool.submit(_scrape_one_detail, job, cdp_port, stop_event, limiter): job
-            for job in todo
-        }
+        # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
+        # 每完成一个补提交一个；停止信号（熔断/登录墙）后不再补提交。
+        # 相比一次性提交全部：内存有界、停止即时生效（千级任务也安全）。
+        window = max(concurrency * 2, 2)
+        todo_iter = iter(todo)
+        total = len(todo)
+        in_flight = set()
+
+        def run_one(job):
+            return job, _scrape_one_detail(job, cdp_port, stop_event, limiter)
+
+        def fill_window():
+            while len(in_flight) < window:
+                if stop_event.is_set():
+                    return
+                try:
+                    job = next(todo_iter)
+                except StopIteration:
+                    return
+                in_flight.add(pool.submit(run_one, job))
+
+        fill_window()
         completed = 0
-        for future in as_completed(futures):
-            job = futures[future]
-            try:
-                result = future.result()
-            except _cdp_exception_types() as exc:
-                result = {"ok": False, "detail": None,
-                          "job_id": job.get("job_id", ""),
-                          "reason": "cdp_session", "message": str(exc)}
-            handle_result(job, result)
-            completed += 1
-            mark = "✓" if result["ok"] else f"✗ {result['reason']}"
-            print(f"  [并发 {completed}/{len(todo)}] {job.get('title', '')} {mark}")
-            if output_path and completed % write_every == 0:
-                persist()
+        while in_flight:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    job, result = future.result()
+                except _cdp_exception_types() as exc:
+                    result = {"ok": False, "detail": None,
+                              "job_id": "", "reason": "cdp_session",
+                              "message": str(exc)}
+                handle_result(job, result)
+                completed += 1
+                mark = "✓" if result["ok"] else f"✗ {result['reason']}"
+                print(f"  [并发 {completed}/{total}] {job.get('title', '')} {mark}")
+                if output_path and completed % write_every == 0:
+                    persist()
+            fill_window()
     if output_path:
         persist()
     return results, pending
