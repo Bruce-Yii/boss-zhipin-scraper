@@ -610,6 +610,77 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(stats["api_pages"][0], 1)
         self.assertEqual(stats["api_pages"][-1], 3, "空页重试后仍按页循环推进")
 
+    # ----- 阶段进度汇报（每 10 条 / 总量>200 时每 5% 一报）-----
+
+    def test_progress_step_scales_with_total(self):
+        module = load_module()
+        self.assertEqual(module.progress_step(30), 10, "小任务固定每 10 条")
+        self.assertEqual(module.progress_step(100), 10)
+        self.assertEqual(module.progress_step(200), 10, "200 条以内保持 10")
+        self.assertEqual(module.progress_step(209), 11, "超 200 后按 5% 取整")
+        self.assertEqual(module.progress_step(300), 15)
+        self.assertEqual(module.progress_step(500), 25)
+
+    def test_progress_line_only_at_report_points(self):
+        module = load_module()
+        self.assertIsNone(module.progress_line(9, 100, 8), "未到汇报点返回 None")
+        line = module.progress_line(10, 100, 9)
+        self.assertIn("10/100", line)
+        self.assertIn("10%", line)
+        self.assertIn("成功 9", line)
+        self.assertIn("失败 1", line)
+        self.assertIsNone(module.progress_line(14, 300, 10), "300 条按 15 条粒度")
+        self.assertIn("15/300", module.progress_line(15, 300, 11))
+        final = module.progress_line(12, 12, 12)
+        self.assertIn("12/12", final, "完成时即使不整除也应汇报")
+        self.assertIn("100%", final)
+
+    def test_parallel_progress_report_printed_per_step(self):
+        module = load_module()
+        jobs = self._sample_jobs(12)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=self._fake_parallel_worker(state, set())), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids",
+                                  return_value=set()), \
+                mock.patch.object(module, "load_pending_ids",
+                                  return_value=set()), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                limiter=limiter_cls.return_value)
+        printed = out.getvalue()
+        self.assertIn("[进度 10/12", printed, "第 10 条应出阶段汇总")
+        self.assertIn("[进度 12/12", printed, "完成时应出最终汇总")
+
+    def test_serial_progress_report_printed_per_step(self):
+        module = load_module()
+        list_data = {"jobs": self._sample_jobs(12)["jobs"]}
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False):
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as outbuf:
+                module.scrape_details(list_data, output_path=out,
+                                      cdp_port=9222, concurrency=1)
+            printed = outbuf.getvalue()
+            self.assertIn("[进度 10/12", printed, "串行第 10 条应出阶段汇总")
+            self.assertIn("[进度 12/12", printed, "串行完成时应出最终汇总")
+
     # ----- 详情会话失败防护 -----
 
     def _sample_jobs(self, n=3):

@@ -22,6 +22,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
 __version__ = "2.2.0"
 
 import json
+import math
 import time
 import random
 import sys
@@ -2039,6 +2040,40 @@ def run_verify(list_path, details_path=None):
     return 0 if report["ok"] else 1
 
 
+def progress_step(total):
+    """阶段进度汇报粒度：总量 ≤200 条每 10 条一报，超 200 后按 5%（取整）。
+
+    Args:
+        total: 待处理总数
+
+    Returns:
+        int: 汇报间隔（条数，至少 10）
+    """
+    return max(10, int(math.ceil(total * 0.05)))
+
+
+def progress_line(completed, total, ok_count):
+    """生成阶段进度汇总行；未到汇报点返回 None（避免刷屏）。
+
+    每 progress_step(total) 条汇报一次，完成时（completed == total）
+    即使不整除也汇报，保证任务结束有最终汇总。
+
+    Args:
+        completed: 已处理条数
+        total: 总数
+        ok_count: 成功条数
+
+    Returns:
+        str|None: 汇总行文本
+    """
+    if total <= 0:
+        return None
+    if completed % progress_step(total) != 0 and completed != total:
+        return None
+    pct = completed / total * 100
+    return f"  [进度 {completed}/{total} {pct:.0f}%] 成功 {ok_count}，失败 {completed - ok_count}"
+
+
 class TokenBucket:
     """线程安全的全局速率限制令牌桶。
 
@@ -2280,6 +2315,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         return results
 
     consecutive_cdp_errors = 0
+    serial_ok = 0
 
     for idx, job in enumerate(jobs):
         link = job.get("job_link", "")
@@ -2311,6 +2347,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         if result["ok"]:
             detail = result["detail"]
             results.append(detail)
+            serial_ok += 1
             # 抓取成功：从待重试清单移除
             if job_id:
                 pending.pop(job_id, None)
@@ -2348,6 +2385,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
         # 详情页间隔加大，随机 10-25 秒
         gap = random.uniform(10, 25)
         print(f"  等待 {gap:.0f}s 后抓下一个...\n")
+        progress = progress_line(idx + 1, len(jobs), serial_ok)
+        if progress:
+            print(progress)
         time.sleep(gap)
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
@@ -2464,6 +2504,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
 
         fill_window()
         completed = 0
+        parallel_ok = 0
         while in_flight:
             done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
             for future in done:
@@ -2475,8 +2516,13 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                               "message": str(exc)}
                 handle_result(job, result)
                 completed += 1
+                if result["ok"]:
+                    parallel_ok += 1
                 mark = "✓" if result["ok"] else f"✗ {result['reason']}"
                 print(f"  [并发 {completed}/{total}] {job.get('title', '')} {mark}")
+                progress = progress_line(completed, total, parallel_ok)
+                if progress:
+                    print(progress)
                 if output_path and completed % write_every == 0:
                     persist()
             fill_window()
