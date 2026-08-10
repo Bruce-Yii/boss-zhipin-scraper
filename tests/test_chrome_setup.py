@@ -1090,6 +1090,56 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("keyword=AI", printed)
         self.assertTrue(result["jobs"], "导出数据仍正常返回")
 
+    # ----- DoD 验收（规格 §4）-----
+
+    def test_dod4_idempotent_repeat_flush_no_growth(self):
+        """DoD 4 幂等：同日重复写入同一数据 → job_id 集合一致、文件不膨胀。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            jobs = [{"job_id": f"job-{i}", "title": f"T{i}"} for i in range(10)]
+            module.flush_jobs(target, {"keyword": "AI"}, jobs)
+            with open(target, encoding="utf-8") as f:
+                first = json.load(f)
+            module.flush_jobs(target, {"keyword": "AI"}, jobs)
+            with open(target, encoding="utf-8") as f:
+                second = json.load(f)
+            self.assertEqual([j["job_id"] for j in first["jobs"]],
+                             [j["job_id"] for j in second["jobs"]],
+                             "重复写入 job_id 集合一致")
+            self.assertEqual(len(second["jobs"]), 10, "不膨胀")
+            self.assertEqual(second["job_count"], 10)
+
+    def test_dod5_login_failure_exits_nonzero(self):
+        """DoD 5 失败信号：登录失效 → 非零退出码 + 明确报错。"""
+        module = load_module()
+        UNAUTH = module.LoginProbeResult(module.LoginProbeStatus.UNAUTHENTICATED)
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
+        ]), \
+                mock.patch.object(module, "require_runtime_dependencies",
+                                  return_value=True), \
+                mock.patch.object(module, "resolve_city",
+                                  return_value=("上海", "101020100")), \
+                mock.patch.object(module, "check_login_state",
+                                  return_value=UNAUTH), \
+                mock.patch.object(module, "scrape_list") as scrape, \
+                redirect_stdout(io.StringIO()) as output:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 1, "登录失败应非零退出")
+        self.assertIn("未检测到 BOSS直聘登录状态", output.getvalue())
+        scrape.assert_not_called(), "登录失败时零请求发出"
+
+    def test_dod6_risk_compliance_no_bypass_no_high_frequency(self):
+        """DoD 6 风控合规：源码自查——无 headless 伪装、无验证码绕过、
+        页间等待有下限（低频随机节奏）。"""
+        source = (ROOT_PATH / "scripts" / "boss_cdp_raw.py").read_text(encoding="utf-8")
+        self.assertNotIn("headless", source.lower(), "禁止 headless 伪装")
+        self.assertIn("wait_for_risk_clear", source, "验证码必须人工介入")
+        self.assertIn("random.uniform(12, 22)", source, "翻页间隔 12-22s 随机")
+        self.assertNotIn("--disable-web-security", source)
+
     # ----- 详情会话失败防护 -----
 
     def _sample_jobs(self, n=3):
