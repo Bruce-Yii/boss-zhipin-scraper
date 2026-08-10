@@ -209,7 +209,7 @@ def _city_data_path():
         from importlib.resources import files  # py3.9+
         pkg_data = files(__package__ or "__main__").joinpath("..", "data", CITY_DATA_FILENAME) \
             if __package__ else None
-    except Exception:
+    except Exception:  # 有意宽捕：importlib.resources 在不同 Python/打包形态抛不同类型异常
         pkg_data = None
     if pkg_data is not None and os.path.isfile(str(pkg_data)):
         return str(pkg_data)
@@ -2051,7 +2051,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT):
                 task["keyword"], task["city"], task["pages"], filters, None,
                 cdp_port=cdp_port, max_jobs=None,
             )
-        except Exception as e:
+        except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
             print(f"  ❌ 任务失败: {e}")
         if i < len(tasks) - 1:
@@ -3086,7 +3086,7 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
             else:
                 print(f"  ❌ {describe_login_probe_result(login_result)}")
                 all_pass = False
-        except Exception as e:
+        except Exception as e:  # 有意宽捕：--check 是诊断命令，任何异常都应报错而非崩溃
             print(f"  ❌ 检测失败: {e}")
             all_pass = False
 
@@ -3131,7 +3131,7 @@ def prepare_cdp_profile(copy_login_state=False, reset=False):
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(src, dst)
                     copied += 1
-                except Exception as e:
+                except Exception as e:  # 有意宽捕：单个 cookie 文件复制失败不应中断其余文件
                     print(f"  ⚠️  复制 {os.path.basename(src)} 失败: {e}")
 
     return {
@@ -3146,7 +3146,9 @@ def is_cdp_ready(cdp_port):
     try:
         resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2)
         return resp.status_code == 200
-    except Exception:
+    except (OSError, TimeoutError):
+        # requests 的 ConnectionError/Timeout 都是 OSError 子类；只吞网络层错误，
+        # 其余意外异常（如 ValueError）照常抛出便于排查
         return False
 
 
@@ -3186,7 +3188,8 @@ def iter_chrome_process_commands():
                 ["powershell", "-NoProfile", "-Command", ps_script],
                 capture_output=True, text=True, timeout=5,
             )
-        except Exception:
+        except (OSError, subprocess.TimeoutExpired):
+            # 进程枚举失败不阻塞主流程：调用方按"无进程"处理
             return []
         if not r.stdout.strip():
             return []
@@ -3211,7 +3214,8 @@ def iter_chrome_process_commands():
 
     try:
         r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5)
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
+        # 进程枚举失败不阻塞主流程：调用方按"无进程"处理
         return []
 
     processes = []

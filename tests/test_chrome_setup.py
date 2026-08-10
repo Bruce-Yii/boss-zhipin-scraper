@@ -849,6 +849,46 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(calls[0][1]["max_jobs"], None)
             self.assertEqual(sleep.call_count, 1, "两个任务之间只等一次")
 
+    # ----- 宽 except 收紧（技术债 #2）-----
+
+    def test_is_cdp_ready_lets_unexpected_errors_escape(self):
+        module = load_module()
+        fake_requests = mock.Mock()
+        with mock.patch.object(module, "requests", fake_requests):
+            fake_requests.get.side_effect = ValueError("unexpected")
+            with self.assertRaises(ValueError):
+                module.is_cdp_ready(9222)
+            fake_requests.get.side_effect = ConnectionError
+            self.assertFalse(module.is_cdp_ready(9222), "连接类错误应返回 False")
+            fake_requests.get.side_effect = TimeoutError
+            self.assertFalse(module.is_cdp_ready(9222))
+            fake_requests.get.side_effect = None
+            fake_requests.get.return_value = type("Resp", (), {"status_code": 200})()
+            self.assertTrue(module.is_cdp_ready(9222))
+            fake_requests.get.return_value = type("Resp", (), {"status_code": 503})()
+            self.assertFalse(module.is_cdp_ready(9222))
+
+    def test_iter_chrome_process_commands_lets_unexpected_errors_escape(self):
+        module = load_module()
+        with mock.patch.object(module.platform, "system",
+                               return_value="Windows"), \
+                mock.patch.object(module.subprocess, "run",
+                                  side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError):
+                module.iter_chrome_process_commands()
+        with mock.patch.object(module.platform, "system",
+                               return_value="Windows"), \
+                mock.patch.object(module.subprocess, "run",
+                                  side_effect=OSError("boom")):
+            self.assertEqual(module.iter_chrome_process_commands(), [],
+                             "OSError 应兜底返回空列表")
+        with mock.patch.object(module.platform, "system",
+                               return_value="Linux"), \
+                mock.patch.object(module.subprocess, "run",
+                                  side_effect=OSError("boom")):
+            self.assertEqual(module.iter_chrome_process_commands(), [],
+                             "POSIX 分支 OSError 同样兜底")
+
     # ----- 详情会话失败防护 -----
 
     def _sample_jobs(self, n=3):
@@ -2379,13 +2419,13 @@ class ChromeSetupTests(unittest.TestCase):
         calls = {"copy2": [], "run": [], "popen": []}
         fake_requests = mock.Mock()
         responses = iter([
-            Exception("not ready"),
+            ConnectionError("not ready"),
             type("Resp", (), {"status_code": 200})(),
         ])
 
         def fake_get(*args, **kwargs):
             response = next(responses)
-            if isinstance(response, Exception):
+            if isinstance(response, BaseException):
                 raise response
             return response
 
