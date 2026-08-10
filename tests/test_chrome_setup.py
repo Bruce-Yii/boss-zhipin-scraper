@@ -1029,6 +1029,30 @@ class ChromeSetupTests(unittest.TestCase):
             for secret in ("cookie", "token", "wt2", "zp_stoken", "password"):
                 self.assertNotIn(secret, raw.lower())
 
+    def test_export_excludes_internal_boss_ids(self):
+        """规格侧建议：security_id/lid/encrypt_* 等 BOSS 内部标识不落导出文件
+        （下游误读风险，且非契约字段）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            module.flush_jobs(target, {"keyword": "AI"}, [{
+                "job_id": "a", "title": "T", "location": "深圳",
+                "job_link": "https://www.zhipin.com/job_detail/x.html",
+                "company_name": "某科技",
+                "security_id": "sec", "lid": "lid-1",
+                "encrypt_job_id": "ej", "encrypt_boss_id": "eb",
+                "encrypt_brand_id": "er",
+            }])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            job = data["jobs"][0]
+            for internal in ("security_id", "lid", "encrypt_job_id",
+                             "encrypt_boss_id", "encrypt_brand_id"):
+                self.assertNotIn(internal, job, f"内部标识不应导出: {internal}")
+            self.assertEqual(job["job_link"],
+                             "https://www.zhipin.com/job_detail/x.html",
+                             "job_link 是公开信息保留")
+
     def test_scrape_list_emits_export_ok_line(self):
         module = load_module()
         cdp = mock.Mock()

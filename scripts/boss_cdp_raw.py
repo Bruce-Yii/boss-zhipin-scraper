@@ -1340,10 +1340,14 @@ def _atomic_write_json(path, payload):
 
 _SENSITIVE_KEYS = ("cookie", "token", "wt2", "zp_stoken", "zp_token",
                    "password", "account", "auth", "secret")
+# BOSS 内部标识字段（规格侧建议剔除：下游误读风险，非契约字段；
+# 详情抓取用 job_link 即可导航，不依赖这些参数）
+_INTERNAL_KEYS = ("security_id", "lid", "encrypt_job_id",
+                  "encrypt_boss_id", "encrypt_brand_id")
 
 
 def _sanitize_job(job):
-    """导出前过滤敏感字段（规格 NFR-6：不落任何登录凭据）。
+    """导出前过滤敏感字段与 BOSS 内部标识（规格 NFR-6 + 联调建议）。
 
     外部数据（--merge/--input）可能夹带凭据字段；列表 API 字段均为公开
     职位信息，不受影响。
@@ -1351,7 +1355,8 @@ def _sanitize_job(job):
     if not isinstance(job, dict):
         return job
     return {k: v for k, v in job.items()
-            if not any(s in k.lower() for s in _SENSITIVE_KEYS)}
+            if not any(s in k.lower() for s in _SENSITIVE_KEYS)
+            and k not in _INTERNAL_KEYS}
 
 
 def flush_jobs(path, meta, jobs):
