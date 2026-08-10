@@ -3,6 +3,11 @@
 ## v2.3.0 (2026-08-11)
 
 ### 新增
+- **导出契约 v1**（ai-pm-job-intel 规格 §3.2）：导出 JSON 顶层加 `format_version: 1`；meta 补 `page_count`/`warnings`（API 空数据、风控等异常留痕）
+- jobs 字段契约化：新增 `company_name`（与 boss_name 同值，规格必填）、`experience`/`education` 独立字段（原合并于 tags）、`skills` 改为数组
+- **AS-8 结构化结果行**：抓取完成输出 `EXPORT_OK jobs=N city=X keyword=Y path=Z`，风控中断输出 `EXPORT_FAIL reason=...`，供下游 30 秒判断可信度
+- **NFR-3 合规**：列表 API 尝试上限 3→2（最多 1 次自动重试）
+- **NFR-6 安全**：导出前过滤敏感字段（cookie/token/账号等，防外部数据混入凭据）
 - job_summary 新增**薪资×经验交叉表**（各经验档位的岗位数/薪资中位数，参考开源招聘分析 dreamhole 实践）与**高薪岗位榜单**（按薪资上限 TOP N：岗位/薪资/公司/地区），补齐"筛选值得投的岗位"环节
 - job_summary 新增**薪资行情统计**（可解析条数/中位月薪/均值/区间，支持 K 与日薪折算）与**公司规模/融资阶段分布**；提示词新增"薪酬预期建议"维度
 - job_summary 提示词**转交给 agent 做语义分析**：移除 JD 高频词（语义弱替代、污染高），提示词引用完整列表/详情数据文件路径，引导 agent 读取文件做深度调研；脚本只保留可靠的聚合统计与结构化技能标签

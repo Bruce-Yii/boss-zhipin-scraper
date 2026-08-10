@@ -188,6 +188,27 @@ python3 scripts/job_summary.py --top 15
 | `--cdp-port` | CDP 端口（默认 9222） |
 | `--scale/--salary/--experience/--degree` | 筛选条件 |
 
+## 导出契约 v1
+
+列表 JSON 为下游程序提供稳定契约（供 ai-pm-job-intel 等系统消费）：
+
+```json
+{
+  "format_version": 1,
+  "keyword": "AI产品经理", "city": "上海",
+  "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
+  "jobs": [
+    {"job_id": "...", "title": "...", "location": "...", "job_link": "...",
+     "company_name": "...", "salary": "25-35K", "experience": "3-5年",
+     "education": "本科", "skills": ["大模型", "Agent"], "...": "..."}
+  ]
+}
+```
+
+- `format_version` 递增表示契约变更；`warnings` 记录采集异常（API 空数据/风控）
+- 必填字段：`job_id`/`title`/`location`/`job_link`/`company_name`；导出前自动过滤敏感字段（凭据不落文件）
+- 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
+
 ## 抓取后摘要与提示词
 
 `scripts/job_summary.py` 只读取已抓取的 `boss_jobs_*.json` 和 `boss_details_*.json`，做**可靠聚合统计**（薪资行情/经验薪资/高薪岗位榜/经验/学历/地区/公司/规模/融资阶段/技能标签）并生成一段可复制提示词。它不读取本地简历文件，不引入 PDF 依赖，也不给个人与岗位做分数判断。

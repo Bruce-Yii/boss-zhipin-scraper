@@ -64,11 +64,12 @@ CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 # 请求频率保护
 MAX_PAGES = 10          # 单次最大页数
 MAX_API_REQUESTS = 500  # 单次最大 API 请求数
-API_ATTEMPT_LIMIT = 3   # 列表 API 单页最大尝试次数（凭证自愈重试）
+API_ATTEMPT_LIMIT = 2   # 列表 API 单页最大尝试次数（规格 NFR-3：最多 1 次自动重试）
 MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
+FORMAT_VERSION = 1              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；契约变更时递增）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -528,13 +529,16 @@ FETCH_API_JS_TEMPLATE = """
             location: (j.cityName || '') + '\\u00b7' + (j.areaDistrict || '') + '\\u00b7' + (j.businessDistrict || ''),
             tags: [j.jobExperience || '', j.jobDegree || ''].filter(function(t){return t && t !== '\\u4e0d\\u9650';}).join(' | '),
             boss_name: j.brandName || '',
+            company_name: j.brandName || '',
             boss_title: j.bossTitle || '',
             boss_active_status: j.activeTimeDesc || (j.bossOnline ? '\\u5728\\u7ebf' : ''),
+            experience: j.jobExperience || '',
+            education: j.jobDegree || '',
             company_scale: j.brandScaleName || '',
             company_stage: j.brandStageName || '',
             company_industry: j.brandIndustry || '',
             job_labels: (j.jobLabels || []).join(' | '),
-            skills: (j.skills || []).join(' | '),
+            skills: j.skills || [],
             security_id: j.securityId || '',
             lid: j.lid || '',
             encrypt_job_id: j.encryptJobId || '',
@@ -1333,6 +1337,22 @@ def _atomic_write_json(path, payload):
                 pass
 
 
+_SENSITIVE_KEYS = ("cookie", "token", "wt2", "zp_stoken", "zp_token",
+                   "password", "account", "auth", "secret")
+
+
+def _sanitize_job(job):
+    """导出前过滤敏感字段（规格 NFR-6：不落任何登录凭据）。
+
+    外部数据（--merge/--input）可能夹带凭据字段；列表 API 字段均为公开
+    职位信息，不受影响。
+    """
+    if not isinstance(job, dict):
+        return job
+    return {k: v for k, v in job.items()
+            if not any(s in k.lower() for s in _SENSITIVE_KEYS)}
+
+
 def flush_jobs(path, meta, jobs):
     """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留"""
     existing_jobs = []
@@ -1344,8 +1364,9 @@ def flush_jobs(path, meta, jobs):
         except (json.JSONDecodeError, OSError, ValueError):
             pass
     merged = merge_unique(existing_jobs, jobs)
+    meta["format_version"] = FORMAT_VERSION
     meta["total"] = len(merged)
-    meta["jobs"] = merged
+    meta["jobs"] = [_sanitize_job(j) for j in merged]
     _atomic_write_json(path, meta)
 
 
@@ -1581,6 +1602,10 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
         print(f"筛选: {' | '.join(filter_desc)}")
     print()
 
+    # 契约 meta（规格 §3.2）：实际翻页数与异常提示，随每次写盘落文件
+    actual_pages = 0
+    warnings = []
+
     tid, sid = create_page_session(cdp)
 
     def human_scroll(cdp, sid):
@@ -1610,6 +1635,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
     try:
         for pg in range(1, max_pages + 1):
+            actual_pages = pg
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
             incr_request()
 
@@ -1624,6 +1650,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     print(f"⚠️ 搜索页 {reason}，等待人工处理...")
                     if not wait_for_risk_clear(cdp, sid):
                         print("列表页风控未解除，停止抓取（保留已抓数据）。")
+                        warnings.append(f"搜索页风控未解除: {reason}")
+                        print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         return {"keyword": keyword, "city": city_name,
                                 "total": len(all_jobs), "jobs": all_jobs}
                 human_scroll(cdp, sid)
@@ -1652,6 +1680,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     break
                 if attempt < API_ATTEMPT_LIMIT - 1:
                     print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
+                    warnings.append(f"第{pg}页API未返回数据，已刷新重试")
                     cdp.send("Page.navigate",
                              {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
                     time.sleep(random.uniform(6, 10))
@@ -1660,11 +1689,13 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         print(f"⚠️ 刷新后 {reason}，等待人工处理...")
                         if not wait_for_risk_clear(cdp, sid):
                             print("风控未解除，停止抓取（保留已抓数据）。")
+                            warnings.append(f"刷新后风控未解除: {reason}")
                             jobs = []
                             break
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
             if should_use_dom_fallback(jobs, allow_dom_fallback):
+                warnings.append(f"第{pg}页API获取失败，回退DOM提取（数据可能不完整）")
                 log.warning("⚠️ API 获取失败，回退到 DOM 提取（此方式已弃用，数据可能不完整）")
                 if pg > 1:
                     url = build_search_url(keyword, city_code, pg, filters)
@@ -1712,6 +1743,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "filters": filters,
                     "filter_desc": filter_desc,
                     "scraped_at": datetime.now().isoformat(),
+                    "page_count": pg,
+                    "warnings": warnings,
                 }, all_jobs)
 
             # 条数上限：抓够即停，不再翻页（BOSS 每页 30 条，实际可能略超上限）
@@ -1743,6 +1776,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             "filters": filters,
             "filter_desc": filter_desc,
             "scraped_at": datetime.now().isoformat(),
+            "page_count": actual_pages or 1,
+            "warnings": warnings,
         }, all_jobs)
         print(f"已保存: {output_path}")
 
@@ -1753,6 +1788,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     else:
         print("无数据")
 
+    # AS-8 结构化结果行（规格 §3.4）：供下游程序/人 30 秒判断本次导出可信度
+    print(f"EXPORT_OK jobs={len(all_jobs)} city={city_name} keyword={keyword} path={output_path}")
     return {"keyword": keyword, "city": city_name, "total": len(all_jobs), "jobs": all_jobs}
 
 

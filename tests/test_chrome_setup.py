@@ -889,6 +889,106 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(module.iter_chrome_process_commands(), [],
                              "POSIX 分支 OSError 同样兜底")
 
+    # ----- S1 契约层（ai-pm-job-intel 规格 v1.0）-----
+
+    REQUIRED_JOB_FIELDS = ["job_id", "title", "location", "job_link", "company_name"]
+
+    def test_flush_jobs_emits_contract_meta(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            meta = {"keyword": "AI", "page_count": 2,
+                    "warnings": ["第3页疑似空数据"]}
+            module.flush_jobs(target, dict(meta), [{"job_id": "a", "title": "T"}])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["format_version"], 1)
+            self.assertEqual(data["page_count"], 2)
+            self.assertEqual(data["warnings"], ["第3页疑似空数据"])
+
+    def test_fetch_api_template_emits_contract_fields(self):
+        module = load_module()
+        js = module.FETCH_API_JS_TEMPLATE
+        self.assertIn("company_name: j.brandName", js)
+        self.assertIn("experience: j.jobExperience", js)
+        self.assertIn("education: j.jobDegree", js)
+        self.assertIn("skills: j.skills", js)
+        self.assertNotIn("(j.skills || []).join", js, "skills 应为数组而非拼接字符串")
+
+    def test_retry_limit_matches_contract(self):
+        module = load_module()
+        self.assertEqual(module.API_ATTEMPT_LIMIT, 2, "NFR-3 最多 1 次重试")
+
+    def test_export_jobs_cover_required_fields(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            module.flush_jobs(target, {"keyword": "AI"}, [{
+                "job_id": "a", "title": "T", "location": "深圳 南山",
+                "job_link": "https://www.zhipin.com/job_detail/x.html",
+                "company_name": "某科技",
+            }])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            for job in data["jobs"]:
+                for field in self.REQUIRED_JOB_FIELDS:
+                    self.assertTrue(str(job.get(field) or "").strip(),
+                                    f"必填字段缺失: {field}")
+
+    def test_export_has_no_sensitive_fields(self):
+        """NFR-6：导出文件不落任何登录凭据（外部数据经 --merge/--input 混入时过滤）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            module.flush_jobs(target, {"keyword": "AI"}, [{
+                "job_id": "a", "title": "T", "location": "深圳",
+                "job_link": "https://www.zhipin.com/job_detail/x.html",
+                "company_name": "某科技",
+                "cookie": "secret", "token": "t", "wt2": "x",
+                "zp_stoken": "y", "password": "p",
+            }])
+            with open(target, encoding="utf-8") as f:
+                raw = f.read()
+            for secret in ("cookie", "token", "wt2", "zp_stoken", "password"):
+                self.assertNotIn(secret, raw.lower())
+
+    def test_scrape_list_emits_export_ok_line(self):
+        module = load_module()
+        cdp = mock.Mock()
+        stats = {"api_pages": []}
+
+        def fake_eval_js(script, sid=None):
+            if "xhr.open" not in script:
+                return None
+            m = re.search(r"page=(\d+)", script)
+            pg = int(m.group(1)) if m else 1
+            stats["api_pages"].append(pg)
+            if pg > 1:
+                return json.dumps([])
+            jobs = [
+                {"title": f"AI岗位-{i}",
+                 "job_link": f"https://www.zhipin.com/job/{i}",
+                 "salary": "20-40K", "boss_name": f"公司{i}"}
+                for i in range(3)
+            ]
+            return json.dumps(jobs)
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with mock.patch.object(module, "resolve_city",
+                               return_value=("深圳", "101280600")), \
+                mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
+            result = module.scrape_list("AI", "深圳", 2, {}, None)
+        printed = out.getvalue()
+        self.assertIn("EXPORT_OK jobs=3", printed)
+        self.assertIn("city=深圳", printed)
+        self.assertIn("keyword=AI", printed)
+        self.assertTrue(result["jobs"], "导出数据仍正常返回")
+
     # ----- 详情会话失败防护 -----
 
     def _sample_jobs(self, n=3):

@@ -186,6 +186,27 @@ python3 scripts/job_summary.py --top 15
 | `--cdp-port` | CDP port (default 9222) |
 | `--scale/--salary/--experience/--degree` | Filters |
 
+## Export Contract v1
+
+The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-job-intel):
+
+```json
+{
+  "format_version": 1,
+  "keyword": "AI产品经理", "city": "上海",
+  "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
+  "jobs": [
+    {"job_id": "...", "title": "...", "location": "...", "job_link": "...",
+     "company_name": "...", "salary": "25-35K", "experience": "3-5年",
+     "education": "本科", "skills": ["大模型", "Agent"], "...": "..."}
+  ]
+}
+```
+
+- `format_version` increments on contract changes; `warnings` records scrape anomalies (empty API responses / risk blocks)
+- Required fields: `job_id`/`title`/`location`/`job_link`/`company_name`; sensitive fields are stripped before writing (credentials never land in files)
+- On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)
+
 ## Post-Scrape Summary & Prompt
 
 `scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, computes **reliable aggregate stats** (salary market / salary-by-experience / top-salary ranking / experience / degree / district / company / scale / stage / skill tags) and produces a copy-paste prompt. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
