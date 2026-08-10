@@ -164,10 +164,12 @@ python3 scripts/job_summary.py --top 15
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
 | `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速） |
+| `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
+| `--verify` | 校验已抓取结果文件完整性（列表/详情可解析、字段齐全、JD 完整、覆盖率；只校验不抓取，不依赖 Chrome） |
 | `--smoke-test` | 用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test，不写结果文件 |
 | `--setup-chrome` | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile（默认、首次启动、重复启动都不复制） |

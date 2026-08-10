@@ -306,6 +306,55 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(probe_mock.call_count, len(module.LOGIN_PROBE_TARGETS))
         self.assertEqual(result.status, module.LoginProbeStatus.RESPONSE_ERROR)
 
+    # ----- 登录探测会话内缓存 -----
+
+    def test_check_login_state_caches_result_within_ttl(self):
+        module = load_module()
+        cdp = mock.Mock()
+        AVAILABLE = module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE)
+        with mock.patch.object(module, "CDPSession", return_value=cdp) as cdp_mock, \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_login_state",
+                                  return_value=AVAILABLE) as probe_mock, \
+                mock.patch.object(module.time, "sleep"):
+            first = module.check_login_state(cdp_port=9333)
+            second = module.check_login_state(cdp_port=9333)
+            self.assertIs(second, first, "TTL 内应直接复用缓存结果")
+            self.assertEqual(cdp_mock.call_count, 1, "TTL 内不应重复连接 CDP")
+            self.assertEqual(probe_mock.call_count, 1)
+
+    def test_check_login_state_cache_expires_after_ttl(self):
+        module = load_module()
+        cdp = mock.Mock()
+        UNAUTH = module.LoginProbeResult(module.LoginProbeStatus.UNAUTHENTICATED)
+        with mock.patch.object(module, "CDPSession", return_value=cdp) as cdp_mock, \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_login_state",
+                                  return_value=UNAUTH) as probe_mock, \
+                mock.patch.object(module.time, "sleep"):
+            module.check_login_state(cdp_port=9333)
+            module._LOGIN_PROBE_CACHE["ts"] -= module.LOGIN_PROBE_CACHE_TTL + 1
+            module.check_login_state(cdp_port=9333)
+            self.assertEqual(cdp_mock.call_count, 2, "缓存过期后应重新探测")
+            self.assertEqual(probe_mock.call_count, 2)
+
+    def test_check_login_state_use_cache_false_bypasses_cache(self):
+        module = load_module()
+        cdp = mock.Mock()
+        AVAILABLE = module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE)
+        with mock.patch.object(module, "CDPSession", return_value=cdp) as cdp_mock, \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_login_state",
+                                  return_value=AVAILABLE) as probe_mock, \
+                mock.patch.object(module.time, "sleep"):
+            module.check_login_state(cdp_port=9333)
+            module.check_login_state(cdp_port=9333, use_cache=False)
+            self.assertEqual(cdp_mock.call_count, 2, "use_cache=False 应强制重新探测")
+            self.assertEqual(probe_mock.call_count, 2)
+
     # ----- 断点续跑（pending 清单）-----
 
     def test_pending_path_for_appends_suffix(self):
@@ -358,6 +407,126 @@ class ChromeSetupTests(unittest.TestCase):
                 json.dump(["legacy-1", "legacy-2"], f)
             self.assertEqual(module.load_pending_ids(out),
                              {"legacy-1": 0, "legacy-2": 0})
+
+    def test_load_pending_ids_force_ids_override_retry_limit(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            module.save_pending_ids(out, {"job-giveup": 3, "job-retry": 1})
+            pending = module.load_pending_ids(out, force_ids=["job-giveup"])
+            self.assertIn("job-giveup", pending, "白名单内已达上限的 job 应强制重试")
+            self.assertIn("job-retry", pending)
+
+    def test_load_pending_ids_force_ids_add_unknown_jobs(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            module.save_pending_ids(out, {"job-a": 1})
+            pending = module.load_pending_ids(out, force_ids=["job-a", "job-new"])
+            self.assertIn("job-new", pending, "白名单里文件未记录的 job 也应加入重试")
+            self.assertEqual(pending["job-new"], 0)
+
+    # ----- --verify 结果文件校验 -----
+
+    def _write_verify_files(self, paths, jobs, details,
+                            list_name="boss_jobs_x.json",
+                            detail_name="boss_details_x.json"):
+        list_path = str(paths["cdp_profile"] / list_name)
+        detail_path = str(paths["cdp_profile"] / detail_name)
+        os.makedirs(paths["cdp_profile"], exist_ok=True)
+        with open(list_path, "w", encoding="utf-8") as f:
+            json.dump({"jobs": jobs}, f)
+        with open(detail_path, "w", encoding="utf-8") as f:
+            json.dump(details, f)
+        return list_path, detail_path
+
+    def test_verify_results_ok_for_complete_files(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path, detail_path = self._write_verify_files(
+                paths,
+                [{"job_id": "a", "title": "A"}, {"job_id": "b", "title": "B"}],
+                [{"job_id": "a", "title": "A",
+                  "jd": "x" * module.MIN_DETAIL_TEXT_LENGTH},
+                 {"job_id": "b", "title": "B",
+                  "jd": "x" * module.MIN_DETAIL_TEXT_LENGTH}],
+            )
+            report = module.verify_results(list_path, detail_path)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["issues"], [])
+            self.assertEqual(report["coverage"], 1.0)
+            self.assertEqual(report["list"]["count"], 2)
+            self.assertEqual(report["details"]["count"], 2)
+
+    def test_verify_results_flags_corrupt_list_file(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with open(list_path, "w", encoding="utf-8") as f:
+                f.write("{corrupt")
+            report = module.verify_results(list_path)
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("无法解析" in i for i in report["issues"]))
+
+    def test_verify_results_flags_missing_job_id_and_duplicates(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path, detail_path = self._write_verify_files(
+                paths,
+                [{"job_id": "a", "title": "A"},
+                 {"title": "no-id"},
+                 {"job_id": "a", "title": "dup"}],
+                [],
+            )
+            report = module.verify_results(list_path, detail_path)
+            self.assertFalse(report["ok"])
+            joined = " | ".join(report["issues"])
+            self.assertIn("job_id", joined)
+            self.assertIn("重复", joined)
+            self.assertEqual(report["coverage"], 0.0)
+
+    def test_verify_results_auto_discovers_latest_details(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            list_path = paths["cdp_profile"] / "boss_jobs_x.json"
+            old_path = paths["cdp_profile"] / "boss_details_old.json"
+            new_path = paths["cdp_profile"] / "boss_details_new.json"
+            with open(list_path, "w", encoding="utf-8") as f:
+                json.dump({"jobs": [{"job_id": "a", "title": "A"}]}, f)
+            with open(old_path, "w", encoding="utf-8") as f:
+                json.dump([{"job_id": "a", "title": "A", "jd": "x"}], f)
+            with open(new_path, "w", encoding="utf-8") as f:
+                json.dump([{"job_id": "a", "title": "A",
+                            "jd": "x" * module.MIN_DETAIL_TEXT_LENGTH}], f)
+            os.utime(old_path, (1000, 1000))
+            os.utime(new_path, (2000, 2000))
+            report = module.verify_results(str(list_path))
+            self.assertTrue(report["ok"], f"应自动选中最新详情文件: {report['issues']}")
+            self.assertEqual(report["coverage"], 1.0)
+
+    def test_verify_results_flags_short_jd_details(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path, detail_path = self._write_verify_files(
+                paths,
+                [{"job_id": "a", "title": "A"}],
+                [{"job_id": "a", "title": "A", "jd": "short"}],
+            )
+            report = module.verify_results(list_path, detail_path)
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("JD" in i for i in report["issues"]))
+
+    def test_verify_results_missing_detail_file(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path, _ = self._write_verify_files(
+                paths, [{"job_id": "a", "title": "A"}], [])
+            missing = str(paths["cdp_profile"] / "boss_details_none.json")
+            report = module.verify_results(list_path, missing)
+            self.assertFalse(report["ok"])
+            self.assertTrue(any("未找到" in i for i in report["issues"]))
 
     # ----- 详情会话失败防护 -----
 

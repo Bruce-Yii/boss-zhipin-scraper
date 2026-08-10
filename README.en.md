@@ -162,10 +162,12 @@ python3 scripts/job_summary.py --top 15
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
 | `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors) |
+| `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
 | `--check` | Environment check (CDP + deps + login state) |
+| `--verify` | Verify scraped result files (list/detail parseability, required fields, JD completeness, coverage; verification only, no scraping, no Chrome needed) |
 | `--smoke-test` | Run one real Chrome/CDP BOSS search API smoke test, writes no result files |
 | `--setup-chrome` | One-shot launch of Chrome CDP (persistent isolated profile) |
 | `--copy-login-state` | Manually import the main Chrome's Local State + cookie-related files into the isolated profile (never copied by default, on first run, or on repeated runs) |

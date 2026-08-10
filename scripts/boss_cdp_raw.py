@@ -68,6 +68,7 @@ API_ATTEMPT_LIMIT = 3   # 列表 API 单页最大尝试次数（凭证自愈重�
 MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
+LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -1098,12 +1099,39 @@ def describe_login_probe_result(result):
 # ============================================================
 # 登录状态检测
 # ============================================================
-def check_login_state(cdp_port=DEFAULT_CDP_PORT):
-    """通过 CDP 检测 BOSS直聘登录状态。
+_LOGIN_PROBE_CACHE = {"ts": 0.0, "result": None}
 
-    用多组关键词/城市轮换探测：单次探测可能因关键词恰好 0 结果而误判
-    （EMPTY），轮换可降低误判；未登录（UNAUTHENTICATED）与风控（RESTRICTED）
-    是确定状态，命中直接返回，不继续轮换。
+
+def check_login_state(cdp_port=DEFAULT_CDP_PORT, use_cache=True):
+    """通过 CDP 检测 BOSS直聘登录状态（会话内结果缓存）。
+
+    同一进程内 TTL 内重复调用（如 --check 与抓取前的登录检测）直接复用
+    上次探测结果，避免重复开 tab、导航与请求；`--login-timeout` 等待循环
+    不受影响（走 wait_for_login，不经过本缓存）。
+
+    Args:
+        cdp_port: CDP 端口
+        use_cache: False 时强制重新探测（绕过缓存）
+
+    Returns:
+        LoginProbeResult: 登录探测的结构化状态
+    """
+    cached = _LOGIN_PROBE_CACHE
+    if use_cache and cached["result"] is not None \
+            and time.time() - cached["ts"] < LOGIN_PROBE_CACHE_TTL:
+        return cached["result"]
+    result = _probe_login_state_uncached(cdp_port)
+    cached["ts"] = time.time()
+    cached["result"] = result
+    return result
+
+
+def _probe_login_state_uncached(cdp_port=DEFAULT_CDP_PORT):
+    """实际探测逻辑（无缓存）：多组关键词/城市轮换探测。
+
+    单次探测可能因关键词恰好 0 结果而误判（EMPTY），轮换可降低误判；
+    未登录（UNAUTHENTICATED）与风控（RESTRICTED）是确定状态，命中直接
+    返回，不继续轮换。
 
     Returns:
         LoginProbeResult: 登录探测的结构化状态
@@ -1771,25 +1799,31 @@ def pending_path_for(output_path):
     return f"{output_path}.pending.json"
 
 
-def load_pending_ids(output_path):
+def load_pending_ids(output_path, force_ids=None):
     """读取待重试详情 job_id → 已重试次数映射。
 
     兼容旧格式（纯字符串 job_id 列表，计数归零）；达到重试上限的
     job 直接放弃（不返回），避免永久失败的短 JD 反复消耗请求。
 
+    Args:
+        output_path: 详情输出路径（pending 文件与其同目录）
+        force_ids: 用户强制重试白名单（iterable of str）；名单内 job_id
+            无视重试次数上限，文件中未记录的也会加入返回结果
+
     Returns:
         dict: {job_id: attempts}
     """
+    force = {str(j).strip() for j in (force_ids or []) if str(j).strip()}
     path = pending_path_for(output_path)
     if not os.path.exists(path):
-        return {}
+        return {jid: 0 for jid in force}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError):
-        return {}
+        return {jid: 0 for jid in force}
     if not isinstance(data, list):
-        return {}
+        return {jid: 0 for jid in force}
 
     pending = {}
     for item in data:
@@ -1803,8 +1837,11 @@ def load_pending_ids(output_path):
                 attempts = 0
         else:
             continue
-        if job_id and attempts < MAX_PENDING_RETRIES:
+        if job_id and (attempts < MAX_PENDING_RETRIES or job_id in force):
             pending[job_id] = attempts
+    for jid in force:
+        if jid not in pending:
+            pending[jid] = 0
     return pending
 
 
@@ -1826,6 +1863,173 @@ def save_pending_ids(output_path, ids):
         {"job_id": job_id, "attempts": attempts}
         for job_id, attempts in sorted(ids.items())
     ])
+
+
+# ============================================================
+# --verify 结果文件校验
+# ============================================================
+def latest_results_file(kind):
+    """默认结果目录下最新文件（kind: "jobs" / "details"）；目录缺失返回 None。"""
+    prefix = "boss_jobs_" if kind == "jobs" else "boss_details_"
+    candidates = []
+    try:
+        for name in os.listdir(DEFAULT_RESULT_DIR):
+            if name.startswith(prefix) and name.endswith(".json"):
+                path = os.path.join(DEFAULT_RESULT_DIR, name)
+                candidates.append((os.path.getmtime(path), path))
+    except OSError:
+        return None
+    return max(candidates)[1] if candidates else None
+
+
+def _latest_details_path(list_path):
+    """自动查找与列表同目录的详情文件：同时间戳优先，其次最新。"""
+    base = os.path.dirname(list_path) or "."
+    stem = os.path.basename(list_path)
+    if stem.startswith("boss_jobs_"):
+        stamp = stem[len("boss_jobs_"):]
+        same_stamp = os.path.join(base, f"boss_details_{stamp}")
+        if os.path.exists(same_stamp):
+            return same_stamp
+    candidates = []
+    try:
+        for name in os.listdir(base):
+            if name.startswith("boss_details_") and name.endswith(".json"):
+                path = os.path.join(base, name)
+                candidates.append((os.path.getmtime(path), path))
+    except OSError:
+        return None
+    return max(candidates)[1] if candidates else None
+
+
+def verify_results(list_path, details_path=None):
+    """校验已抓取结果文件完整性。
+
+    检查：列表/详情 JSON 可解析性、job 必备字段（job_id/title）、重复
+    job_id、详情 JD 完整度（短于 MIN_DETAIL_TEXT_LENGTH 视为残缺）、
+    列表-详情覆盖率。
+
+    Args:
+        list_path: boss_jobs_*.json 路径
+        details_path: boss_details_*.json 路径；不传则自动查找
+            （同时间戳优先，其次最新）
+
+    Returns:
+        dict: {"ok", "issues", "list": {"count"}, "details": {"count"},
+               "detail_path", "coverage", "missing"}
+    """
+    issues = []
+
+    list_count = 0
+    list_ids = set()
+    if not os.path.exists(list_path):
+        issues.append(f"列表文件不存在: {list_path}")
+        list_data = None
+    else:
+        try:
+            with open(list_path, "r", encoding="utf-8") as f:
+                list_data = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            issues.append(f"列表文件无法解析: {e}")
+            list_data = None
+    if list_data is not None:
+        jobs = list_data.get("jobs") if isinstance(list_data, dict) else None
+        if not isinstance(jobs, list) or not jobs:
+            issues.append("列表没有职位数据（jobs 为空或缺失）")
+        else:
+            list_count = len(jobs)
+            seen = set()
+            missing_fields = 0
+            dup = set()
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                jid = str(job.get("job_id") or "").strip()
+                if not jid or not str(job.get("title") or "").strip():
+                    missing_fields += 1
+                if jid:
+                    if jid in seen:
+                        dup.add(jid)
+                    seen.add(jid)
+                    list_ids.add(jid)
+            if missing_fields:
+                issues.append(f"列表有 {missing_fields} 条记录缺少 job_id 或 title")
+            if dup:
+                issues.append(f"列表存在重复 job_id: {', '.join(sorted(dup)[:5])}")
+            if not list_ids:
+                issues.append("列表没有有效的 job_id，无法与详情匹配")
+
+    if details_path is None:
+        details_path = _latest_details_path(list_path)
+    detail_count = 0
+    detail_ids = set()
+    if details_path is None or not os.path.exists(details_path):
+        issues.append("未找到详情文件（可用 --detail-output 指定路径）")
+        details = None
+    else:
+        try:
+            with open(details_path, "r", encoding="utf-8") as f:
+                details = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            issues.append(f"详情文件无法解析: {e}")
+            details = None
+    if details is not None:
+        if not isinstance(details, list) or not details:
+            issues.append("详情文件没有数据（空列表）")
+        else:
+            detail_count = len(details)
+            seen = set()
+            dup = set()
+            short_jd = 0
+            for d in details:
+                if not isinstance(d, dict):
+                    continue
+                jid = str(d.get("job_id") or "").strip()
+                if jid:
+                    if jid in seen:
+                        dup.add(jid)
+                    seen.add(jid)
+                    detail_ids.add(jid)
+                if len(str(d.get("jd") or "")) < MIN_DETAIL_TEXT_LENGTH:
+                    short_jd += 1
+            if dup:
+                issues.append(f"详情存在重复 job_id: {', '.join(sorted(dup)[:5])}")
+            if short_jd:
+                issues.append(f"详情有 {short_jd} 条 JD 过短（<{MIN_DETAIL_TEXT_LENGTH} 字），可能抓取残缺")
+
+    missing = sorted(list_ids - detail_ids) if list_ids else []
+    coverage = (len(list_ids) - len(missing)) / len(list_ids) if list_ids else 0.0
+    if list_ids and coverage < 1.0:
+        shown = ", ".join(missing[:5])
+        more = f" 等 {len(missing)} 条" if len(missing) > 5 else ""
+        issues.append(f"详情覆盖率 {coverage:.0%}，缺失 {len(missing)} 条: {shown}{more}")
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "list": {"count": list_count},
+        "details": {"count": detail_count},
+        "detail_path": details_path,
+        "coverage": coverage,
+        "missing": missing,
+    }
+
+
+def run_verify(list_path, details_path=None):
+    """打印 --verify 报告并返回退出码（0 全过 / 1 有问题）。"""
+    print("\n=== 校验抓取结果文件 ===")
+    print(f"列表: {list_path}")
+    report = verify_results(list_path, details_path)
+    print(f"详情: {report['detail_path'] or '未指定'}")
+    print(f"列表 {report['list']['count']} 条 / 详情 {report['details']['count']} 条 "
+          f"/ 覆盖率 {report['coverage']:.0%}")
+    if not report["issues"]:
+        print("✅ 校验通过：文件完整、字段齐全、详情覆盖列表")
+    else:
+        for i in report["issues"]:
+            print(f"  ❌ {i}")
+    print()
+    return 0 if report["ok"] else 1
 
 
 class TokenBucket:
@@ -2984,6 +3188,11 @@ def main():
 
     # 工具命令
     p.add_argument("--check", action="store_true", help="运行环境诊断检查")
+    p.add_argument("--verify", action="store_true",
+                   help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
+    p.add_argument("--retry-job", action="append", default=[],
+                   metavar="JOB_ID",
+                   help="强制重试指定 job_id（可重复指定；无视 pending 重试上限，未记录的也会重抓）")
     p.add_argument("--smoke-test", action="store_true",
                    help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
     p.add_argument("--list-cities", nargs="?", const="", default=None,
@@ -3016,6 +3225,18 @@ def main():
     # --check 模式
     if args.check:
         sys.exit(run_check(args.cdp_port))
+
+    # --verify 模式（只校验结果文件，不抓取、不依赖 Chrome）
+    if args.verify:
+        list_path = args.input
+        if not list_path:
+            list_path = latest_results_file("jobs")
+            if list_path:
+                print(f"未指定 --input，自动使用最新列表文件: {list_path}")
+            else:
+                print(f"未找到列表文件（--input 或 {DEFAULT_RESULT_DIR} 下的 boss_jobs_*.json）")
+                sys.exit(1)
+        sys.exit(run_verify(list_path, args.detail_output))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
@@ -3119,10 +3340,17 @@ def main():
     # 抓详情
     details = None
     if args.detail and list_data.get("jobs"):
+        pending_ids = None
+        if args.retry_job:
+            # 用户强制重试白名单：无视 pending 重试上限，未记录的先加入重试
+            pending_ids = load_pending_ids(
+                args.detail_output or default_output_path("details"),
+                force_ids=args.retry_job)
         details = scrape_details(
             list_data, args.max_details, args.detail_output,
             cdp_port=args.cdp_port, fmt=args.format,
             concurrency=args.concurrency,
+            pending_ids=pending_ids,
         )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
