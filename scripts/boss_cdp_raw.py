@@ -1517,7 +1517,8 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # 抓取列表
 # ============================================================
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
-                cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False):
+                cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
+                max_jobs=None):
     city_name, city_code = resolve_city(city_input)
     cdp = CDPSession(cdp_port)
     all_jobs = []
@@ -1690,6 +1691,11 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "filter_desc": filter_desc,
                     "scraped_at": datetime.now().isoformat(),
                 }, all_jobs)
+
+            # 条数上限：抓够即停，不再翻页（BOSS 每页 30 条，实际可能略超上限）
+            if max_jobs and len(all_jobs) >= max_jobs:
+                print(f"  已抓 {len(all_jobs)} 条 ≥ 目标 {max_jobs}，停止翻页")
+                break
 
             if pg < max_pages:
                 d = random.uniform(12, 22)
@@ -3158,6 +3164,8 @@ def main():
     p.add_argument("--keyword", default="AI Agent", help="搜索关键词")
     p.add_argument("--city", default=DEFAULT_CITY_INPUT, help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
     p.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
+    p.add_argument("--max-jobs", type=int, default=None,
+                   help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--detail-output", default=None, help="详情数据输出路径")
     p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
@@ -3313,6 +3321,7 @@ def main():
             args.keyword, args.city, args.pages, filters, args.output,
             cdp_port=args.cdp_port, fmt=args.format,
             allow_dom_fallback=args.allow_dom_fallback,
+            max_jobs=args.max_jobs,
         )
 
     # 合并外部文件
