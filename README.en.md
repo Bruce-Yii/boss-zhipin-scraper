@@ -161,6 +161,7 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv; csv also exports list and detail CSVs |
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
+| `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors) |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |

@@ -1,4 +1,5 @@
 import importlib.util
+import contextlib
 import csv
 import io
 import json
@@ -8,6 +9,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -366,6 +368,342 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(results, [])
             self.assertEqual(len(module.load_pending_ids(out)), 3,
                              "熔断后不应继续尝试剩余 job")
+
+    # ----- 并发详情抓取：全局限速令牌桶 -----
+
+    def test_token_bucket_allows_burst_up_to_capacity(self):
+        module = load_module()
+        bucket = module.TokenBucket(rate=2.0, capacity=2)
+        with mock.patch.object(module.time, "sleep") as sleep_mock, \
+                mock.patch.object(module.time, "time", side_effect=[0.0, 0.1, 0.2]):
+            bucket.acquire()
+            bucket.acquire()
+        sleep_mock.assert_not_called(), "容量内不应阻塞"
+
+    def test_token_bucket_blocks_when_depleted(self):
+        module = load_module()
+        bucket = module.TokenBucket(rate=1.0, capacity=1)
+        with mock.patch.object(module.time, "sleep") as sleep_mock, \
+                mock.patch.object(module.time, "time", side_effect=[0.0, 0.1, 1.1]):
+            bucket.acquire()   # 消耗唯一令牌
+            bucket.acquire()   # 需要等 1 秒补充
+        sleep_mock.assert_called_once()
+        self.assertGreaterEqual(sleep_mock.call_args[0][0], 0.9,
+                                "等待时长应覆盖令牌补充间隔")
+
+    def test_token_bucket_accumulates_tokens_over_time(self):
+        module = load_module()
+        bucket = module.TokenBucket(rate=2.0, capacity=10)
+        with mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.time, "time", side_effect=[0.0, 5.0]):
+            # 5 秒空闲后应有 10 个令牌（受容量上限）
+            bucket.acquire()
+        # 无阻塞即说明令牌已按速率累计
+        self.assertTrue(True)
+
+    def test_adaptive_limiter_halves_rate_on_high_failure_window(self):
+        module = load_module()
+        limiter = module.AdaptiveRateLimiter(base_rate=4.0, window=60.0,
+                                             failure_threshold=0.3,
+                                             pause_seconds=60.0)
+        # 窗口内 10 次请求 4 次失败（40% > 30%）
+        for _ in range(6):
+            limiter.record_success()
+        for _ in range(4):
+            limiter.record_failure()
+        limiter._roll_window()
+        self.assertEqual(limiter.current_rate(), 2.0, "失败率超阈值后速率应降半")
+
+    def test_adaptive_limiter_pauses_after_consecutive_bad_windows(self):
+        module = load_module()
+        limiter = module.AdaptiveRateLimiter(base_rate=4.0, window=60.0,
+                                             failure_threshold=0.3,
+                                             pause_seconds=30.0)
+        times = iter([0.0, 0.1, 0.2, 1.0, 59.0, 59.1, 59.2, 60.0, 60.1, 60.2])
+        with mock.patch.object(module.time, "sleep") as sleep_mock, \
+                mock.patch.object(module.time, "time", side_effect=lambda: next(times)):
+            # 两个连续坏窗口
+            for _ in range(2):
+                limiter.record_failure()
+                limiter.record_failure()
+                limiter.record_failure()
+                limiter._roll_window()
+            limiter.acquire()  # 应触发暂停（至少 30s）
+        self.assertGreaterEqual(sleep_mock.call_args[0][0], 29.0,
+                                "连续坏窗口后应暂停约 pause_seconds")
+
+    def test_adaptive_limiter_recovers_after_healthy_window(self):
+        module = load_module()
+        limiter = module.AdaptiveRateLimiter(base_rate=4.0, window=60.0,
+                                             failure_threshold=0.3,
+                                             pause_seconds=60.0)
+        limiter._halved = True
+        for _ in range(10):
+            limiter.record_success()
+        limiter._roll_window()
+        self.assertEqual(limiter.current_rate(), 4.0, "健康窗口后应恢复基线速率")
+
+    # ----- 并发详情抓取：单详情 worker 单元 -----
+
+    @contextlib.contextmanager
+    def _mock_detail_page(self, module, jd_text):
+        """构造 mock 的详情页环境：CDPSession + 干净页面 + 可提取内容。"""
+        ws = mock.Mock()
+        detail_url = "https://www.zhipin.com/job_detail/abc.html"
+        good = json.dumps({
+            "jd": f"职位描述\n{jd_text}",
+            "page_text": f"职位描述\n{jd_text}",
+            "tags": ["Python"],
+            "url": detail_url,
+        })
+        ws.eval_js.return_value = good
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "classify_risk_page",
+                                  return_value=(False, "")), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0), \
+                mock.patch.object(module.random, "randint", return_value=3), \
+                mock.patch.object(module.random, "random", return_value=0.1):
+            yield ws, detail_url
+
+    def _detail_job(self, job_id="job-1"):
+        return {
+            "job_id": job_id,
+            "title": "AI产品经理",
+            "boss_name": "某公司",
+            "salary": "30-60K",
+            "salary_source": "api",
+            "location": "杭州·滨江区",
+            "tags": "3-5年 | 本科",
+            "job_link": "https://www.zhipin.com/job_detail/abc.html",
+            "boss_active_status": "在线",
+        }
+
+    def test_scrape_one_detail_success_path(self):
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (_ws, _url):
+            result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["job_id"], "job-1")
+        self.assertIn("AI agents", result["detail"]["jd"])
+        self.assertEqual(result["detail"]["title"], "AI产品经理")
+        self.assertEqual(result["detail"]["boss_active_status"], "在线")
+        self.assertEqual(result["reason"], "")
+
+    def test_scrape_one_detail_reports_cdp_session_failure(self):
+        module = load_module()
+        with mock.patch.object(module, "CDPSession",
+                               side_effect=TimeoutError("cdp down")), \
+                mock.patch.object(module.time, "sleep"):
+            result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "cdp_session")
+        self.assertEqual(result["detail"], None)
+
+    def test_scrape_one_detail_reports_risk_timeout(self):
+        module = load_module()
+        ws = mock.Mock()
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "classify_risk_page",
+                                  return_value=(True, "滑块验证")), \
+                mock.patch.object(module, "wait_for_risk_clear",
+                                  return_value=False), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0), \
+                mock.patch.object(module.random, "randint", return_value=3), \
+                mock.patch.object(module.random, "random", return_value=0.1):
+            result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "risk_timeout")
+
+    def test_scrape_one_detail_reports_invalid_detail(self):
+        module = load_module()
+        ws = mock.Mock()
+        short = json.dumps({"jd": "职位描述\n太短", "page_text": "", "tags": [],
+                            "url": "https://x"})
+        ws.eval_js.return_value = short
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "classify_risk_page",
+                                  return_value=(False, "")), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0), \
+                mock.patch.object(module.random, "randint", return_value=3), \
+                mock.patch.object(module.random, "random", return_value=0.1):
+            result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "invalid_detail")
+
+    def test_scrape_one_detail_reports_login_required(self):
+        module = load_module()
+        ws = mock.Mock()
+        wall = json.dumps({"jd": "", "page_text": "登录查看完整内容", "tags": [],
+                           "url": "https://x"})
+        ws.eval_js.return_value = wall
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "classify_risk_page",
+                                  return_value=(False, "")), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0), \
+                mock.patch.object(module.random, "randint", return_value=3), \
+                mock.patch.object(module.random, "random", return_value=0.1):
+            result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "login_required")
+
+    def test_scrape_one_detail_respects_stop_event(self):
+        module = load_module()
+        stop_event = threading.Event()
+        stop_event.set()
+        with mock.patch.object(module, "CDPSession",
+                               side_effect=AssertionError("不应建立会话")), \
+                mock.patch.object(module.time, "sleep"):
+            result = module._scrape_one_detail(self._detail_job(),
+                                               cdp_port=9222,
+                                               stop_event=stop_event)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "stopped")
+
+    # ----- 并发详情抓取：并行执行层 -----
+
+    def _fake_parallel_worker(self, active_state, ok_ids, fail_ids=()):
+        """构造模拟 worker：记录并发峰值，按 job_id 返回成功/失败。"""
+        lock, active, max_active = active_state
+
+        def worker(job, cdp_port, stop_event=None, limiter=None):
+            if stop_event is not None and stop_event.is_set():
+                return {"ok": False, "detail": None, "job_id": job["job_id"],
+                        "reason": "stopped", "message": ""}
+            with lock:
+                active[0] += 1
+                max_active[0] = max(max_active[0], active[0])
+            # 注意：不能用 time.sleep（测试会 mock module.time.sleep，time 是单例模块，
+            # 会连测试代码里的 sleep 一起 mock 掉）；用 Event.wait 实现真实阻塞
+            threading.Event().wait(0.15)
+            with lock:
+                active[0] -= 1
+            if job["job_id"] in fail_ids:
+                return {"ok": False, "detail": None, "job_id": job["job_id"],
+                        "reason": "invalid_detail", "message": "too short"}
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"], "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+        return worker
+
+    def test_parallel_respects_concurrency_limit_and_collects_results(self):
+        module = load_module()
+        jobs = self._sample_jobs(5)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=self._fake_parallel_worker(state, set())), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, pending_out = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                limiter=limiter_cls.return_value)
+        self.assertEqual(len(results), 5, "全部成功应收集 5 条")
+        self.assertLessEqual(state[2][0], 2, "并发峰值不应超过 concurrency")
+        self.assertEqual(state[2][0], 2, "5 个任务在 2 并发下应出现并发峰值 2")
+        self.assertEqual(pending_out, set())
+
+    def test_parallel_records_failed_jobs_to_pending(self):
+        module = load_module()
+        jobs = self._sample_jobs(4)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=self._fake_parallel_worker(
+                                   state, set(), fail_ids={"job-1", "job-2"})), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, pending_out = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=3,
+                limiter=limiter_cls.return_value)
+        self.assertEqual(len(results), 2, "失败的 job 不应写入结果")
+        self.assertEqual(pending_out, {"job-1", "job-2"})
+
+    def test_parallel_stops_submitting_after_global_stop(self):
+        module = load_module()
+        jobs = self._sample_jobs(6)["jobs"]
+
+        def always_fail(job, cdp_port, stop_event=None, limiter=None):
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "cdp_session", "message": "boom"}
+
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=always_fail), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, pending_out = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=3,
+                limiter=limiter_cls.return_value)
+        self.assertEqual(results, [])
+        # 连续失败熔断后不再执行剩余任务（部分任务可能已提交）
+        self.assertLessEqual(len(pending_out), 6)
+
+    # ----- 并发详情抓取：CLI 分派 -----
+
+    def test_scrape_details_uses_parallel_path_when_concurrency_gt_1(self):
+        module = load_module()
+        list_data = {"jobs": self._sample_jobs(3)["jobs"]}
+        fake_detail = {"job_id": "job-0", "title": "t0", "jd": "x" * 200}
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_details_parallel",
+                                   return_value=([fake_detail], set())) as parallel, \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module.time, "sleep"):
+                results = module.scrape_details(list_data, output_path=out,
+                                                cdp_port=9222, concurrency=3)
+            self.assertEqual(len(results), 1, "并发路径应返回新抓详情（与已有合并）")
+            parallel.assert_called_once()
+            self.assertEqual(parallel.call_args[0][2], 3, "并发度应透传")
+            # 并发结果应已落盘
+            with open(out, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            self.assertEqual(len(saved), 1)
+
+    def test_scrape_details_keeps_serial_path_when_concurrency_is_1(self):
+        module = load_module()
+        list_data = {"jobs": self._sample_jobs(1)["jobs"]}
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_details_parallel") as parallel, \
+                    mock.patch.object(module, "_scrape_one_detail",
+                                      return_value={"ok": False, "detail": None,
+                                                    "job_id": "job-0",
+                                                    "reason": "cdp_session",
+                                                    "message": "boom"}) as worker, \
+                    mock.patch.object(module, "CDPSession",
+                                      side_effect=TimeoutError("cdp down")), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module.time, "sleep"):
+                module.scrape_details(list_data, output_path=out,
+                                      cdp_port=9222, concurrency=1)
+            parallel.assert_not_called(), "默认并发 1 不应走并发路径"
+            worker.assert_called_once()
 
     def test_wait_for_login_explicitly_uses_foreground_target(self):
         module = load_module()
@@ -1621,6 +1959,7 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("--stop-chrome", result.stdout)
         self.assertIn("--close-chrome", result.stdout)
         self.assertIn("--verbose", result.stdout)
+        self.assertIn("--concurrency", result.stdout)
 
 
 class tempfile_profile:

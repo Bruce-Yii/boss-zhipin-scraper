@@ -37,6 +37,8 @@ import shutil
 import signal
 import logging
 import ntpath
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 from collections import Counter
@@ -64,6 +66,7 @@ MAX_PAGES = 10          # 单次最大页数
 MAX_API_REQUESTS = 500  # 单次最大 API 请求数
 API_ATTEMPT_LIMIT = 3   # 列表 API 单页最大尝试次数（凭证自愈重试）
 MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
+DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -1795,8 +1798,199 @@ def save_pending_ids(output_path, ids):
     _atomic_write_json(path, sorted(ids))
 
 
+class TokenBucket:
+    """线程安全的全局速率限制令牌桶。
+
+    容量 capacity 内可突发；令牌按 rate（个/秒）持续补充，
+    耗尽时 acquire 阻塞直到令牌补充（并发详情抓取的全局限速用）。
+    """
+    def __init__(self, rate, capacity):
+        self.rate = rate
+        self.capacity = capacity
+        self._tokens = float(capacity)
+        self._last_refill = time.time()
+        self._lock = threading.Lock()
+
+    def _refill(self, now):
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
+            self._last_refill = now
+
+    def acquire(self):
+        with self._lock:
+            self._refill(time.time())
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+            deficit = (1.0 - self._tokens) / self.rate
+        time.sleep(deficit)
+        with self._lock:
+            self._last_refill = time.time()
+            self._tokens = max(0.0, self._tokens - 1.0)
+
+
+class AdaptiveRateLimiter:
+    """全局限速 + 错误率自适应（Scrapy AutoThrottle 思想）。
+
+    - 滑动窗口（默认 60s）内失败率 > failure_threshold → 速率降半
+    - 连续 2 个坏窗口 → acquire 暂停 pause_seconds（等风控窗口过去）
+    - 健康窗口 → 速率恢复基线
+    """
+    def __init__(self, base_rate, capacity=None, window=60.0,
+                 failure_threshold=0.3, pause_seconds=60.0):
+        self.base_rate = base_rate
+        self.capacity = capacity or max(int(base_rate), 1)
+        self.window = window
+        self.failure_threshold = failure_threshold
+        self.pause_seconds = pause_seconds
+        self._halved = False
+        self._consecutive_bad = 0
+        self._window_start = time.time()
+        self._window_total = 0
+        self._window_failures = 0
+        self._bucket = TokenBucket(base_rate, self.capacity)
+        self._lock = threading.Lock()
+
+    def current_rate(self):
+        """当前生效速率（降半后的值）。"""
+        return self.base_rate / 2.0 if self._halved else self.base_rate
+
+    def record_success(self):
+        """记录一次成功请求。"""
+        self._record(failed=False)
+
+    def record_failure(self):
+        """记录一次失败请求。"""
+        self._record(failed=True)
+
+    def _record(self, failed):
+        with self._lock:
+            now = time.time()
+            if now - self._window_start >= self.window:
+                self._roll_window()
+            self._window_total += 1
+            if failed:
+                self._window_failures += 1
+
+    def _roll_window(self):
+        """窗口推进：按失败率调整速率与连续坏窗口计数。"""
+        if self._window_total > 0:
+            failure_rate = self._window_failures / self._window_total
+            if failure_rate > self.failure_threshold:
+                self._halved = True
+                self._consecutive_bad += 1
+            else:
+                self._halved = False
+                self._consecutive_bad = 0
+        self._window_start = time.time()
+        self._window_total = 0
+        self._window_failures = 0
+
+    def acquire(self):
+        """申请一个请求配额；连续坏窗口时先暂停，再走令牌桶。"""
+        if self._consecutive_bad >= 2:
+            time.sleep(self.pause_seconds)
+            self._consecutive_bad = 0
+        self._bucket.rate = self.current_rate()
+        self._bucket.acquire()
+
+
+def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None, limiter=None):
+    """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
+
+    Args:
+        job: 列表 job dict（含 job_link / job_id / title 等）
+        cdp_port: CDP 端口
+        stop_event: 可选 threading.Event；置位时提前返回（登录墙/熔断等
+            全局停止信号），不再发起新会话
+        limiter: 可选 AdaptiveRateLimiter；并发模式下在导航前申请全局配额
+
+    Returns:
+        dict: {"ok": bool, "detail": dict|None, "job_id": str,
+               "reason": str, "message": str}
+        reason 取值: "" | "stopped" | "cdp_session" | "risk_timeout"
+                   | "invalid_detail" | "login_required"
+    """
+    job_id = job.get("job_id", "")
+    if stop_event is not None and stop_event.is_set():
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "stopped", "message": "已收到停止信号"}
+
+    ws = None
+    tid = None
+    try:
+        ws = CDPSession(cdp_port)
+        tid, sid = create_page_session(ws)
+
+        detail_url = build_detail_url(job)
+        # 并发模式全局限速：导航（真实请求）前申请配额
+        if limiter is not None:
+            limiter.acquire()
+        ws.send("Page.navigate", {"url": detail_url}, sid)
+        time.sleep(random.uniform(5, 10))
+
+        # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入
+        is_risk, risk_reason = classify_risk_page(probe_risk_page(ws, sid))
+        if is_risk and not wait_for_risk_clear(ws, sid):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "risk_timeout", "message": risk_reason}
+
+        # 模拟人类阅读详情页的滚动行为
+        scroll_count = random.randint(3, 7)
+        for _ in range(scroll_count):
+            if stop_event is not None and stop_event.is_set():
+                return {"ok": False, "detail": None, "job_id": job_id,
+                        "reason": "stopped", "message": "已收到停止信号"}
+            if random.random() < 0.12:
+                delta = -random.randint(80, 200)
+            else:
+                delta = random.randint(200, 600)
+            ws.eval_js(f"window.scrollBy(0,{delta})", sid)
+            if random.random() < 0.35:
+                time.sleep(random.uniform(2.0, 5.0))
+            else:
+                time.sleep(random.uniform(0.8, 1.8))
+
+        # 偶尔模拟鼠标移动
+        if random.random() < 0.5:
+            ws.send("Input.dispatchMouseEvent", {
+                "type": "mouseMoved",
+                "x": random.randint(200, 800),
+                "y": random.randint(200, 600)
+            }, sid)
+            time.sleep(random.uniform(0.5, 1.5))
+
+        d = eval_detail_with_retry(ws, sid, detail_url)
+        try:
+            fields = extract_detail_fields(d)
+            d["jd"] = fields["jd"]
+            d["boss_active_status"] = fields["boss_active_status"]
+        except DetailLoginRequiredError as exc:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "login_required", "message": str(exc)}
+        except DetailExtractionError as exc:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": str(exc)}
+
+        return {"ok": True, "detail": build_detail_record(job, d),
+                "job_id": job_id, "reason": "", "message": ""}
+    except _cdp_exception_types() as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "cdp_session", "message": str(exc)}
+    finally:
+        if ws is not None:
+            try:
+                if tid is not None:
+                    ws.send("Target.closeTarget", {"targetId": tid})
+                ws.close()
+            except _cdp_exception_types():
+                log.debug("关闭详情会话失败", exc_info=True)
+
+
 def scrape_details(list_data, max_details=None, output_path=None,
-                   cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None):
+                   cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
+                   concurrency=DEFAULT_CONCURRENCY):
     jobs = list_data.get("jobs", [])
     if max_details:
         jobs = jobs[:max_details]
@@ -1824,6 +2018,23 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
 
+    # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/落盘/pending
+    if concurrency > 1:
+        print(f"⚡ 并发详情抓取（--concurrency {concurrency}，全局限速 + 错误率自适应降速）")
+        new_results, pending = _scrape_details_parallel(
+            jobs, cdp_port, concurrency,
+            existing_ids=existing_ids, pending_ids=pending)
+        results = results + new_results
+        _atomic_write_json(output_path, results)
+        save_pending_ids(output_path, pending)
+        if pending:
+            print(f"ℹ️  {len(pending)} 个详情待重试（已记录到 {pending_path_for(output_path)}，下次运行自动重试）")
+        print(f"\n详情已保存: {output_path}")
+        if fmt == "csv":
+            csv_path = output_path.rsplit(".", 1)[0] + ".csv"
+            write_detail_csv(csv_path, results)
+        return results
+
     consecutive_cdp_errors = 0
 
     for idx, job in enumerate(jobs):
@@ -1850,117 +2061,46 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
         incr_request()
 
-        # 每个详情页用新 session 避免检测；自动化 target 默认后台创建。
-        # 会话建立失败视为单条失败：记录 pending 继续；连续失败熔断停止。
-        ws = None
-        try:
-            ws = CDPSession(cdp_port)
-            tid, sid = create_page_session(ws)
-        except _cdp_exception_types() as exc:
+        result = _scrape_one_detail(job, cdp_port)
+        reason = result["reason"]
+
+        if result["ok"]:
+            detail = result["detail"]
+            results.append(detail)
+            # 抓取成功：从待重试清单移除
+            if job_id:
+                pending.discard(job_id)
+            if detail.get("tags"):
+                print(f"  技能: {', '.join(detail['tags'])}")
+            if detail.get("boss_active_status"):
+                print(f"  活跃: {detail['boss_active_status']}")
+            print(f"  JD: {len(detail.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
+            # 每抓完一个详情就写入，异常退出也能保留
+            if output_path:
+                _atomic_write_json(output_path, results)
+        elif reason == "login_required":
+            raise RuntimeError(
+                "BOSS detail login expired; stopped before writing truncated JD data"
+            )
+        elif reason == "cdp_session":
             consecutive_cdp_errors += 1
-            print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {exc}")
+            print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {result['message']}")
             if job_id:
                 pending.add(job_id)
                 save_pending_ids(output_path, pending)
-            if ws is not None:
-                try:
-                    ws.close()
-                except _cdp_exception_types():
-                    log.debug("关闭失败会话连接出错", exc_info=True)
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
                 print("   可运行 --stop-chrome 后重新 --setup-chrome 再继续（已抓数据保留，剩余自动重试）。")
                 break
             continue
+        elif reason == "stopped":
+            break
         else:
-            consecutive_cdp_errors = 0
-
-        detail_url = build_detail_url(job)
-        ws.send("Page.navigate", {"url": detail_url}, sid)
-        print("  加载页面...")
-        time.sleep(random.uniform(5, 10))
-
-        # 页面级风控检测：滑块/验证页/登录墙命中时提示人工介入
-        is_risk, reason = classify_risk_page(probe_risk_page(ws, sid))
-        if is_risk:
-            print(f"⚠️ 详情页 {reason}，等待人工处理...")
-            if not wait_for_risk_clear(ws, sid):
-                print(f"  风控未解除，跳过该详情: {title}")
-                if job_id:
-                    pending.add(job_id)
-                    save_pending_ids(output_path, pending)
-                ws.send("Target.closeTarget", {"targetId": tid})
-                ws.close()
-                continue
-
-        # 模拟人类阅读详情页的滚动行为
-        scroll_count = random.randint(3, 7)
-        print(f"  模拟滚动 ({scroll_count} 次)...")
-        for i in range(scroll_count):
-            if random.random() < 0.12:
-                # 偶尔往上回滚（回看内容）
-                delta = -random.randint(80, 200)
-            else:
-                delta = random.randint(200, 600)
-            ws.eval_js(f"window.scrollBy(0,{delta})", sid)
-            # 有时快滚，有时停下来"阅读"
-            if random.random() < 0.35:
-                time.sleep(random.uniform(2.0, 5.0))
-            else:
-                time.sleep(random.uniform(0.8, 1.8))
-
-        # 偶尔模拟鼠标移动
-        if random.random() < 0.5:
-            ws.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": random.randint(200, 800),
-                "y": random.randint(200, 600)
-            }, sid)
-            time.sleep(random.uniform(0.5, 1.5))
-
-        print("  提取 JD...")
-        d = eval_detail_with_retry(ws, sid, detail_url)
-
-        try:
-            fields = extract_detail_fields(d)
-            d["jd"] = fields["jd"]
-            d["boss_active_status"] = resolve_boss_active_status(
-                list_status=job.get("boss_active_status", ""),
-                detail_status=fields["boss_active_status"],
-            )
-        except DetailLoginRequiredError as exc:
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            raise RuntimeError(
-                "BOSS detail login expired; stopped before writing truncated JD data"
-            ) from exc
-        except DetailExtractionError as exc:
-            print(f"  跳过无效详情页: {exc}")
+            print(f"  跳过无效详情页: {result['message']}")
             if job_id:
                 pending.add(job_id)
                 save_pending_ids(output_path, pending)
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            continue
 
-        detail = build_detail_record(job, d)
-        results.append(detail)
-        # 抓取成功：从待重试清单移除
-        if job_id:
-            pending.discard(job_id)
-
-        if d.get("tags"):
-            print(f"  技能: {', '.join(d['tags'])}")
-        if d.get("boss_active_status"):
-            print(f"  活跃: {d['boss_active_status']}")
-        print(f"  JD: {len(d.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
-
-        # 每抓完一个详情就写入，异常退出也能保留
-        if output_path:
-            _atomic_write_json(output_path, results)
-
-        ws.send("Target.closeTarget", {"targetId": tid})
-        ws.close()
         # 详情页间隔加大，随机 10-25 秒
         gap = random.uniform(10, 25)
         print(f"  等待 {gap:.0f}s 后抓下一个...\n")
@@ -1977,6 +2117,86 @@ def scrape_details(list_data, max_details=None, output_path=None,
         csv_path = output_path.rsplit(".", 1)[0] + ".csv"
         write_detail_csv(csv_path, results)
     return results
+
+
+def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
+                             existing_ids=None, pending_ids=None):
+    """并发详情抓取：worker 只取数，主线程统一合并结果与 pending。
+
+    Args:
+        jobs: 列表 job dict 列表
+        cdp_port: CDP 端口
+        concurrency: 并发 worker 数
+        limiter: 可选 AdaptiveRateLimiter（全局限速）；None 时按并发度自建
+        existing_ids: 历史已抓 job_id 集合（跳过）
+        pending_ids: 待重试 job_id 集合（优先重抓）
+
+    Returns:
+        (results, pending): results 为本次抓取的详情列表；
+            pending 为待重试 job_id 集合（调用方负责落盘）
+    """
+    existing_ids = existing_ids if existing_ids is not None else set()
+    pending = set(pending_ids) if pending_ids is not None else set()
+    if limiter is None:
+        # 默认全局限速：每 worker 约 0.5 请求/秒（含加载等待），
+        # 失败率升高时由 AdaptiveRateLimiter 自动降速/暂停
+        limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
+
+    # 过滤已抓/重复（与串行路径同一套去重逻辑）
+    todo = []
+    seen_links = set()
+    for job in jobs:
+        link = job.get("job_link", "")
+        job_id = job.get("job_id", "")
+        if not link or link in seen_links:
+            continue
+        seen_links.add(link)
+        if job_id and job_id in existing_ids and job_id not in pending:
+            continue
+        todo.append(job)
+
+    results = []
+    stop_event = threading.Event()
+    consecutive_cdp_errors = 0
+    lock = threading.Lock()
+
+    def handle_result(job, result):
+        nonlocal consecutive_cdp_errors
+        job_id = job.get("job_id", "")
+        if result["ok"]:
+            limiter.record_success()
+            with lock:
+                results.append(result["detail"])
+                if job_id:
+                    pending.discard(job_id)
+            return
+        limiter.record_failure()
+        reason = result["reason"]
+        if reason == "login_required":
+            stop_event.set()
+        elif reason == "cdp_session":
+            consecutive_cdp_errors += 1
+            if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
+                stop_event.set()
+        if job_id:
+            with lock:
+                pending.add(job_id)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(_scrape_one_detail, job, cdp_port, stop_event, limiter): job
+            for job in todo
+        }
+        for future in as_completed(futures):
+            job = futures[future]
+            try:
+                result = future.result()
+            except _cdp_exception_types() as exc:
+                result = {"ok": False, "detail": None,
+                          "job_id": job.get("job_id", ""),
+                          "reason": "cdp_session", "message": str(exc)}
+            handle_result(job, result)
+    return results, pending
 
 
 # ============================================================
@@ -2679,6 +2899,9 @@ def main():
     p.add_argument("--detail", action="store_true", default=True, help="抓取详情页 JD（默认开启）")
     p.add_argument("--no-detail", dest="detail", action="store_false", help="不抓取详情页")
     p.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                   help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
+                        "并发越高成功率越低，含全局限速与错误率自适应降速）")
     p.add_argument("--analysis", action="store_true", help="输出分析报告")
     p.add_argument("--input", default=None, help="从已有 JSON 文件读取（跳过抓取）")
     p.add_argument("--allow-dom-fallback", action="store_true",
@@ -2824,6 +3047,7 @@ def main():
         details = scrape_details(
             list_data, args.max_details, args.detail_output,
             cdp_port=args.cdp_port, fmt=args.format,
+            concurrency=args.concurrency,
         )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
