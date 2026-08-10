@@ -67,6 +67,7 @@ MAX_API_REQUESTS = 500  # 单次最大 API 请求数
 API_ATTEMPT_LIMIT = 3   # 列表 API 单页最大尝试次数（凭证自愈重试）
 MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
+MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -1771,22 +1772,48 @@ def pending_path_for(output_path):
 
 
 def load_pending_ids(output_path):
-    """读取上次抓取失败、待重试的详情 job_id 集合。"""
+    """读取待重试详情 job_id → 已重试次数映射。
+
+    兼容旧格式（纯字符串 job_id 列表，计数归零）；达到重试上限的
+    job 直接放弃（不返回），避免永久失败的短 JD 反复消耗请求。
+
+    Returns:
+        dict: {job_id: attempts}
+    """
     path = pending_path_for(output_path)
     if not os.path.exists(path):
-        return set()
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError):
-        return set()
+        return {}
     if not isinstance(data, list):
-        return set()
-    return {str(item).strip() for item in data if str(item).strip()}
+        return {}
+
+    pending = {}
+    for item in data:
+        if isinstance(item, str):
+            job_id, attempts = item.strip(), 0
+        elif isinstance(item, dict):
+            job_id = str(item.get("job_id") or "").strip()
+            try:
+                attempts = int(item.get("attempts") or 0)
+            except (TypeError, ValueError):
+                attempts = 0
+        else:
+            continue
+        if job_id and attempts < MAX_PENDING_RETRIES:
+            pending[job_id] = attempts
+    return pending
 
 
 def save_pending_ids(output_path, ids):
-    """原子写回待重试详情 job_id 列表；空集合时删除文件。"""
+    """原子写回待重试详情（job_id → 重试次数）；空映射时删除文件。
+
+    Args:
+        ids: {job_id: attempts} 映射
+    """
     path = pending_path_for(output_path)
     if not ids:
         if os.path.exists(path):
@@ -1795,7 +1822,10 @@ def save_pending_ids(output_path, ids):
             except OSError:
                 pass
         return
-    _atomic_write_json(path, sorted(ids))
+    _atomic_write_json(path, [
+        {"job_id": job_id, "attempts": attempts}
+        for job_id, attempts in sorted(ids.items())
+    ])
 
 
 class TokenBucket:
@@ -2019,7 +2049,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if existing_ids:
         print(f"ℹ️  已加载 {len(existing_ids)} 个历史详情 job_id，命中直接跳过")
     # 断点续跑：上次失败待重试的 job_id（即使已在结果文件里也重新抓取）
-    pending = set(pending_ids) if pending_ids is not None else load_pending_ids(output_path)
+    pending = dict(pending_ids) if pending_ids is not None else load_pending_ids(output_path)
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
 
@@ -2072,7 +2102,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             results.append(detail)
             # 抓取成功：从待重试清单移除
             if job_id:
-                pending.discard(job_id)
+                pending.pop(job_id, None)
             if detail.get("tags"):
                 print(f"  技能: {', '.join(detail['tags'])}")
             if detail.get("boss_active_status"):
@@ -2089,7 +2119,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             consecutive_cdp_errors += 1
             print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {result['message']}")
             if job_id:
-                pending.add(job_id)
+                pending[job_id] = pending.get(job_id, 0) + 1
                 save_pending_ids(output_path, pending)
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
@@ -2101,7 +2131,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         else:
             print(f"  跳过无效详情页: {result['message']}")
             if job_id:
-                pending.add(job_id)
+                pending[job_id] = pending.get(job_id, 0) + 1
                 save_pending_ids(output_path, pending)
 
         # 详情页间隔加大，随机 10-25 秒
@@ -2145,7 +2175,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             pending 为待重试 job_id 集合
     """
     existing_ids = existing_ids if existing_ids is not None else set()
-    pending = set(pending_ids) if pending_ids is not None else set()
+    pending = dict(pending_ids) if pending_ids is not None else {}
     if limiter is None:
         # 默认全局限速：令牌桶仅提供弱错峰（容量=并发，错开同时导航的瞬时
         # 突发）；实际请求间隔主要由每条详情固有的加载/滚动等待（约 20-30s）
@@ -2182,7 +2212,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             limiter.record_success()
             results.append(result["detail"])
             if job_id:
-                pending.discard(job_id)
+                pending.pop(job_id, None)
             return
         limiter.record_failure()
         reason = result["reason"]
@@ -2193,7 +2223,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 stop_event.set()
         if job_id:
-            pending.add(job_id)
+            pending[job_id] = pending.get(job_id, 0) + 1
             if output_path:
                 save_pending_ids(output_path, pending)
 

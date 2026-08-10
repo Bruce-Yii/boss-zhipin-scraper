@@ -319,23 +319,45 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         with tempfile_profile() as paths:
             missing = str(paths["cdp_profile"] / "no.json")
-            self.assertEqual(module.load_pending_ids(missing), set())
+            self.assertEqual(module.load_pending_ids(missing), {})
             corrupt = str(paths["cdp_profile"] / "bad.json")
             os.makedirs(paths["cdp_profile"], exist_ok=True)
             with open(corrupt, "w", encoding="utf-8") as f:
                 f.write("not json")
-            self.assertEqual(module.load_pending_ids(corrupt), set())
+            self.assertEqual(module.load_pending_ids(corrupt), {})
 
     def test_save_and_load_pending_ids_roundtrip(self):
         module = load_module()
         with tempfile_profile() as paths:
             out = str(paths["cdp_profile"] / "details.json")
-            module.save_pending_ids(out, {"a", "b"})
-            self.assertEqual(module.load_pending_ids(out), {"a", "b"})
-            module.save_pending_ids(out, set())
-            self.assertEqual(module.load_pending_ids(out), set())
+            module.save_pending_ids(out, {"a": 0, "b": 2})
+            self.assertEqual(module.load_pending_ids(out), {"a": 0, "b": 2})
+            module.save_pending_ids(out, {})
+            self.assertEqual(module.load_pending_ids(out), {})
             self.assertFalse(os.path.exists(module.pending_path_for(out)),
                              "空集合时应删除 pending 文件")
+
+    def test_pending_retry_limit_gives_up_after_max_attempts(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            # 已达上限的 job 加载时应被放弃（不再自动重试浪费请求）
+            module.save_pending_ids(out, {"job-giveup": 3, "job-retry": 1})
+            pending = module.load_pending_ids(out)
+            self.assertNotIn("job-giveup", pending, "达到重试上限应放弃")
+            self.assertIn("job-retry", pending)
+            self.assertEqual(pending["job-retry"], 1, "未达上限的保留原计数")
+
+    def test_pending_load_handles_legacy_string_format(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            # 旧格式：纯字符串 job_id 列表（无计数）→ 归零兼容
+            with open(module.pending_path_for(out), "w", encoding="utf-8") as f:
+                json.dump(["legacy-1", "legacy-2"], f)
+            self.assertEqual(module.load_pending_ids(out),
+                             {"legacy-1": 0, "legacy-2": 0})
 
     # ----- 详情会话失败防护 -----
 
@@ -354,7 +376,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module.time, "sleep"):
                 results = module.scrape_details(self._sample_jobs(2), output_path=out)
             self.assertEqual(results, [], "单条会话失败不应崩溃，应跳过并记录")
-            self.assertEqual(module.load_pending_ids(out), {"job-0", "job-1"})
+            self.assertEqual(module.load_pending_ids(out), {"job-0": 1, "job-1": 1})
 
     def test_scrape_details_breaks_after_consecutive_session_failures(self):
         module = load_module()
@@ -638,7 +660,7 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(len(results), 5, "全部成功应收集 5 条")
         self.assertLessEqual(state[2][0], 2, "并发峰值不应超过 concurrency")
         self.assertEqual(state[2][0], 2, "5 个任务在 2 并发下应出现并发峰值 2")
-        self.assertEqual(pending_out, set())
+        self.assertEqual(pending_out, {})
 
     def test_parallel_records_failed_jobs_to_pending(self):
         module = load_module()
@@ -655,7 +677,7 @@ class ChromeSetupTests(unittest.TestCase):
                 jobs, cdp_port=9222, concurrency=3,
                 limiter=limiter_cls.return_value)
         self.assertEqual(len(results), 2, "失败的 job 不应写入结果")
-        self.assertEqual(pending_out, {"job-1", "job-2"})
+        self.assertEqual(pending_out, {"job-1": 1, "job-2": 1})
 
     def test_parallel_stops_submitting_after_global_stop(self):
         module = load_module()
@@ -804,7 +826,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
                     mock.patch.object(module, "load_pending_ids",
-                                      return_value=set()), \
+                                      return_value={}), \
                     mock.patch.object(module.time, "sleep"):
                 module.scrape_details(list_data, output_path=out,
                                       cdp_port=9222, concurrency=1)
