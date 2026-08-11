@@ -252,8 +252,9 @@ python3 "$SCRIPT_PATH" --setup-chrome --reset-chrome-profile --cdp-port 9222
 
 - 仅用于个人求职研究
 - 单次最多 10 页（300 条），防封号
-- 翻页间隔 12-22 秒随机延迟，3 页约 1 分钟
+- 翻页间隔 12-22 秒随机延迟（并发 >1 时自动拉长到 20-30 秒），3 页约 1 分钟
 - 详情页每条 10-25 秒，10 条约 3-5 分钟
+- **并发守则（ai-pm-job-intel 规格 §3.6）**：默认并发上限 1（互斥锁硬防线）；`--max-concurrent N`（2-3）仅指令显式开启；任一任务遇风控 → 全停挂起等人工，确认后 `--reset-lock` 重开
 - BOSS直聘可能更新 API 路径，失效时需更新脚本中 `API_JOB_LIST_PATH` 常量
 
 ## 安装本 Skill

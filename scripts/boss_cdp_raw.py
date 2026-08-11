@@ -1379,7 +1379,17 @@ def flush_jobs(path, meta, jobs):
 
 # ============================================================
 # 单进程互斥（规格 §3.6：防止多任务并发启动超频/竞争 Chrome）
+# 锁文件格式：第一行最大并发数 N，后续每行一个持有 pid，
+# 熔断时追加一行 risk（任一并发任务遇风控 → 全停广播）
+#   N
+#   pid1
+#   pid2
+#   risk
+# 并发上限默认 1（现状）；--max-concurrent N 仅指令显式放开（如 2-3）
 # ============================================================
+RISK_LINE = "risk"
+
+
 def _pid_is_running(pid):
     """检查 pid 对应进程是否存活（跨平台）。"""
     try:
@@ -1401,39 +1411,128 @@ def _pid_is_running(pid):
         return False
 
 
-def acquire_scrape_lock():
-    """获取单进程互斥锁；锁被存活进程持有时返回 False。
+def _read_scrape_lock():
+    """读取锁文件，返回 (max_concurrent, 持有 pid 列表, risk 标志)；损坏返回 (1, [], False)。"""
+    try:
+        with open(SCRAPE_LOCK_PATH, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    except (OSError, UnicodeDecodeError, ValueError):
+        return 1, [], False
+    if not lines:
+        return 1, [], False
+    try:
+        max_concurrent = int(lines[0])
+    except (TypeError, ValueError):
+        max_concurrent = 1
+    risk = RISK_LINE in lines
+    holders = [ln for ln in lines[1:] if ln != RISK_LINE]
+    return max_concurrent, holders, risk
 
-    锁文件内容为持有者 pid；持有者已死（进程崩溃遗留）则接管。
+
+def _write_scrape_lock(max_concurrent, holders, risk=False):
+    """原子写锁文件（tmp + os.replace，防并发撕裂）。"""
+    tmp = SCRAPE_LOCK_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(str(max_concurrent) + "\n")
+        for pid in holders:
+            f.write(str(pid) + "\n")
+        if risk:
+            f.write(RISK_LINE + "\n")
+    os.replace(tmp, SCRAPE_LOCK_PATH)
+
+
+def acquire_scrape_lock(max_concurrent=1):
+    """获取并发锁；熔断中或存活持有者已达上限时返回 False。
+
+    max_concurrent=1 时行为与旧版单 pid 互斥一致（硬防线，默认）。
+    持锁进程崩溃（pid 已死）自动清理其条目并接管。
+    熔断标志（risk）一旦置位即拒绝新任务（挂起等人工确认；
+    人工处理后 --reset-lock 清除，再重开）。
     """
+    if max_concurrent < 1:
+        max_concurrent = 1
     try:
         os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
+        max_c, holders, risk = _read_scrape_lock()
+        if risk:
+            return False  # 熔断中：必须人工确认（--reset-lock）后才能重开
         if os.path.exists(SCRAPE_LOCK_PATH):
-            try:
-                with open(SCRAPE_LOCK_PATH, "r", encoding="utf-8") as f:
-                    holder = f.read().strip()
-            except (OSError, UnicodeDecodeError):
-                holder = ""
-            if holder and _pid_is_running(holder):
+            alive = [p for p in holders if _pid_is_running(p)]
+            if len(alive) >= max(max_c, max_concurrent):
                 return False
-        with open(SCRAPE_LOCK_PATH, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+        else:
+            alive = []
+        _write_scrape_lock(max_concurrent, alive + [str(os.getpid())])
         return True
     except OSError:
         return False
 
 
-def release_scrape_lock():
-    """释放单进程互斥锁；只释放自己的锁（他人锁不删）。"""
+def set_scrape_lock_risk():
+    """置熔断标志：任一并发任务遇风控时广播全停（其他任务在页间检查并停止）。"""
     try:
         if not os.path.exists(SCRAPE_LOCK_PATH):
             return
-        with open(SCRAPE_LOCK_PATH, "r", encoding="utf-8") as f:
-            holder = f.read().strip()
-        if holder == str(os.getpid()):
+        max_c, holders, risk = _read_scrape_lock()
+        if risk:
+            return
+        _write_scrape_lock(max_c, holders, risk=True)
+    except OSError:
+        pass
+
+
+def is_scrape_lock_risk():
+    """读取当前锁文件是否已熔断（并发任务全停广播）。"""
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return False
+        _, _, risk = _read_scrape_lock()
+        return risk
+    except OSError:
+        return False
+
+
+def release_scrape_lock():
+    """释放本进程持有的锁；只移除自己的 pid（他人 pid 保留）。
+
+    熔断中（risk 已置位）保留锁文件（挂起等人工确认），不因持有者退出而删除；
+    无 risk 且无剩余持有者时删除锁文件。
+    """
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return
+        max_c, holders, risk = _read_scrape_lock()
+        mine = str(os.getpid())
+        rest = [p for p in holders if p != mine]
+        if len(rest) == len(holders):
+            return  # 锁里没有自己（他人/已清理），不动
+        if rest or risk:
+            # 仍有持有者，或熔断中需保留风险状态
+            _write_scrape_lock(max_c, rest, risk=risk)
+        else:
             os.remove(SCRAPE_LOCK_PATH)
     except OSError:
         pass
+
+
+def clear_scrape_lock_risk():
+    """人工确认后清除熔断状态（--reset-lock）。
+
+    仅清除 risk 标志；若锁文件内仍有存活持有者则保留（他人任务在跑不动）。
+    """
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return True
+        max_c, holders, risk = _read_scrape_lock()
+        if not risk:
+            return True
+        if holders:
+            _write_scrape_lock(max_c, holders, risk=False)
+        else:
+            os.remove(SCRAPE_LOCK_PATH)
+        return True
+    except OSError:
+        return False
 
 
 # ============================================================
@@ -1627,11 +1726,11 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                max_jobs=None):
+                max_jobs=None, max_concurrent=1):
     city_name, city_code = resolve_city(city_input)
-    # 单进程互斥（规格 §3.6）：已有抓取任务运行时拒绝启动，防超频/竞争 Chrome
-    if not acquire_scrape_lock():
-        print("❌ 已有抓取任务在运行（单进程互斥），本次拒绝启动。")
+    # 单进程互斥（规格 §3.6）：默认并发上限 1（现状）；--max-concurrent N 仅指令显式放开
+    if not acquire_scrape_lock(max_concurrent=max_concurrent):
+        print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
         print(f"EXPORT_FAIL reason=lock_held city={city_name} keyword={keyword}")
         return {"keyword": keyword, "city": city_name, "total": 0, "jobs": []}
     cdp = CDPSession(cdp_port)
@@ -1706,6 +1805,13 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
     try:
         for pg in range(1, max_pages + 1):
+            # 并发熔断检查：其他任务已广播风控 → 本任务立即全停（不降并发续跑）
+            if is_scrape_lock_risk():
+                print("⚠️ 并发任务已触发风控熔断，本任务立即停止（保留已抓数据）。")
+                warnings.append("并发任务风控熔断")
+                print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                return {"keyword": keyword, "city": city_name,
+                        "total": len(all_jobs), "jobs": all_jobs}
             actual_pages = pg
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
             incr_request()
@@ -1719,6 +1825,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
                 if is_risk:
                     print(f"⚠️ 搜索页 {reason}，等待人工处理...")
+                    set_scrape_lock_risk()  # 并发熔断广播：其他任务全停
                     if not wait_for_risk_clear(cdp, sid):
                         print("列表页风控未解除，停止抓取（保留已抓数据）。")
                         warnings.append(f"搜索页风控未解除: {reason}")
@@ -1824,9 +1931,21 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 break
 
             if pg < max_pages:
-                d = random.uniform(12, 22)
+                # 并发 >1 时页间隔自动拉长（规格 §3.6 修订：12-22s → 20-30s）
+                if max_concurrent > 1:
+                    d = random.uniform(20, 30)
+                else:
+                    d = random.uniform(12, 22)
                 print(f"  翻页等待 {d:.0f}s...\n")
-                time.sleep(d)
+                # 长等待期间分片检查熔断广播（其他任务风控 → 立即停，不等到翻页完成）
+                for _ in range(4):
+                    if is_scrape_lock_risk():
+                        print("⚠️ 并发任务已触发风控熔断，本任务立即停止（保留已抓数据）。")
+                        warnings.append("并发任务风控熔断")
+                        print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        return {"keyword": keyword, "city": city_name,
+                                "total": len(all_jobs), "jobs": all_jobs}
+                    time.sleep(d / 4)
 
     except KeyboardInterrupt:
         print("\n中断")
@@ -3603,6 +3722,9 @@ def main():
     p.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
     p.add_argument("--max-jobs", type=int, default=None,
                    help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
+    p.add_argument("--max-concurrent", type=int, default=1,
+                   help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
+                        "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
     p.add_argument("--output", default=None, help="列表数据输出路径")
     p.add_argument("--detail-output", default=None, help="详情数据输出路径")
     p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
@@ -3647,6 +3769,8 @@ def main():
     p.add_argument("--retry-job", action="append", default=[],
                    metavar="JOB_ID",
                    help="强制重试指定 job_id（可重复指定；无视 pending 重试上限，未记录的也会重抓）")
+    p.add_argument("--reset-lock", action="store_true",
+                   help="人工确认后清除并发锁的熔断状态（--max-concurrent 任务遇风控全停后重开前使用）")
     p.add_argument("--smoke-test", action="store_true",
                    help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
     p.add_argument("--list-cities", nargs="?", const="", default=None,
@@ -3735,6 +3859,14 @@ def main():
     if args.stop_chrome:
         sys.exit(run_stop_chrome())
 
+    # --reset-lock 模式（人工确认后清除并发锁熔断状态）
+    if args.reset_lock:
+        if clear_scrape_lock_risk():
+            print("✅ 并发锁熔断状态已清除，可重新开始抓取。")
+        else:
+            print("❌ 清除失败（锁文件异常）。")
+        sys.exit(0)
+
     if not require_runtime_dependencies("requests", "websocket"):
         sys.exit(1)
 
@@ -3788,6 +3920,7 @@ def main():
             cdp_port=args.cdp_port, fmt=args.format,
             allow_dom_fallback=args.allow_dom_fallback,
             max_jobs=args.max_jobs,
+            max_concurrent=args.max_concurrent,
         )
 
     # 合并外部文件

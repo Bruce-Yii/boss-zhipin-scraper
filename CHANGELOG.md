@@ -3,6 +3,7 @@
 ## v2.3.0 (2026-08-11)
 
 ### 新增
+- **互斥锁升级为"并发上限可配"**（ai-pm-job-intel 规格 §3.6 修订）：锁文件从单 pid 升级为「pid 列表 + 最大并发数」（`~/.boss-zhipin-scraper/scrape.lock`，首行上限、余行持有 pid）；新增 `--max-concurrent N`（**默认 1**，现状行为不变，超上限仍 `lock_held` 拒启动）；**熔断广播**：任一并发任务遇 code 37/验证码 → 锁文件置 `risk` 标志，其余任务页间分片检查立即全停（不降并发续跑），挂起等人工，`--reset-lock` 清除后重开；并发 >1 时页间隔自动拉长 12-22s → 20-30s；SKILL.md 守则同步（并发只准指令显式开启 + 风控全停）
 - **双端契约一致校验**（与 ai-pm-job-intel 消费端对齐）：消费端校验器按 SHA 固化为 vendor 副本（`tests/fixtures/consumer_validator/`，含 v1.0.0 版本号），CI 新增 `contract-check` job 对契约样例 fixture 跑 `validate_export.py`，断言退出码 0 且输出含 `v1.0.0`（版本漂移即红，触发双端对齐）；本地回归测试同步覆盖。契约样例 fixture 重出：剔除 `security_id`/`lid`/`encrypt_*` 内部标识（新版 `tests/fixtures/sample_export_v1.json`，30 条实测通过）
 - **导出契约 v1**（ai-pm-job-intel 规格 §3.2）：导出 JSON 顶层加 `format_version: 1`；meta 补 `page_count`/`warnings`（API 空数据、风控等异常留痕）
 - jobs 字段契约化：新增 `company_name`（与 boss_name 同值，规格必填）、`experience`/`education` 独立字段（原合并于 tags）、`skills` 改为数组

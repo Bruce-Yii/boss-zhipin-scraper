@@ -955,6 +955,134 @@ class ChromeSetupTests(unittest.TestCase):
                 module.release_scrape_lock()
                 self.assertTrue(os.path.exists(lock), "他人锁不应被删")
 
+    def test_scrape_lock_default_max_concurrent_is_one(self):
+        """规格 §3.6 修订：默认并发上限 1（现状行为不变）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True) as running:
+                self.assertTrue(module.acquire_scrape_lock())
+                self.assertFalse(module.acquire_scrape_lock(),
+                                 "默认上限 1：第二个存活持有者应拒绝")
+                self.assertTrue(running.called)
+
+    def test_scrape_lock_max_concurrent_allows_parallel(self):
+        """--max-concurrent N：指令显式放开并发上限。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True):
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3))
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3),
+                                "上限 3：第二个存活持有者应允许")
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3),
+                                "上限 3：第三个存活持有者应允许")
+                self.assertFalse(module.acquire_scrape_lock(max_concurrent=3),
+                                 "上限 3：第四个存活持有者应拒绝")
+
+    def test_scrape_lock_pid_list_in_file(self):
+        """锁文件内容为 max_concurrent 行 + 持有 pid 列表。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True):
+                module.acquire_scrape_lock(max_concurrent=2)
+                module.acquire_scrape_lock(max_concurrent=2)
+                with open(lock, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                self.assertEqual(lines[0], "2", "首行应为并发上限")
+                self.assertEqual(len(lines[1:]), 2, "应有 2 个持有 pid")
+
+    def test_scrape_lock_release_only_removes_own_pid(self):
+        """并发持有：释放只移除自己 pid，其他持有者保留。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True), \
+                    mock.patch.object(module.os, "getpid",
+                                      side_effect=[100, 200, 100]):
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3))
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3))
+                module.release_scrape_lock()  # 进程 100 释放
+                with open(lock, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                self.assertEqual(lines[0], "3")
+                self.assertEqual(lines[1:], ["200"], "只剩进程 200")
+
+    def test_scrape_lock_risk_broadcast(self):
+        """熔断广播：set 后 is 返回 True，其他任务据此全停。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock):
+                module.acquire_scrape_lock(max_concurrent=2)
+                self.assertFalse(module.is_scrape_lock_risk())
+                module.set_scrape_lock_risk()
+                self.assertTrue(module.is_scrape_lock_risk())
+                # 熔断中释放仍保留 risk 标志（挂起等人工确认）
+                module.release_scrape_lock()
+                self.assertTrue(module.is_scrape_lock_risk())
+
+    def test_scrape_lock_risk_blocks_new_acquire(self):
+        """熔断中（即使无存活持有者）新任务也应拒绝，必须人工确认后重开。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True):
+                module.acquire_scrape_lock(max_concurrent=2)
+                module.set_scrape_lock_risk()
+                module.release_scrape_lock()
+                self.assertFalse(module.acquire_scrape_lock(max_concurrent=2),
+                                 "熔断中不应允许新任务")
+
+    def test_scrape_lock_risk_cleared_by_reset(self):
+        """人工确认后 --reset-lock 清除熔断，可重新抓取。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=False):
+                module.acquire_scrape_lock(max_concurrent=2)
+                module.set_scrape_lock_risk()
+                module.release_scrape_lock()
+                self.assertTrue(module.is_scrape_lock_risk())
+                self.assertTrue(module.clear_scrape_lock_risk(),
+                                "reset-lock 应成功")
+                self.assertFalse(module.is_scrape_lock_risk(),
+                                 "清除后 risk 应为 False")
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=2),
+                                "清除后可重新获取锁")
+
+    def test_scrape_lock_clear_keeps_other_holders(self):
+        """reset-lock 仅清熔断；有其他存活持有者时锁文件保留。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True), \
+                    mock.patch.object(module.os, "getpid",
+                                      side_effect=[100, 200]):
+                module.acquire_scrape_lock(max_concurrent=2)
+                module.acquire_scrape_lock(max_concurrent=2)
+                module.set_scrape_lock_risk()
+                self.assertTrue(module.clear_scrape_lock_risk())
+                with open(lock, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                self.assertEqual(lines[0], "2")
+                self.assertEqual(lines[1:], ["100", "200"], "持有 pid 保留")
+
     def test_scrape_list_aborts_when_lock_held(self):
         module = load_module()
         with tempfile_profile() as paths:
@@ -969,6 +1097,7 @@ class ChromeSetupTests(unittest.TestCase):
                 result = module.scrape_list("AI", "上海", 1, {}, None)
             self.assertIn("EXPORT_FAIL reason=lock_held", out.getvalue())
             self.assertEqual(result["jobs"], [])
+
 
     def test_flush_jobs_emits_contract_meta(self):
         module = load_module()
