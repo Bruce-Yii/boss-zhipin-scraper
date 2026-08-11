@@ -1053,6 +1053,36 @@ class ChromeSetupTests(unittest.TestCase):
                              "https://www.zhipin.com/job_detail/x.html",
                              "job_link 是公开信息保留")
 
+    # ----- 双端契约一致校验（消费端校验器 vendor 副本 v1.0.0）-----
+
+    CONSUMER_VALIDATOR = (
+        pathlib.Path(__file__).resolve().parents[0]
+        / "fixtures" / "consumer_validator" / "scripts" / "validate_export.py"
+    )
+    CONTRACT_FIXTURE = (
+        pathlib.Path(__file__).resolve().parents[0] / "fixtures" / "sample_export_v1.json"
+    )
+
+    def test_vendor_validator_fixture_files_exist(self):
+        self.assertTrue(self.CONSUMER_VALIDATOR.is_file(),
+                        "消费端校验器 vendor 副本缺失")
+        self.assertTrue(self.CONTRACT_FIXTURE.is_file(),
+                        "契约样例 fixture 缺失")
+
+    def test_vendor_validator_passes_contract_fixture(self):
+        """双端一致：消费端校验器（vendor 副本 v1.0.0）须通过我方契约样例，
+        且输出行含 v1.0.0（版本漂移即失败，触发与 ai-pm-job-intel 对齐）。"""
+        result = subprocess.run(
+            [sys.executable, str(self.CONSUMER_VALIDATOR), str(self.CONTRACT_FIXTURE)],
+            capture_output=True, text=True, encoding="utf-8", timeout=60,
+        )
+        out = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, f"校验器退出码非 0:\n{out}")
+        self.assertIn("validator=v1.0.0", out,
+                      f"校验器版本不匹配（需与 ai-pm-job-intel 对齐）:\n{out}")
+        self.assertIn("ok=True", out, f"样例未通过消费端契约校验:\n{out}")
+
+
     def test_scrape_list_emits_export_ok_line(self):
         module = load_module()
         cdp = mock.Mock()
