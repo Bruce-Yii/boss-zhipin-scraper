@@ -571,6 +571,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "create_page_session",
                                   return_value=("t", "s")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs"), \
                 mock.patch.object(module.time, "sleep"):
             result = module.scrape_list("AI", "上海", 5, {}, None, max_jobs=50)
         self.assertEqual(len(result["jobs"]), 60, "达到目标后整页为止，允许一页边界")
@@ -604,6 +605,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "create_page_session",
                                   return_value=("t", "s")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs"), \
                 mock.patch.object(module.time, "sleep"):
             result = module.scrape_list("AI", "上海", 3, {}, None, max_jobs=None)
         self.assertEqual(len(result["jobs"]), 30, "不设上限时按页数正常抓取")
@@ -1092,6 +1094,7 @@ class ChromeSetupTests(unittest.TestCase):
                                       return_value=False), \
                     mock.patch.object(module, "resolve_city",
                                       return_value=("上海", "101020100")), \
+                    mock.patch.object(module, "flush_jobs"), \
                     mock.patch("sys.stdout",
                                new_callable=__import__("io").StringIO) as out:
                 result = module.scrape_list("AI", "上海", 1, {}, None)
@@ -1240,6 +1243,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "create_page_session",
                                   return_value=("t", "s")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs"), \
                 mock.patch.object(module.time, "sleep"), \
                 mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as out:
             result = module.scrape_list("AI", "深圳", 2, {}, None)
