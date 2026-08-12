@@ -156,7 +156,10 @@ log = logging.getLogger("boss_cdp")
 
 
 def default_output_path(kind):
-    filename = f"boss_{kind}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    # 秒级时间戳 + pid 后缀：并发（--max-concurrent/多 batch 进程）同秒写盘不撞名
+    # （分钟级在单进程下够用，并发后同分钟互相覆盖导致数据丢失——灰度实测暴露）
+    filename = (f"boss_{kind}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"_{os.getpid()}.json")
     return os.path.join(DEFAULT_RESULT_DIR, filename)
 
 

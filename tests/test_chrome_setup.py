@@ -53,6 +53,25 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("boss_jobs_", module.default_output_path("jobs"))
         self.assertIn("boss_details_", module.default_output_path("details"))
 
+    def test_default_output_path_unique_across_concurrent_calls(self):
+        """并发（多进程同秒写盘）不撞名：秒级时间戳 + pid 后缀（灰度实测暴露）。"""
+        module = load_module()
+        fake_now = module.datetime(2026, 8, 12, 18, 30, 45)
+        fake_dt = mock.Mock()
+        fake_dt.now.return_value = fake_now
+        names = set()
+        with mock.patch.object(module, "datetime", fake_dt), \
+                mock.patch.object(module.os, "getpid",
+                                  side_effect=["1111", "2222"]):
+            names.add(module.default_output_path("jobs"))
+            names.add(module.default_output_path("jobs"))
+        self.assertEqual(len(names), 2,
+                         "同秒不同 pid 的文件名应不同（不覆盖）")
+        for n in names:
+            self.assertIn("20260812_183045", n, "文件名含秒级时间戳")
+        self.assertTrue(all("_1111" in n or "_2222" in n for n in names),
+                        "文件名含 pid 后缀")
+
     def test_create_page_session_defaults_to_background_with_visibility_override(self):
         module = load_module()
         cdp = mock.Mock()
