@@ -11,10 +11,20 @@ import re
 import sys
 from collections import Counter
 
+import matplotlib
+
+matplotlib.use("Agg")  # 无头后端：仅生成 PNG 不弹窗
+import matplotlib.pyplot as plt
+import pandas as pd
+
 try:
     from scripts import boss_cdp_raw as boss
 except ImportError:
     import boss_cdp_raw as boss
+
+# matplotlib 中文字体（Windows 微软雅黑/黑体；CI 无中文字体时退化为警告不失败）
+plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "DejaVu Sans"]
+plt.rcParams["axes.unicode_minus"] = False
 
 
 DEFAULT_RESULT_DIR = boss.DEFAULT_RESULT_DIR
@@ -114,8 +124,29 @@ def parse_salary_monthly(salary):
     return None
 
 
+_SALARY_MONTHS_RE = re.compile(r"(\d+)\s*薪")
+
+
+def parse_salary_annual(salary):
+    """把薪资字符串解析为年薪范围（千元）；无法解析返回 None。
+
+    "20-40K·15薪" → (300, 600)（月薪×月数）；无月数信息按 12 个月折算。
+    15薪 vs 13薪按月度排名不公平，年薪折算供跨岗位公平比较。
+    """
+    monthly = parse_salary_monthly(salary)
+    if monthly is None:
+        return None
+    low, high = monthly
+    m = _SALARY_MONTHS_RE.search(str(salary or ""))
+    months = int(m.group(1)) if m else 12
+    return round(low * months, 1), round(high * months, 1)
+
+
 def salary_stats(jobs):
-    """汇总岗位薪资行情：中位/均值/区间（月薪千元）与解析覆盖率。
+    """汇总岗位薪资行情：中位/均值/P10-P90 区间（月薪千元）与解析覆盖率。
+
+    口径（第四轮调研修正）：区间用 P10/P90 分位替代 min/max（极值在
+    小样本不稳定）；中位数取两中位均值（偶数样本）。
 
     Returns:
         dict: {"parsed", "unparsed", "median_k", "mean_k", "low_k", "high_k"}；
@@ -140,14 +171,16 @@ def salary_stats(jobs):
     if not mids:
         return {"parsed": 0, "unparsed": unparsed,
                 "median_k": None, "mean_k": None, "low_k": None, "high_k": None}
-    ordered = sorted(mids)
+    series = pd.Series(mids)
+    low_series = pd.Series(lows)
+    high_series = pd.Series(highs)
     return {
         "parsed": len(mids),
         "unparsed": unparsed,
-        "median_k": ordered[len(ordered) // 2],
-        "mean_k": round(sum(mids) / len(mids), 1),
-        "low_k": min(lows),
-        "high_k": max(highs),
+        "median_k": float(series.median()),
+        "mean_k": round(float(series.mean()), 1),
+        "low_k": round(float(low_series.quantile(0.1)), 1),
+        "high_k": round(float(high_series.quantile(0.9)), 1),
     }
 
 
@@ -200,10 +233,9 @@ def salary_by_experience(jobs):
     for bucket, mids in buckets.items():
         if not mids and unparsed[bucket] == 0:
             continue
-        ordered = sorted(mids)
         result[bucket] = {
             "count": len(mids) + unparsed[bucket],
-            "median_k": ordered[len(ordered) // 2] if mids else None,
+            "median_k": float(pd.Series(mids).median()) if mids else None,
             "unparsed": unparsed[bucket],
         }
     return result
@@ -384,13 +416,17 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
                     jd_terms[normalized] += 1
                     seen_terms.add(key)
 
+    market = salary_stats(jobs)
     return {
         "keyword": search_keyword,
         "city": city,
         "total_jobs": len([job for job in jobs if isinstance(job, dict)]),
         "total_details": len([detail for detail in details if isinstance(detail, dict)]),
         "salary_ranges": _most_common(salary_ranges, top),
-        "salary_market": salary_stats(jobs),
+        "salary_market": market,
+        # 样本量警示：可解析薪资 <30 时结论仅供参考（第四轮统计口径）
+        "sample_warning": (market.get("parsed", 0) > 0
+                           and market.get("parsed", 0) < 30),
         "salary_by_experience": salary_by_experience(jobs),
         "top_salary": top_salary_jobs(jobs, top),
         "experience": _most_common(experience, top),
@@ -452,6 +488,10 @@ def format_summary(summary):
     lines = [
         f"岗位市场摘要: {title}",
         f"列表岗位: {summary['total_jobs']} 条；详情 JD: {summary['total_details']} 条",
+    ]
+    if summary.get("sample_warning"):
+        lines.insert(1, "⚠️ 样本量警示：可解析薪资不足 30 条，统计结论仅供参考")
+    lines += [
         "",
         f"薪资区间: {_format_items(summary['salary_ranges'])}",
         _salary_market_line(summary),
@@ -543,6 +583,68 @@ def load_details_for_input(input_path, detail_path=None, result_dir=DEFAULT_RESU
         ) or []
 
 
+def generate_charts(jobs, output_dir, filename_prefix="summary"):
+    """生成薪资分布直方图 + 经验×薪资中位条形图（PNG，matplotlib Agg 无头后端）。
+
+    Returns:
+        list[str]: 生成的 PNG 路径；无可解析薪资样本时返回空列表。
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    rows = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        parsed = parse_salary_monthly(job.get("salary"))
+        if parsed is None:
+            continue
+        low, high = parsed
+        bucket = "未标注"
+        for tag in split_tags(job.get("tags", "")):
+            if is_experience_tag(tag):
+                bucket = experience_bucket(tag)
+                break
+        rows.append({"mid_k": (low + high) / 2, "bucket": bucket})
+    if not rows:
+        return []
+    df = pd.DataFrame(rows)
+
+    charts = []
+
+    # 1. 薪资中位分布直方图（可解析样本）
+    fig, ax = plt.subplots(figsize=(8, 4))
+    bins = min(12, max(5, int(df["mid_k"].nunique())))
+    ax.hist(df["mid_k"], bins=bins, edgecolor="white", color="#4C72B0")
+    ax.set_title("薪资中位分布（千元/月）")
+    ax.set_xlabel("月薪（千元）")
+    ax.set_ylabel("岗位数")
+    path1 = os.path.join(output_dir, f"{filename_prefix}_salary_hist.png")
+    fig.tight_layout()
+    fig.savefig(path1, dpi=120)
+    plt.close(fig)
+    charts.append(path1)
+
+    # 2. 经验×薪资中位条形图（档位固定顺序）
+    order = ("应届/在校", "1-3年", "3-5年", "5-10年", "10年以上",
+             "经验不限", "未标注")
+    grouped = (df.groupby("bucket")["mid_k"].median()
+               .reindex([b for b in order if b in df["bucket"].values])
+               .dropna())
+    if not grouped.empty:
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(grouped.index.astype(str), grouped.values, color="#55A868")
+        ax.set_title("经验档位 × 薪资中位（千元/月）")
+        ax.set_xlabel("经验要求")
+        ax.set_ylabel("月薪中位（千元）")
+        ax.tick_params(axis="x", rotation=15)
+        path2 = os.path.join(output_dir, f"{filename_prefix}_salary_by_exp.png")
+        fig.tight_layout()
+        fig.savefig(path2, dpi=120)
+        plt.close(fig)
+        charts.append(path2)
+
+    return charts
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="对已抓取的 BOSS 岗位 JSON 做聚合摘要，并生成可复制的求职材料优化提示词。"
@@ -553,6 +655,9 @@ def build_arg_parser():
     parser.add_argument("--keyword", help="覆盖列表文件里的搜索关键词")
     parser.add_argument("--city", help="覆盖列表文件里的城市")
     parser.add_argument("--top", type=positive_int, default=10, help="每个维度展示前 N 项")
+    parser.add_argument("--charts-dir",
+                        help="生成薪资图表（PNG）的输出目录；不传则生成到结果目录 charts/ 子目录")
+    parser.add_argument("--no-charts", action="store_true", help="不生成图表")
     output_group = parser.add_mutually_exclusive_group()
     output_group.add_argument("--summary-only", action="store_true", help="只输出聚合摘要")
     output_group.add_argument("--prompt-only", action="store_true", help="只输出提示词")
@@ -606,6 +711,17 @@ def main(argv=None):
         if not args.prompt_only:
             print("\n--- 可复制提示词 ---")
         print(build_prompt(summary, jobs_path=input_path, details_path=details_path))
+
+    # 图表生成（分析产品化）：默认输出到结果目录 charts/，摘要尾部引用
+    if not args.no_charts:
+        charts_dir = (os.path.expanduser(args.charts_dir)
+                      if args.charts_dir
+                      else os.path.join(os.path.expanduser(args.result_dir), "charts"))
+        charts = generate_charts(jobs, charts_dir)
+        if charts:
+            print("\n--- 图表 ---")
+            for path in charts:
+                print(f"![{os.path.basename(path)}]({path})")
 
     return 0
 

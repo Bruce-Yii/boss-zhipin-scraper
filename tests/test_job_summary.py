@@ -2,6 +2,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -355,8 +356,8 @@ class JobSummaryTests(unittest.TestCase):
         self.assertEqual(stats["unparsed"], 1)
         self.assertEqual(stats["median_k"], 30, "中位月薪 30K")
         self.assertEqual(stats["mean_k"], 30, "均值 (45+30+15)/3 = 30")
-        self.assertEqual(stats["low_k"], 10)
-        self.assertEqual(stats["high_k"], 60)
+        self.assertEqual(stats["low_k"], 12, "P10 分位（lows=[10,20,30] 线性外推）")
+        self.assertEqual(stats["high_k"], 56, "P90 分位（highs=[30,40,60] 线性外推）")
 
     def test_salary_stats_handles_all_unparsed(self):
         module = load_summary_module()
@@ -427,7 +428,8 @@ class JobSummaryTests(unittest.TestCase):
         ]
         by_exp = module.salary_by_experience(jobs)
         self.assertEqual(by_exp["3-5年"]["count"], 3, "a/b/d 三条均带 3-5年")
-        self.assertEqual(by_exp["3-5年"]["median_k"], 45, "解析值 [30,45] 上中位")
+        self.assertEqual(by_exp["3-5年"]["median_k"], 37.5,
+                         "解析值 [30,45] 两中位均值（原上中位 45 已修正）")
         self.assertEqual(by_exp["3-5年"]["unparsed"], 1, "d 薪资未标注")
         self.assertEqual(by_exp["1-3年"]["median_k"], 15)
         self.assertEqual(by_exp["未标注"]["count"], 1, "无经验标签的归未标注")
@@ -471,6 +473,88 @@ class JobSummaryTests(unittest.TestCase):
         self.assertIn("经验薪资", text)
         self.assertIn("高薪岗位", text)
         self.assertIn("30-60K", text)
+
+
+class SalaryAnalysisUpgradeTests(unittest.TestCase):
+    """分析产品化（pandas+matplotlib 引入）：口径修正 / N薪解析 / 样本警示 / 图表。"""
+
+    def test_salary_stats_even_samples_median_is_mid_mean(self):
+        """中位数取法修正：偶数样本取两中位均值（mid=[15,25,35,45] → 30）。"""
+        module = load_summary_module()
+        jobs = [{"salary": f"{lo}-{hi}K"}
+                for lo, hi in [(10, 20), (20, 30), (30, 40), (40, 50)]]
+        stats = module.salary_stats(jobs)
+        self.assertEqual(stats["median_k"], 30.0, "偶数样本中位数应为两中位均值")
+
+    def test_salary_stats_reports_p10_p90_range(self):
+        """区间改 P10/P90 分位（极值在小样本不稳定），不再用 min/max。"""
+        module = load_summary_module()
+        jobs = [{"salary": f"{lo}-{hi}K"}
+                for lo, hi in [(10, 20), (20, 30), (30, 40), (40, 50)]]
+        stats = module.salary_stats(jobs)
+        self.assertLessEqual(stats["low_k"], 25.0)
+        self.assertGreaterEqual(stats["high_k"], 25.0)
+        self.assertLess(stats["low_k"], min(
+            (lo + hi) / 2 for lo, hi in [(10, 20), (20, 30), (30, 40), (40, 50)]),
+            "P10 应低于最小值（分位外推）")
+        self.assertGreater(stats["high_k"], max(
+            (lo + hi) / 2 for lo, hi in [(10, 20), (20, 30), (30, 40), (40, 50)]),
+            "P90 应高于最大值（分位外推）")
+
+    def test_salary_by_experience_even_median_fixed(self):
+        """经验档位偶数样本中位数修正：[30,45] → 37.5（此前取上中位 45）。"""
+        module = load_summary_module()
+        jobs = [
+            {"title": "a", "salary": "30-60K", "tags": "3-5年"},
+            {"title": "b", "salary": "20-40K", "tags": "3-5年"},
+        ]
+        by_exp = module.salary_by_experience(jobs)
+        self.assertEqual(by_exp["3-5年"]["median_k"], 37.5)
+
+    def test_parse_salary_annual_converts_by_months(self):
+        """N薪解析：20-40K·15薪 → 年薪 300-600K（月薪×15）。"""
+        module = load_summary_module()
+        annual = module.parse_salary_annual("20-40K·15薪")
+        self.assertEqual(annual, (300.0, 600.0))
+        fallback = module.parse_salary_annual("20-40K")
+        self.assertEqual(fallback, (240.0, 480.0), "无月数信息按 12 个月折算")
+
+    def test_build_summary_adds_sample_warning_for_small_n(self):
+        """样本量警示：可解析薪资 <30 时 summary 带警示，≥30 无警示。"""
+        module = load_summary_module()
+        small = [{"salary": "20-40K"} for _ in range(10)]
+        big = [{"salary": "20-40K"} for _ in range(30)]
+        s_small = module.build_summary(small, search_keyword="AI")
+        s_big = module.build_summary(big, search_keyword="AI")
+        self.assertTrue(s_small.get("sample_warning"),
+                        "小样本应带样本量警示")
+        self.assertFalse(s_big.get("sample_warning"),
+                         "样本充足不应带警示")
+
+    def test_format_summary_renders_sample_warning(self):
+        """format_summary 头部输出样本警示行。"""
+        module = load_summary_module()
+        jobs = [{"title": "T", "salary": "20-40K"} for _ in range(5)]
+        summary = module.build_summary(jobs, search_keyword="AI", city="上海")
+        text = module.format_summary(summary)
+        self.assertIn("样本", text)
+        self.assertIn("警示", text)
+
+    def test_generate_charts_produces_pngs(self):
+        """matplotlib 图表：薪资直方图 + 经验×薪资条形图生成非空 PNG。"""
+        module = load_summary_module()
+        jobs = [
+            {"title": f"T{i}", "salary": f"{lo}-{hi}K", "tags": "3-5年"}
+            for i, (lo, hi) in enumerate([(20, 40), (30, 60), (10, 20),
+                                          (25, 45), (15, 30)], start=1)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            charts = module.generate_charts(jobs, tmp)
+            self.assertEqual(len(charts), 2, "应生成 2 张图")
+            for path in charts:
+                self.assertTrue(os.path.exists(path), f"图表缺失: {path}")
+                self.assertGreater(os.path.getsize(path), 0, f"图表为空: {path}")
+                self.assertTrue(path.endswith(".png"))
 
 
 if __name__ == "__main__":
