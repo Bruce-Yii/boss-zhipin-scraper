@@ -2285,6 +2285,10 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
     支持 --max-concurrent 透传：多个 batch 进程并行时锁允许多个持有者
     （如 2 个 batch 各跑一半任务 + max_concurrent=2 即并发 2）。
 
+    完成后自动完整性校验（2026-08-12 撞名事故教训）：对比任务数 vs
+    结果目录新增文件数，不一致输出 EXPORT_FAIL reason=batch_shortfall
+    （并发/撞名/写盘异常时立即暴露，不必等人工数文件）。
+
     Returns:
         int: 退出码（0 全成功 / 1 有任务失败或配置错误）
     """
@@ -2294,6 +2298,13 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
     if not tasks:
         print("❌ 没有可执行的批量任务")
         return 1
+
+    # 记录开始前的结果目录文件集合（供完成校验对比）
+    try:
+        before = {n for n in os.listdir(DEFAULT_RESULT_DIR)
+                  if n.startswith("boss_jobs_") and n.endswith(".json")}
+    except OSError:
+        before = set()
 
     print(f"\n=== 批量列表抓取（{len(tasks)} 个任务，max_concurrent={max_concurrent}）===")
     failed = 0
@@ -2314,7 +2325,24 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
             gap = task.get("sleep") or random.uniform(30, 60)
             print(f"任务间等待 {gap:.0f}s 防风控...")
             time.sleep(gap)
-    print(f"\n✅ 批量任务完成：成功 {len(tasks) - failed}/{len(tasks)}")
+
+    # 完成校验：任务数 vs 实际落盘新文件数
+    try:
+        after = {n for n in os.listdir(DEFAULT_RESULT_DIR)
+                 if n.startswith("boss_jobs_") and n.endswith(".json")}
+    except OSError:
+        after = set()
+    new_files = after - before
+    expected_files = len(tasks) - failed  # 失败任务不出文件
+    if len(new_files) < expected_files:
+        print(f"\n❌ 完整性校验失败：任务 {expected_files} 个（失败 {failed}），"
+              f"结果目录新增文件 {len(new_files)} 个（可能撞名/写盘异常）。")
+        print(f"EXPORT_FAIL reason=batch_shortfall tasks_done={len(new_files)} "
+              f"tasks_expected={expected_files}")
+        return 1
+
+    print(f"\n✅ 批量任务完成：成功 {len(tasks) - failed}/{len(tasks)}，"
+          f"落盘 {len(new_files)} 个文件（完整性校验通过）")
     return 0 if failed == 0 else 1
 
 

@@ -859,7 +859,14 @@ class ChromeSetupTests(unittest.TestCase):
             with mock.patch.object(module, "scrape_list",
                                    side_effect=lambda *a, **k: calls.append((a, k))), \
                     mock.patch.object(module.time, "sleep") as sleep, \
-                    mock.patch.object(module, "resolve_city") as rc:
+                    mock.patch.object(module, "resolve_city") as rc, \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[
+                                          ["old1.json", "old2.json"],
+                                          ["old1.json", "old2.json",
+                                           "boss_jobs_new1.json",
+                                           "boss_jobs_new2.json"],
+                                      ]):
                 rc.side_effect = lambda city: (city, "101020100")
                 code = module.run_batch(path)
             self.assertEqual(code, 0)
@@ -881,12 +888,69 @@ class ChromeSetupTests(unittest.TestCase):
             with mock.patch.object(module, "scrape_list",
                                    side_effect=lambda *a, **k: calls.append((a, k))), \
                     mock.patch.object(module.time, "sleep"), \
-                    mock.patch.object(module, "resolve_city") as rc:
+                    mock.patch.object(module, "resolve_city") as rc, \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[
+                                          ["old1.json"],
+                                          ["old1.json", "boss_jobs_new1.json"],
+                                      ]):
                 rc.side_effect = lambda city: (city, "101020100")
                 code = module.run_batch(path, max_concurrent=2)
             self.assertEqual(code, 0)
             self.assertEqual(calls[0][1]["max_concurrent"], 2,
                              "batch 任务应透传 max_concurrent")
+
+    def test_run_batch_integrity_check_passes_when_files_match(self):
+        """batch 完成校验：任务数 = 新增文件数 → 通过。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 1},
+                {"keyword": "Java", "city": "杭州", "pages": 1},
+            ])
+            with mock.patch.object(module, "scrape_list"), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city") as rc, \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[
+                                          ["old1.json", "old2.json"],   # before
+                                          ["old1.json", "old2.json",
+                                           "boss_jobs_new1.json",
+                                           "boss_jobs_new2.json"],      # after
+                                      ]), \
+                    mock.patch("sys.stdout",
+                               new_callable=__import__("io").StringIO) as out:
+                rc.side_effect = lambda city: (city, "101020100")
+                code = module.run_batch(path)
+            printed = out.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn("完整性校验通过", printed)
+
+    def test_run_batch_integrity_check_fails_on_shortfall(self):
+        """batch 完成校验：文件数 < 任务数（撞名/写盘异常）→ EXPORT_FAIL。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 1},
+                {"keyword": "Java", "city": "杭州", "pages": 1},
+            ])
+            with mock.patch.object(module, "scrape_list"), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city") as rc, \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[
+                                          ["old1.json"],                # before
+                                          ["old1.json",
+                                           "boss_jobs_new1.json"],      # after: 少一个
+                                      ]), \
+                    mock.patch("sys.stdout",
+                               new_callable=__import__("io").StringIO) as out:
+                rc.side_effect = lambda city: (city, "101020100")
+                code = module.run_batch(path)
+            printed = out.getvalue()
+            self.assertEqual(code, 1)
+            self.assertIn("EXPORT_FAIL reason=batch_shortfall", printed)
+            self.assertIn("tasks_expected=2", printed)
 
     # ----- 宽 except 收紧（技术债 #2）-----
 
