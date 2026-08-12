@@ -9,6 +9,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -1524,14 +1525,26 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         with tempfile_profile() as paths:
             out = str(paths["cdp_profile"] / "details.json")
-            with mock.patch.object(module, "CDPSession",
-                                   side_effect=TimeoutError("cdp down")), \
+            # SCRAPE_LOCK_PATH mock 到临时路径：熔断冷却文件也落在临时目录（不污染真实 ~/.boss-zhipin-scraper）
+            real_cooldown = (pathlib.Path.home() / ".boss-zhipin-scraper"
+                             / "cdp.cooldown")
+            existed_before = real_cooldown.exists()
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH",
+                                   str(paths["cdp_profile"] / "scrape.lock")), \
+                    mock.patch.object(module, "CDPSession",
+                                      side_effect=TimeoutError("cdp down")), \
                     mock.patch.object(module.time, "sleep"):
                 # 5 个 job、阈值 3 → 连续 3 次失败后熔断停止
                 results = module.scrape_details(self._sample_jobs(5), output_path=out)
             self.assertEqual(results, [])
             self.assertEqual(len(module.load_pending_ids(out)), 3,
                              "熔断后不应继续尝试剩余 job")
+            # 冷却文件应落在 mock 的临时锁目录，不新增真实目录文件
+            tmp_cooldown = pathlib.Path(paths["cdp_profile"]) / "cdp.cooldown"
+            self.assertTrue(tmp_cooldown.exists(),
+                            "冷却文件应写 mock 的临时锁目录")
+            self.assertEqual(real_cooldown.exists(), existed_before,
+                             "真实目录冷却文件不应被测试新增")
 
     # ----- 并发详情抓取：全局限速令牌桶 -----
 
@@ -1854,6 +1867,9 @@ class ChromeSetupTests(unittest.TestCase):
 
         with mock.patch.object(module, "_scrape_one_detail",
                                new=always_fail), \
+                mock.patch.object(module, "SCRAPE_LOCK_PATH",
+                                  str(pathlib.Path(tempfile.mkdtemp())
+                                      / "scrape.lock")), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
@@ -1878,6 +1894,9 @@ class ChromeSetupTests(unittest.TestCase):
 
         with mock.patch.object(module, "_scrape_one_detail",
                                new=always_fail), \
+                mock.patch.object(module, "SCRAPE_LOCK_PATH",
+                                  str(pathlib.Path(tempfile.mkdtemp())
+                                      / "scrape.lock")), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
