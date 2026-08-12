@@ -186,7 +186,7 @@ python3 scripts/job_summary.py --top 15
 | `-q, --quiet` | 静默模式：日志降到 WARNING 级别（结果行/EXPORT 行仍输出 stdout） |
 | `--output` | 列表输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
 | `--detail-output` | 详情输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
-| `--cdp-port` | CDP 端口（默认 9222） |
+| `--cdp-port` | CDP 端口（默认 45222——固定高位端口，绕开 BOSS 安全 JS 扫描的 9222/9223/9229） |
 | `--scale/--salary/--experience/--degree` | 筛选条件 |
 
 ### 退出码
@@ -195,7 +195,8 @@ python3 scripts/job_summary.py --top 15
 |----|------|
 | 0 | 成功 |
 | 1 | 运行期错误（登录失败/风控/未预期异常——干净错误消息，无 traceback） |
-| 2 | CLI 误用（未知参数/非法值，argparse 默认） |
+| 2 | CLI 误用（未知参数/非法值/冲突命令，argparse 默认） |
+| 130 | 用户 Ctrl+C 中断（128+signal 约定） |
 
 ## 导出契约 v1
 

@@ -5,6 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 连推时取消旧 run（每 run 4 job 矩阵，旧 run 排队纯浪费）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ${{ matrix.os }}

@@ -2220,7 +2220,7 @@ class ChromeSetupTests(unittest.TestCase):
                 module.fetch_boss_json(module.HOT_CITY_URL)
 
     def test_main_rejects_unknown_city_before_login_probe(self):
-        """CLI 城市预校验失败后以非零状态退出，不进入登录探测。"""
+        """CLI 城市预校验失败以 exit 2（CLI 误用）退出，不进入登录探测。"""
         module = load_module()
 
         with mock.patch.object(sys, "argv", [
@@ -2231,12 +2231,13 @@ class ChromeSetupTests(unittest.TestCase):
              mock.patch.object(module, "resolve_city",
                                side_effect=module.CityResolutionError("无法解析城市")), \
              mock.patch.object(module, "check_login_state") as login_probe, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err, \
              redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as exit_context:
                 module.main()
 
-        self.assertEqual(exit_context.exception.code, 1)
-        self.assertIn("无法解析城市", output.getvalue())
+        self.assertEqual(exit_context.exception.code, 2)
+        self.assertIn("无法解析城市", output.getvalue() + err.getvalue())
         login_probe.assert_not_called()
 
     def test_resolve_city_empty_input(self):
@@ -2368,8 +2369,10 @@ class ChromeSetupTests(unittest.TestCase):
                 module.LoginProbeStatus.RESTRICTED,
             ),
             (
+                # 未知非零 code 一律归 RESTRICTED（降速语义），不再 RESPONSE_ERROR——
+                # 新风控形态不被误判为不可恢复（第三轮调研落地）
                 {"code": 7, "message": "业务异常"},
-                module.LoginProbeStatus.RESPONSE_ERROR,
+                module.LoginProbeStatus.RESTRICTED,
             ),
         ]
 
@@ -3539,6 +3542,108 @@ class BestPracticesBatch2Tests(unittest.TestCase):
         self.assertEqual(root.level, logging.WARNING)
         module._apply_verbosity(2, True)
         self.assertEqual(root.level, logging.WARNING, "quiet 优先于 verbose")
+
+
+class BestPracticesBatch3Tests(unittest.TestCase):
+    """第三轮调研实施：flag 互斥/CLI 误用退出码/subprocess UTF-8/端口/风控码/scrubber/CDP 会话。"""
+
+    # ----- C 组：动作型 flag 互斥 + parser.error 语义 -----
+
+    def test_parser_rejects_conflicting_action_flags(self):
+        """同时给多个动作型命令（--check + --verify）→ argparse 拒绝 exit 2。"""
+        module = load_module()
+        parser = module.build_parser()
+        for flags in (["--check", "--verify"], ["--list-results", "--archive"],
+                      ["--setup-chrome", "--stop-chrome"]):
+            with self.assertRaises(SystemExit) as ctx:
+                parser.parse_args(flags)
+            self.assertEqual(ctx.exception.code, 2, f"冲突 flag 应 exit 2: {flags}")
+
+    def test_parser_allows_auxiliary_flags_with_setup_chrome(self):
+        """--setup-chrome 的辅助 flag（--no-wait-login/--login-timeout）不被互斥组误伤。"""
+        module = load_module()
+        parser = module.build_parser()
+        args = parser.parse_args(["--setup-chrome", "--no-wait-login",
+                                  "--login-timeout", "60"])
+        self.assertTrue(args.setup_chrome)
+        self.assertTrue(args.no_wait_login)
+        self.assertEqual(args.login_timeout, 60)
+
+    def test_main_invalid_archive_arg_exits_2(self):
+        """--archive 非整数是 CLI 误用 → exit 2（不再 exit 1）。"""
+        module = load_module()
+        with mock.patch.object(sys, "argv", ["boss_cdp_raw.py", "--archive", "abc"]), \
+             mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit) as ctx:
+                module.main()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--archive", err.getvalue())
+
+    # ----- B 组：未知风控码归受限 -----
+
+    def test_probe_unknown_nonzero_code_returns_restricted(self):
+        """未知非零 code（不在已知风控集合）→ RESTRICTED（降速语义），不再 RESPONSE_ERROR。"""
+        module = load_module()
+        result = module.classify_login_probe_response(
+            {"code": 9999, "message": "新风控形态"})
+        self.assertEqual(result.status, module.LoginProbeStatus.RESTRICTED)
+
+    # ----- B 组：凭证 scrubber -----
+
+    def test_scrub_secrets_redacts_credentials(self):
+        """日志/错误输出中的 cookie/token/__zp_stoken__ 值被脱敏。"""
+        module = load_module()
+        text = "URL: https://www.zhipin.com/wapi?__zp_stoken__=abcdef&wt2=secret"
+        scrubbed = module._scrub_secrets(text)
+        self.assertNotIn("abcdef", scrubbed)
+        self.assertNotIn("secret", scrubbed)
+        self.assertIn("__zp_stoken__=***", scrubbed)
+
+    def test_main_catch_all_scrubs_secrets_in_error(self):
+        """catch-all 打印的错误消息经 scrubber 脱敏（凭证不进 stderr）。"""
+        module = load_module()
+        with mock.patch.object(module, "run_cli",
+                               side_effect=RuntimeError(
+                                   "failed: __zp_stoken__=topsecret123")), \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit):
+                module.main()
+        self.assertNotIn("topsecret123", err.getvalue())
+
+    # ----- A 组：CDP 会话心跳/快速失败 -----
+
+    def test_cdp_session_send_fails_fast_when_connection_dead(self):
+        """连接标记死亡后 send 立即抛错（不等 30s 超时挂起）。"""
+        module = load_module()
+        fake_requests = mock.Mock()
+        fake_requests.get.return_value.json.return_value = {
+            "webSocketDebuggerUrl": "ws://x"}
+        fake_websocket = mock.Mock()
+        fake_websocket.create_connection.return_value = mock.Mock()
+        with mock.patch.object(module, "require_runtime_dependencies",
+                               return_value=True), \
+             mock.patch.object(module, "requests", fake_requests), \
+             mock.patch.object(module, "websocket", fake_websocket):
+            sess = module.CDPSession(9999)
+            sess._dead = True
+            with self.assertRaises(ConnectionError):
+                sess.send("Browser.getVersion")
+
+    def test_cdp_session_recv_break_detects_target_crashed_event(self):
+        """收到 Inspector.detached / Target.targetCrashed 事件 → 抛目标崩溃异常（快速失败）。"""
+        module = load_module()
+        sess = object.__new__(module.CDPSession)
+        sess.mid = 5
+        sess.ws = mock.Mock()
+        sess._dead = False
+        sess.ws.recv.side_effect = [
+            json.dumps({"method": "Inspector.detached",
+                        "params": {"reason": "Render process gone.", "sessionId": "s1"}}),
+        ]
+        with self.assertRaises(module.TargetCrashedError):
+            sess.send("Runtime.evaluate", {"expression": "1"}, "s1")
 
 
 class tempfile_profile:

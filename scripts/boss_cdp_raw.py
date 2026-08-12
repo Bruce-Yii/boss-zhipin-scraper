@@ -54,7 +54,7 @@ requests = None
 # ============================================================
 
 # CDP 默认端口（可通过 --cdp-port 覆盖）
-DEFAULT_CDP_PORT = 9222
+DEFAULT_CDP_PORT = 45222  # 固定高位端口：绕开 BOSS 安全 JS 扫描名单（9222/9223/9229 实测被扫）
 
 # API 基础路径（便于统一修改）
 API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
@@ -132,27 +132,15 @@ LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
 LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
-# BOSS 风控码会随平台策略变化，码表追不上时按 message 关键字兜底识别风控/限流，
-# 避免把「已登录但被风控」误判为 RESPONSE_ERROR 进而当成登录失败。
-LOGIN_RESTRICTED_MESSAGE_KEYWORDS = (
-    "环境存在异常",
-    "访问频繁",
-    "操作太频繁",
-    "安全校验",
-    "滑块",
-    "验证",
-)
+# 未知非零 code 一律按受限（降速）处理，见 probe_login_state 的 code != 0 分支
 DEFAULT_LOGIN_TIMEOUT = 300
 
 # 全局请求计数器
 _request_counter = 0
 _live_city_maps_cache = None
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+# logging 配置移入 main()（if __name__ 守卫内）——模块顶层 basicConfig 会被任何
+# import（含测试）触发并改动 root logger，且 -q 时模块级 handler 残留
 log = logging.getLogger("boss_cdp")
 
 
@@ -295,8 +283,12 @@ def incr_request():
 # ============================================================
 # CDP 连接
 # ============================================================
+class TargetCrashedError(Exception):
+    """CDP target 崩溃/会话 detached（如渲染进程 OOM）——立即失败，避免 evaluate 永久挂起。"""
+
+
 class CDPSession:
-    def __init__(self, cdp_port=DEFAULT_CDP_PORT):
+    def __init__(self, cdp_port=DEFAULT_CDP_PORT, heartbeat_interval=30):
         if not require_runtime_dependencies("requests", "websocket"):
             raise RuntimeError("缺少 CDP 运行依赖")
         self.cdp_port = cdp_port
@@ -304,6 +296,37 @@ class CDPSession:
         ws_url = resp.json()["webSocketDebuggerUrl"]
         self.ws = websocket.create_connection(ws_url, timeout=60)
         self.mid = 0
+        self._dead = False
+        if heartbeat_interval and heartbeat_interval > 0:
+            self._start_heartbeat(heartbeat_interval)
+
+    def _start_heartbeat(self, interval):
+        """后台线程 HTTP 探活：NAT/代理静默断连时尽早标记 _dead（防僵尸连接）。
+
+        CDP 无内置保活，空闲连接可能被静默掐断且收不到任何事件；
+        用同端口 /json/version HTTP 探活（不干扰 ws 消息循环），
+        连续失败即标记连接死亡，send 快速失败而非挂起 30s 超时。
+        """
+        import threading
+
+        def _beat():
+            while not self._dead:
+                try:
+                    requests.get(
+                        f"http://127.0.0.1:{self.cdp_port}/json/version",
+                        timeout=5,
+                    )
+                except requests.RequestException:
+                    self._dead = True
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(interval)
+
+        threading.Thread(target=_beat, daemon=True,
+                         name="cdp-heartbeat").start()
 
     def send(self, method, params=None, sid=None, timeout=30):
         """发送 CDP 命令并等待匹配的响应。
@@ -318,8 +341,14 @@ class CDPSession:
             CDP 响应字典
 
         Raises:
-            TimeoutError: 超过 max_retries 仍未收到匹配响应
+            ConnectionError: 连接已死亡/WebSocket 异常断开（快速失败，不挂起）
+            TargetCrashedError: 渲染进程崩溃/会话 detached（Inspector.detached/targetCrashed）
+            TimeoutError: 超过 timeout 仍未收到匹配响应
         """
+        if self._dead:
+            raise ConnectionError(
+                f"CDP 连接已断开（心跳探活失败），method={method}"
+            )
         self.mid += 1
         msg = {"id": self.mid, "method": method, "params": params or {}}
         if sid:
@@ -342,12 +371,26 @@ class CDPSession:
                 raw = self.ws.recv()
             except websocket.WebSocketTimeoutException:
                 raise TimeoutError(f"CDP WebSocket recv 超时, method={method}")
+            except websocket.WebSocketException:
+                # 连接被对端关闭（NAT 掐断/Chrome 退出）——快速失败，不等到超时
+                self._dead = True
+                raise ConnectionError(
+                    f"CDP WebSocket 连接异常断开, method={method}"
+                )
 
             try:
                 r = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 log.debug(f"跳过非 JSON 消息: {raw[:100]}")
                 continue
+
+            if r.get("method") in ("Inspector.detached", "Target.targetCrashed"):
+                # OOM 时只发 Inspector.detached（reason="Render process gone."）且
+                # pending evaluate 会永久挂起（社区已知 bug）——必须立即失败
+                raise TargetCrashedError(
+                    f"CDP target 崩溃/会话断开: {r.get('method')} "
+                    f"{json.dumps(r.get('params', {}), ensure_ascii=False)[:200]}"
+                )
 
             if r.get("id") == self.mid:
                 return r
@@ -365,7 +408,11 @@ class CDPSession:
         return r.get("result", {}).get("result", {}).get("value", None)
 
     def close(self):
-        self.ws.close()
+        self._dead = True
+        try:
+            self.ws.close()
+        except websocket.WebSocketException:
+            pass
 
 
 BACKGROUND_VISIBILITY_SCRIPT = (
@@ -982,11 +1029,9 @@ def classify_login_probe_response(data, http_status=200):
     if code in LOGIN_RESTRICTED_CODES:
         return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
     if code != 0:
-        # code 不在已知风控码集合里时，再按 message 关键字兜底判定是否风控，
-        # 避免新风控码被当成不可恢复的 RESPONSE_ERROR 误拦已登录用户。
-        if any(kw in message for kw in LOGIN_RESTRICTED_MESSAGE_KEYWORDS):
-            return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
-        return LoginProbeResult(LoginProbeStatus.RESPONSE_ERROR, code=code, message=message)
+        # 未知非零 code 一律按受限处理（降速语义）——新风控形态不被误判为
+        # 不可恢复的 RESPONSE_ERROR（避免"误拦已登录用户"与静默放弃并存）
+        return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
 
     zp_data = data.get("zpData")
     if not isinstance(zp_data, dict):
@@ -1367,6 +1412,19 @@ def cleanup_stale_tmp_files(result_dir, max_age_seconds=300):
 
 _SENSITIVE_KEYS = ("cookie", "token", "wt2", "zp_stoken", "zp_token",
                    "password", "account", "auth", "secret")
+# 日志/错误输出脱敏：key=value 形态的凭据值替换为 ***（凭证不进日志/异常/stderr）
+_SECRET_KEY_PATTERN = re.compile(
+    r"(__zp_stoken__|wt2|zp_token|zp_stoken|cookie|token|password|secret)"
+    r"=([^&\s\"'<>]+)",
+    re.IGNORECASE,
+)
+
+
+def _scrub_secrets(text):
+    """日志/错误输出脱敏：cookie/token/__zp_stoken__ 等凭据值替换为 ***。"""
+    if not isinstance(text, str):
+        return text
+    return _SECRET_KEY_PATTERN.sub(lambda m: f"{m.group(1)}=***", text)
 # BOSS 内部标识字段（规格侧建议剔除：下游误读风险，非契约字段；
 # 详情抓取用 job_link 即可导航，不依赖这些参数）
 _INTERNAL_KEYS = ("security_id", "lid", "encrypt_job_id",
@@ -1457,7 +1515,8 @@ def _pid_is_running(pid):
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5)
             return bool(r.stdout.strip())
         os.kill(pid, 0)
         return True
@@ -3635,7 +3694,8 @@ def iter_chrome_process_commands():
         try:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5,
             )
         except (OSError, subprocess.TimeoutExpired):
             # 进程枚举失败不阻塞主流程：调用方按"无进程"处理
@@ -3662,7 +3722,8 @@ def iter_chrome_process_commands():
         return processes
 
     try:
-        r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5)
+        r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.TimeoutExpired):
         # 进程枚举失败不阻塞主流程：调用方按"无进程"处理
         return []
@@ -3874,6 +3935,12 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    # logging 配置只在真正运行 CLI 时生效（import/测试不触发）
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     try:
         run_cli()
     except KeyboardInterrupt:
@@ -3882,7 +3949,7 @@ def main():
     except Exception as e:
         # 退出码固化：0=成功 / 1=运行期错误（含未预期异常，干净消息无 traceback）/
         # 2=CLI 误用（argparse 默认）
-        print(f"❌ 未预期错误: {e}", file=sys.stderr)
+        print(f"❌ 未预期错误: {_scrub_secrets(str(e))}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -3989,30 +4056,37 @@ def build_parser():
 
     # ---- 工具命令 ----
     g_tool = p.add_argument_group("工具命令")
-    g_tool.add_argument("--check", action="store_true", help="运行环境诊断检查")
-    g_tool.add_argument("--verify", action="store_true",
-                        help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
-    g_tool.add_argument("--list-results", action="store_true",
-                        help="列出结果目录中的历史抓取结果文件")
-    g_tool.add_argument("--batch", default=None, metavar="CONFIG.json",
-                        help="批量列表抓取：从配置文件（JSON 数组，每个元素一个任务："
-                             "keyword/city/pages/sleep/筛选字段）逐任务执行，任务间自动等待防风控")
-    g_tool.add_argument("--archive", nargs="?", const="1", default=None,
-                        metavar="KEEP",
-                        help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
-    g_tool.add_argument("--reset-lock", action="store_true",
-                        help="人工确认后清除并发锁的熔断状态（--max-concurrent 任务遇风控全停后重开前使用）")
-    g_tool.add_argument("--smoke-test", action="store_true",
-                        help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
-    g_tool.add_argument("--list-cities", nargs="?", const="", default=None,
-                        metavar="关键词",
-                        help="打印支持的城市列表（可选关键词过滤，如 --list-cities 江）；"
-                             "支持全国城市，码表见 data/city_codes.json，运行时自动从 BOSS 同步")
+    # 动作型命令互斥：同时给多个是无意义输入，argparse 直接拒绝（exit 2）。
+    # --setup-chrome 的辅助 flag（--no-wait-login/--login-timeout 等）不在组内，可正常组合。
+    g_tool_excl = g_tool.add_mutually_exclusive_group()
+    g_tool_excl.add_argument("--check", action="store_true", help="运行环境诊断检查")
+    g_tool_excl.add_argument("--verify", action="store_true",
+                             help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
+    g_tool_excl.add_argument("--list-results", action="store_true",
+                             help="列出结果目录中的历史抓取结果文件")
+    g_tool_excl.add_argument("--batch", default=None, metavar="CONFIG.json",
+                             help="批量列表抓取：从配置文件（JSON 数组，每个元素一个任务："
+                                  "keyword/city/pages/sleep/筛选字段）逐任务执行，任务间自动等待防风控")
+    g_tool_excl.add_argument("--archive", nargs="?", const="1", default=None,
+                             metavar="KEEP",
+                             help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
+    g_tool_excl.add_argument("--reset-lock", action="store_true",
+                             help="人工确认后清除并发锁的熔断状态（--max-concurrent 任务遇风控全停后重开前使用）")
+    g_tool_excl.add_argument("--smoke-test", action="store_true",
+                             help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
+    g_tool_excl.add_argument("--list-cities", nargs="?", const="", default=None,
+                             metavar="关键词",
+                             help="打印支持的城市列表（可选关键词过滤，如 --list-cities 江）；"
+                                  "支持全国城市，码表见 data/city_codes.json，运行时自动从 BOSS 同步")
+    g_tool_excl.add_argument("--setup-chrome", action="store_true",
+                             help="自动启动 Chrome CDP 调试模式")
+    g_tool_excl.add_argument("--stop-chrome", action="store_true",
+                             help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
+    g_tool_excl.add_argument("--close-chrome", action="store_true",
+                             help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
 
     # ---- Chrome 管理 ----
     g_chrome = p.add_argument_group("Chrome 管理")
-    g_chrome.add_argument("--setup-chrome", action="store_true",
-                          help="自动启动 Chrome CDP 调试模式")
     g_chrome.add_argument("--copy-login-state", action="store_true",
                           help="手动从主 Chrome 导入 Local State + Cookie 相关文件到独立 profile（默认、首次启动、重复启动都不复制）")
     g_chrome.add_argument("--reset-chrome-profile", action="store_true",
@@ -4021,10 +4095,6 @@ def build_parser():
                           help="--setup-chrome 启动后不等待 BOSS 登录完成")
     g_chrome.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT,
                           help=f"--setup-chrome 等待登录完成的秒数 (默认 {DEFAULT_LOGIN_TIMEOUT})")
-    g_chrome.add_argument("--stop-chrome", action="store_true",
-                          help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
-    g_chrome.add_argument("--close-chrome", action="store_true",
-                          help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
 
     # ---- 通用参数 ----
     g_general = p.add_argument_group("通用参数")
@@ -4085,8 +4155,7 @@ def run_cli():
         try:
             keep = int(args.archive)
         except ValueError:
-            print(f"❌ --archive 参数必须是正整数: {args.archive}")
-            sys.exit(1)
+            p.error(f"--archive 参数必须是正整数: {args.archive}")
         sys.exit(run_archive(keep_latest=keep))
 
     # --batch 模式（批量列表抓取）
@@ -4132,12 +4201,12 @@ def run_cli():
         sys.exit(1)
 
     # 抓取前校验城市，避免无效中文名被原样作为 city 参数继续请求。
+    # 城市无法解析是 CLI 误用 → parser.error（exit 2，与"1=运行期错误"语义区分）
     if not args.input:
         try:
             resolve_city(args.city)
         except CityResolutionError as e:
-            print(f"❌ {e}")
-            sys.exit(1)
+            p.error(str(e))
 
     # 页数限制
     if args.pages > MAX_PAGES:

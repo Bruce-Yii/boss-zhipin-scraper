@@ -184,7 +184,7 @@ python3 scripts/job_summary.py --top 15
 | `-q, --quiet` | Quiet mode: logs drop to WARNING (result/EXPORT lines still go to stdout) |
 | `--output` | List output path (default `~/.boss-zhipin-scraper/job-result/`) |
 | `--detail-output` | Detail output path (default `~/.boss-zhipin-scraper/job-result/`) |
-| `--cdp-port` | CDP port (default 9222) |
+| `--cdp-port` | CDP port (default 45222 — fixed high port, bypasses the 9222/9223/9229 ports scanned by BOSS security JS) |
 | `--scale/--salary/--experience/--degree` | Filters |
 
 ### Exit codes
@@ -193,7 +193,8 @@ python3 scripts/job_summary.py --top 15
 |------|---------|
 | 0 | Success |
 | 1 | Runtime error (login failure / risk block / unexpected exception — clean message, no traceback) |
-| 2 | CLI misuse (unknown argument / invalid value, argparse default) |
+| 2 | CLI misuse (unknown argument / invalid value / conflicting commands, argparse default) |
+| 130 | Interrupted by user Ctrl+C (128+signal convention) |
 
 ## Export Contract v1
 
