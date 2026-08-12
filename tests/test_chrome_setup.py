@@ -1243,17 +1243,23 @@ class ChromeSetupTests(unittest.TestCase):
                 self.assertLessEqual(remaining, 300)
 
     def test_cdp_cooldown_expires_and_clears(self):
-        """冷却到期：check 返回 None 且清除标记文件。"""
+        """冷却到期：check 返回 None；文件保留到恢复期结束后由 check_cdp_recovery 清除。"""
         module = load_module()
         with tempfile_profile() as paths:
             lock = str(paths["cdp_profile"] / "scrape.lock")
             with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
                     mock.patch.object(module.time, "time",
                                       side_effect=[1000.0, 1400.0]):
-                module.mark_cdp_cooldown(seconds=300)  # 截止 1300
+                module.mark_cdp_cooldown(seconds=300)  # 冷却截止 1300，恢复期截止 1420
                 self.assertIsNone(module.check_cdp_cooldown(), "到期应返回 None")
+                self.assertTrue(os.path.exists(module._cdp_cooldown_path()),
+                                "恢复期内文件保留（渐变恢复信息）")
+            # 恢复期也结束后（time=1500）：check_cdp_recovery 清理残留
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module.time, "time", return_value=1500.0):
+                self.assertEqual(module.check_cdp_recovery(), 0.0)
                 self.assertFalse(os.path.exists(module._cdp_cooldown_path()),
-                                 "到期应清除标记文件")
+                                 "恢复期结束后清除标记文件")
 
     # ----- 风控码（#3）-----
 
@@ -3644,6 +3650,79 @@ class BestPracticesBatch3Tests(unittest.TestCase):
         ]
         with self.assertRaises(module.TargetCrashedError):
             sess.send("Runtime.evaluate", {"expression": "1"}, "s1")
+
+    # ----- 中价值：run 级血缘字段 + 键冲突检测（flush_jobs）-----
+
+    def test_flush_jobs_accumulates_record_counts_across_writes(self):
+        """渐进写盘多次 flush：record_counts.new/duplicate/quarantine 跨次累积。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+
+            def full(jid):
+                return {"job_id": jid, "title": f"T-{jid}", "location": "深圳",
+                        "job_link": f"https://www.zhipin.com/job_detail/{jid}.html",
+                        "company_name": "某科技"}
+
+            module.flush_jobs(target, {"keyword": "AI", "run_id": "r1"}, [full("a")])
+            module.flush_jobs(target, {"keyword": "AI", "run_id": "r1"},
+                              [full("a"), full("b")])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            counts = data["record_counts"]
+            self.assertEqual(counts["new"], 2, "两次写入共新增 2 个新 job")
+            self.assertEqual(counts["duplicate"], 1, "第二次写入中 job a 是重复")
+            self.assertEqual(data["run_id"], "r1", "血缘 run_id 应保留")
+
+    def test_flush_jobs_quarantines_key_conflict(self):
+        """同 job_id 不同 payload（旧版本已存在）→ 记 key_conflict 不静默覆盖。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+
+            def full(jid, title):
+                return {"job_id": jid, "title": title, "location": "深圳",
+                        "job_link": f"https://www.zhipin.com/job_detail/{jid}.html",
+                        "company_name": "某科技"}
+
+            module.flush_jobs(target, {"keyword": "AI"}, [full("a", "旧标题")])
+            module.flush_jobs(target, {"keyword": "AI"}, [full("a", "新标题")])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data["jobs"][0]["title"], "旧标题", "旧版本优先不被覆盖")
+            self.assertIn("key_conflict", data["quarantine"][0]["reason"])
+
+    # ----- 中价值：冷却恢复分级 -----
+
+    def test_cdp_cooldown_writes_recovery_phase(self):
+        """熔断冷却标记带恢复期：冷却结束前恢复期生效，冷却后恢复期结束。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            cooldown = str(paths["cdp_profile"] / "cdp.cooldown")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH",
+                                   str(paths["cdp_profile"] / "scrape.lock")):
+                module.mark_cdp_cooldown(seconds=5)
+                recovery = module.check_cdp_recovery()
+                self.assertGreater(recovery, 0, "冷却期间应处于恢复期")
+                remaining = module.check_cdp_cooldown()
+                self.assertGreater(remaining, 0, "冷却检查兼容（读首行）")
+                deadline = time.time() + 5 + module.CDP_RECOVERY_SECONDS + 1
+                with open(cooldown, "w", encoding="utf-8") as f:
+                    f.write(f"{time.time() - 1}\n{deadline}\n")
+                self.assertEqual(module.check_cdp_cooldown(), None, "冷却结束")
+                self.assertGreater(module.check_cdp_recovery(), 0, "冷却结束仍在恢复期")
+
+    # ----- 中价值：预算分账 -----
+
+    def test_incr_request_tracks_per_kind_budget(self):
+        """请求计数分账：probe/list/detail 各自累计，总量语义不变。"""
+        module = load_module()
+        before = dict(module._request_budget)
+        module.incr_request("probe")
+        module.incr_request("detail")
+        self.assertEqual(module._request_budget["probe"], before["probe"] + 1)
+        self.assertEqual(module._request_budget["detail"], before["detail"] + 1)
+        self.assertEqual(module._request_budget["list"], before["list"])
 
 
 class tempfile_profile:

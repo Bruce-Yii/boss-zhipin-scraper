@@ -39,6 +39,7 @@ import signal
 import logging
 import ntpath
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
 from datetime import datetime
@@ -67,6 +68,7 @@ MAX_API_REQUESTS = 500  # 单次最大 API 请求数
 API_ATTEMPT_LIMIT = 2   # 列表 API 单页最大尝试次数（规格 NFR-3：最多 1 次自动重试）
 MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
 CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重开（防"熔断→重启→再熔断"循环）
+CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
@@ -268,12 +270,20 @@ INDUSTRY_MAP = {
 
 
 # ============================================================
-# 全局请求计数器辅助
+# 全局请求计数器辅助（预算分账：探测/列表/详情独立计数）
 # ============================================================
-def incr_request():
-    """递增全局请求计数，达到上限时抛出异常"""
+_request_budget = {"probe": 0, "list": 0, "detail": 0}
+
+
+def incr_request(kind="list"):
+    """递增全局请求计数（分账统计），达到上限时抛出异常
+
+    kind: probe（登录探测）/ list（列表 API）/ detail（详情导航）
+    总量上限语义不变；分账计数供血缘统计与漂移诊断。
+    """
     global _request_counter
     _request_counter += 1
+    _request_budget[kind] = _request_budget.get(kind, 0) + 1
     if _request_counter > MAX_API_REQUESTS:
         raise RuntimeError(f"已达到单次最大请求数 {MAX_API_REQUESTS}，停止抓取")
     if _request_counter >= MAX_API_REQUESTS * 0.8:
@@ -1091,7 +1101,7 @@ def probe_login_state(cdp, sid, query=LOGIN_PROBE_QUERY, city_code=LOGIN_PROBE_C
         }});
     }})()
     """
-    incr_request()
+    incr_request("probe")
     val = cdp.eval_js(js, sid)
     if not val:
         return LoginProbeResult(
@@ -1458,15 +1468,35 @@ def _missing_required_fields(job):
 
 
 def flush_jobs(path, meta, jobs):
-    """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留"""
+    """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留。
+
+    血缘字段（record_counts）跨次累积：渐进写盘时每次 flush 只算当次
+    new/duplicate/quarantine 增量，与旧值相加。
+    """
     existing_jobs = []
+    old_counts = {"new": 0, "duplicate": 0, "quarantine": 0}
     if os.path.exists(path):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 old = json.load(f)
             existing_jobs = old.get("jobs", [])
+            old_counts = old.get("record_counts") or old_counts
         except (json.JSONDecodeError, OSError, ValueError):
             pass
+    existing_ids = {j.get("job_id") for j in existing_jobs
+                    if isinstance(j, dict) and j.get("job_id")}
+    existing_payloads = {j.get("job_id"): j for j in existing_jobs
+                         if isinstance(j, dict) and j.get("job_id")}
+    sanitized_incoming = [_sanitize_job(j) for j in jobs]
+
+    # 键冲突检测：incoming 与已有同 job_id 但 payload 不同 → quarantine 记录
+    # （merge_unique 本身旧版本优先，这里把"静默覆盖"变成显式信号；
+    #  比较在 sanitize 后进行，跨 run 续抓不因敏感键差异误报）
+    incoming_ids = [j.get("job_id") for j in sanitized_incoming
+                    if j.get("job_id")]
+    new_count = sum(1 for jid in incoming_ids if jid not in existing_ids)
+    dup_count = len(incoming_ids) - new_count
+
     merged = merge_unique(existing_jobs, jobs)
     sanitized = [_sanitize_job(j) for j in merged]
     quarantine = []
@@ -1480,6 +1510,22 @@ def flush_jobs(path, meta, jobs):
             })
         else:
             valid.append(j)
+    key_conflicts = [jid for jid in existing_payloads
+                     if jid in incoming_ids
+                     and existing_payloads[jid] != next(
+                         (x for x in sanitized_incoming
+                          if x.get("job_id") == jid), {})]
+    if key_conflicts:
+        log.warning("job_id 键冲突（同 ID 不同 payload，保留旧版本）: %s",
+                    key_conflicts[:5])
+        quarantine.extend({"job_id": jid, "reason": "key_conflict"}
+                           for jid in key_conflicts)
+
+    counts = dict(old_counts)
+    counts["new"] += new_count
+    counts["duplicate"] += dup_count
+    counts["quarantine"] = counts.get("quarantine", 0) + len(quarantine)
+    meta["record_counts"] = counts
     meta["format_version"] = FORMAT_VERSION
     meta["total"] = len(valid)
     meta["job_count"] = len(valid)
@@ -1603,12 +1649,18 @@ def _cdp_cooldown_path():
 
 
 def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
-    """熔断时记录冷却截止时间戳（原子写）。"""
+    """熔断时记录冷却截止时间戳（原子写）。
+
+    文件两行：首行冷却截止，次行恢复期截止（冷却结束后仍限速减半，
+    渐变恢复而非跳回全速，防恢复瞬间再触发风控）。
+    """
     try:
         os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
         tmp = _cdp_cooldown_path() + ".tmp"
+        now = time.time()
         with open(tmp, "w", encoding="utf-8") as f:
-            f.write(str(time.time() + seconds))
+            f.write(str(now + seconds) + "\n")
+            f.write(str(now + seconds + CDP_RECOVERY_SECONDS) + "\n")
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, _cdp_cooldown_path())
@@ -1616,23 +1668,45 @@ def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
         pass
 
 
-def check_cdp_cooldown():
-    """检查冷却期：未冷却返回 None；冷却中返回剩余秒数。
+def check_cdp_recovery():
+    """熔断冷却结束后进入渐变恢复期：返回剩余恢复秒数（0=无恢复期）。
 
-    冷却期过后自动清除标记（下次抓取自然放行）。
+    调用方（如详情限速器）在恢复期内降低速率，冷却结束不直接跳回全速。
+    冷却与恢复期都结束后清理残留标记文件。
     """
     try:
         with open(_cdp_cooldown_path(), "r", encoding="utf-8") as f:
-            deadline = float(f.read().strip())
-    except (OSError, UnicodeDecodeError, ValueError):
+            lines = f.read().splitlines()
+        deadline = float(lines[0])
+        recovery_until = float(lines[1]) if len(lines) > 1 else deadline
+        remaining = recovery_until - time.time()
+        if remaining > 0:
+            return remaining
+        if time.time() > deadline:
+            try:
+                os.remove(_cdp_cooldown_path())
+            except OSError:
+                pass
+        return 0.0
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def check_cdp_cooldown():
+    """检查冷却期：未冷却返回 None；冷却中返回剩余秒数。
+
+    冷却期过后返回 None（不再删除标记——恢复期信息保留在文件第二行，
+    由 check_cdp_recovery 在恢复期结束后清理）。
+    文件首行为冷却截止（第二行为恢复期截止，冷却判断只看首行）。
+    """
+    try:
+        with open(_cdp_cooldown_path(), "r", encoding="utf-8") as f:
+            deadline = float(f.read().splitlines()[0])
+    except (OSError, UnicodeDecodeError, ValueError, IndexError):
         return None
     remaining = deadline - time.time()
     if remaining > 0:
         return int(remaining)
-    try:
-        os.remove(_cdp_cooldown_path())  # 冷却结束，清除标记
-    except OSError:
-        pass
     return None
 
 
@@ -1945,6 +2019,10 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     if not output_path:
         output_path = default_output_path("jobs")
 
+    # run 级血缘字段：本次运行是谁、什么代码、何时开始（record_counts 由 flush_jobs 累积）
+    run_id = uuid.uuid4().hex
+    run_started_at = datetime.now().isoformat()
+
     # 显示筛选条件
     filter_desc = []
     if filters.get("scale"):
@@ -2021,7 +2099,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         "total": len(all_jobs), "jobs": all_jobs}
             actual_pages = pg
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
-            incr_request()
+            incr_request("list")
 
             # 第一页：导航到搜索页建立 cookie/session
             if pg == 1:
@@ -2141,6 +2219,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "scraped_at": datetime.now().isoformat(),
                     "page_count": pg,
                     "warnings": warnings,
+                    "run_id": run_id,
+                    "scraper_version": __version__,
+                    "started_at": run_started_at,
                 }, all_jobs)
 
             # 条数上限：抓够即停，不再翻页（BOSS 每页 30 条，实际可能略超上限）
@@ -2178,7 +2259,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     print(f"完成: {len(all_jobs)} 条")
 
     if all_jobs:
-        # 最终写入（含时间戳更新）
+        # 最终写入（含时间戳更新 + run 级血缘字段）
         flush_jobs(output_path, {
             "keyword": keyword,
             "city": city_name,
@@ -2187,6 +2268,10 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             "scraped_at": datetime.now().isoformat(),
             "page_count": actual_pages or 1,
             "warnings": warnings,
+            "run_id": run_id,
+            "scraper_version": __version__,
+            "started_at": run_started_at,
+            "ended_at": datetime.now().isoformat(),
         }, all_jobs)
         print(f"已保存: {output_path}")
 
@@ -2785,8 +2870,15 @@ def run_summary(elapsed_sec, total, ok_count, reason_counts):
     reason_txt = "，".join(
         f"{k}:{v}" for k, v in sorted(reason_counts.items())) if reason_counts else "—"
     rate = math.ceil(elapsed_sec / total)
-    return (f"  ✅ 完成 {total} 条：成功 {ok_count}，失败 {failed}（{reason_txt}）"
+    line = (f"  ✅ 完成 {total} 条：成功 {ok_count}，失败 {failed}（{reason_txt}）"
             f"| 耗时 {_format_elapsed(elapsed_sec)}，平均 {rate}s/条")
+    # 平台漂移信号：列表正常但详情大面积 CDP 会话失败 → 提示检查页面结构/风控，
+    # 不要在同一轮里反复重试（平台侧结构性变化，重试纯浪费）
+    cdp_fails = reason_counts.get("cdp_session", 0)
+    if failed >= 5 and cdp_fails / max(failed, 1) > 0.5:
+        line += ("\n  ⚠️ 平台漂移信号：详情大面积 CDP 会话失败（列表正常但详情异常），"
+                 "建议检查页面结构/风控状态后再重试详情")
+    return line
 
 
 def progress_line(completed, total, ok_count):
@@ -3079,7 +3171,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         t0 = time.time()
         print(f"[{idx+1}/{len(jobs)}] {company} - {title}")
 
-        incr_request()
+        incr_request("detail")
 
         result = _scrape_one_detail(job, cdp_port, verbose=True)
         reason = result["reason"]
@@ -3185,6 +3277,11 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         # 突发）；实际请求间隔主要由每条详情固有的加载/滚动等待（约 20-30s）
         # 决定。失败率升高时由 AdaptiveRateLimiter 降半/暂停兜底。
         limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
+        # 熔断恢复期：冷却结束后渐变恢复，恢复期内限速减半（不跳回全速）
+        recovery = check_cdp_recovery()
+        if recovery > 0:
+            limiter.base_rate /= 2.0
+            print(f"⚠️ 熔断恢复期（剩余约 {recovery:.0f}s），详情限速减半")
 
     # 过滤已抓/重复（与串行路径同一套去重逻辑）
     todo = []
@@ -3257,7 +3354,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 except StopIteration:
                     return
                 # 与串行路径一致：每个提交的详情计入全局请求预算（500 上限）
-                incr_request()
+                incr_request("detail")
                 in_flight.add(pool.submit(run_one, job))
 
         fill_window()
