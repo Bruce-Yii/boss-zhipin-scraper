@@ -2022,6 +2022,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     # run 级血缘字段：本次运行是谁、什么代码、何时开始（record_counts 由 flush_jobs 累积）
     run_id = uuid.uuid4().hex
     run_started_at = datetime.now().isoformat()
+    # B 增量同步观察集合：本 run 观察到的全部 job_id（新增+重复，raw 事实，
+    # 独立于累积 jobs 数组；B 方案 A 契约字段 observed_jobs）
+    observed_ids = []
 
     # 显示筛选条件
     filter_desc = []
@@ -2194,6 +2197,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             for j in jobs:
                 key = j.get('job_link') or j['title']
                 j['job_id'] = hashlib.md5(key.encode()).hexdigest()[:16]
+                observed_ids.append(j['job_id'])
                 if key in seen:
                     continue
                 seen.add(key)
@@ -2222,6 +2226,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "run_id": run_id,
                     "scraper_version": __version__,
                     "started_at": run_started_at,
+                    "mode": "incremental",
+                    "observed_jobs": sorted(set(observed_ids)),
                 }, all_jobs)
 
             # 条数上限：抓够即停，不再翻页（BOSS 每页 30 条，实际可能略超上限）
@@ -2259,7 +2265,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     print(f"完成: {len(all_jobs)} 条")
 
     if all_jobs:
-        # 最终写入（含时间戳更新 + run 级血缘字段）
+        # 最终写入（含时间戳更新 + run 级血缘字段 + B 增量观察集合）
         flush_jobs(output_path, {
             "keyword": keyword,
             "city": city_name,
@@ -2272,6 +2278,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             "scraper_version": __version__,
             "started_at": run_started_at,
             "ended_at": datetime.now().isoformat(),
+            "mode": "incremental",
+            "observed_jobs": sorted(set(observed_ids)),
         }, all_jobs)
         print(f"已保存: {output_path}")
 
@@ -2284,7 +2292,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
     # AS-8 结构化结果行（规格 §3.4）：供下游程序/人 30 秒判断本次导出可信度
     print(f"EXPORT_OK jobs={len(all_jobs)} city={city_name} keyword={keyword} path={output_path}")
-    return {"keyword": keyword, "city": city_name, "total": len(all_jobs), "jobs": all_jobs}
+    return {"keyword": keyword, "city": city_name, "total": len(all_jobs),
+            "jobs": all_jobs, "output_path": output_path}
 
 
 # ============================================================
@@ -3098,9 +3107,37 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                 log.debug("关闭详情会话失败", exc_info=True)
 
 
+def _note_detail_risk_blocked(list_output_path=None):
+    """E 降级：详情验证码命中 → 全停。列表文件 meta.warnings 追加降级原因 + 打印提示。
+
+    规格侧方案（2026-08-13 拍板）：EXPORT_OK + warnings 承载降级信号，
+    契约零变更、消费端零适配。列表文件为 None 或不存在时只打印提示。
+    """
+    print("⚠️ 验证码命中，已全部停止（保留已抓数据）")
+    if not list_output_path or not os.path.exists(list_output_path):
+        return
+    try:
+        with open(list_output_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        warnings = meta.setdefault("warnings", [])
+        if not any("detail_risk_blocked" in w for w in warnings):
+            warnings.append(
+                "detail_risk_blocked: 验证码命中，已全部停止（保留已抓数据）")
+            _atomic_write_json(list_output_path, meta)
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
-                   concurrency=DEFAULT_CONCURRENCY):
+                   concurrency=DEFAULT_CONCURRENCY, list_output_path=None):
+    """抓取详情。
+
+    Args:
+        list_output_path: 可选列表文件路径——E 降级（验证码命中全停）时
+            在列表文件 meta.warnings 追加降级原因（规格侧方案：EXPORT_OK
+            + warnings 承载降级信号；None 时不更新列表文件）。
+    """
     jobs = list_data.get("jobs", [])
     if max_details:
         jobs = jobs[:max_details]
@@ -3134,7 +3171,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
         results, pending = _scrape_details_parallel(
             jobs, cdp_port, concurrency,
             existing_ids=existing_ids, pending_ids=pending,
-            existing_results=results, output_path=output_path)
+            existing_results=results, output_path=output_path,
+            list_output_path=list_output_path)
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -3212,6 +3250,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
             continue
         elif reason == "stopped":
             break
+        elif reason == "risk_timeout":
+            # E 降级：详情验证码命中 → 全部停止（不再逐条等 120s 无效重试）
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            _note_detail_risk_blocked(list_output_path)
+            break
         else:
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
@@ -3251,7 +3295,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
 def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              existing_ids=None, pending_ids=None,
                              existing_results=None, output_path=None,
-                             write_every=5):
+                             write_every=5, list_output_path=None):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -3320,6 +3364,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         reason = result["reason"]
         if reason == "login_required":
             stop_event.set()
+        elif reason == "risk_timeout":
+            # E 降级：详情验证码命中 → 全局停止（不再逐条等 120s 无效重试）
+            stop_event.set()
+            _note_detail_risk_blocked(list_output_path)
         elif reason == "cdp_session":
             consecutive_cdp_errors += 1
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
@@ -4394,6 +4442,9 @@ def run_cli():
                 cdp_port=args.cdp_port, fmt=args.format,
                 concurrency=args.concurrency,
                 pending_ids=pending_ids,
+                # E 降级：验证码命中全停时，列表文件 warnings 追加降级原因
+                # （--input 模式列表文件为输入文件；抓取模式为实际落盘路径）
+                list_output_path=list_data.get("output_path") or args.input,
             )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:

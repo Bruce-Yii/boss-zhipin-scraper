@@ -2008,7 +2008,7 @@ class ChromeSetupTests(unittest.TestCase):
             def fake_parallel(jobs, cdp_port, concurrency, limiter=None,
                               existing_ids=None, pending_ids=None,
                               existing_results=None, output_path=None,
-                              write_every=5):
+                              write_every=5, list_output_path=None):
                 # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
                 captured["concurrency"] = concurrency
                 merged = list(existing_results or []) + [fake_detail]
@@ -3552,6 +3552,116 @@ class BestPracticesBatch2Tests(unittest.TestCase):
 
 class BestPracticesBatch3Tests(unittest.TestCase):
     """第三轮调研实施：flag 互斥/CLI 误用退出码/subprocess UTF-8/端口/风控码/scrubber/CDP 会话。"""
+
+    # ----- E 梯度降级（修订版：验证码命中 → 全停 → 返回）+ B observed_jobs -----
+
+    def test_serial_stops_all_on_risk_timeout(self):
+        """E 降级：详情验证码命中 → 后续 job 不再处理 + 降级提示 + 列表文件 warnings 更新。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job/{i}"} for i in range(3)]
+        calls = []
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False):
+            calls.append(job["job_id"])
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "risk_timeout", "message": "验证码命中"}
+
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            list_path = str(paths["cdp_profile"] / "jobs.json")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with open(list_path, "w", encoding="utf-8") as f:
+                json.dump({"keyword": "AI", "jobs": []}, f)
+            with mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                 mock.patch.object(module, "load_existing_detail_ids",
+                                   return_value=set()), \
+                 mock.patch.object(module, "load_pending_ids",
+                                   return_value={}), \
+                 mock.patch.object(module.time, "sleep"), \
+                 mock.patch("sys.stdout",
+                            new_callable=__import__("io").StringIO) as outbuf:
+                module.scrape_details({"jobs": jobs}, output_path=out,
+                                      cdp_port=9222, concurrency=1,
+                                      list_output_path=list_path)
+            printed = outbuf.getvalue()
+            with open(list_path, encoding="utf-8") as f:
+                meta = json.load(f)
+        self.assertEqual(len(calls), 1, "验证码命中后不应继续处理剩余详情")
+        self.assertIn("验证码命中", printed, "应输出降级提示")
+        self.assertIn("已全部停止", printed)
+        self.assertTrue(any("detail_risk_blocked" in w for w in meta.get("warnings", [])),
+                        "列表文件 warnings 应含降级原因")
+
+    def test_parallel_stops_all_on_risk_timeout(self):
+        """E 降级（并行）：risk_timeout 触发全局 stop，后续不再提交。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job/{i}"} for i in range(6)]
+        calls = []
+
+        def fake_worker(job, cdp_port, stop_event=None, limiter=None, verbose=False):
+            calls.append(job["job_id"])
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "risk_timeout", "message": "验证码命中"}
+
+        with mock.patch.object(module, "_scrape_one_detail", new=fake_worker), \
+             mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+             mock.patch.object(module, "load_existing_detail_ids",
+                               return_value=set()), \
+             mock.patch.object(module, "load_pending_ids", return_value={}), \
+             mock.patch.object(module.time, "sleep"), \
+             mock.patch("sys.stdout",
+                        new_callable=__import__("io").StringIO) as outbuf:
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                limiter=limiter_cls.return_value)
+        printed = outbuf.getvalue()
+        self.assertLess(len(calls), len(jobs),
+                        "risk_timeout 后不应处理全部任务（应被全局停止）")
+        self.assertIn("已全部停止", printed, "应输出降级提示")
+
+    def test_scrape_list_emits_observed_jobs(self):
+        """B 方案 A：meta 含 observed_jobs（本 run 观察集合）+ mode=incremental。"""
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_eval_js(script, sid=None):
+            if "xhr.open" not in script:
+                return None
+            m = re.search(r"page=(\d+)", script)
+            pg = int(m.group(1)) if m else 1
+            if pg > 2:
+                return json.dumps([])
+            jobs = [{"job_id": f"job-{pg}-{i}", "title": f"T{pg}-{i}",
+                     "job_link": f"https://www.zhipin.com/job/{pg}-{i}",
+                     "salary": "20-40K", "boss_name": f"公司{pg}-{i}",
+                     "location": "上海·浦东", "company_name": f"公司{pg}-{i}"}
+                    for i in range(2)]
+            return json.dumps(jobs)
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "jobs.json")
+            with mock.patch.object(module, "resolve_city",
+                                   return_value=("上海", "101020100")), \
+                 mock.patch.object(module, "CDPSession", return_value=cdp), \
+                 mock.patch.object(module, "create_page_session",
+                                   return_value=("t", "s")), \
+                 mock.patch.object(module, "probe_risk_page", return_value={}), \
+                 mock.patch.object(module.time, "sleep"), \
+                 mock.patch("sys.stdout",
+                            new_callable=__import__("io").StringIO):
+                module.scrape_list("AI", "上海", 3, {}, out)
+            with open(out, encoding="utf-8") as f:
+                data = json.load(f)
+        observed = data.get("observed_jobs", [])
+        self.assertEqual(len(observed), 4, "2 页各 2 条 = 4 个观察 id")
+        self.assertEqual(data.get("mode"), "incremental")
+        file_ids = {j["job_id"] for j in data["jobs"]}
+        self.assertEqual(set(observed), file_ids,
+                         "observed_jobs 应等于本 run 观察集合（与文件 jobs 的 job_id 一致）")
+        self.assertEqual(len(observed), len(set(observed)), "观察集合应去重")
 
     # ----- C 组：动作型 flag 互斥 + parser.error 语义 -----
 
