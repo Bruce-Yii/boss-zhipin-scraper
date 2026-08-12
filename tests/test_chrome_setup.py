@@ -1186,6 +1186,103 @@ class ChromeSetupTests(unittest.TestCase):
                 self.assertEqual(lines[0], "2")
                 self.assertEqual(lines[1:], ["100", "200"], "持有 pid 保留")
 
+    def test_scrape_lock_guard_serializes_rmw(self):
+        """guard 文件互斥 RMW：并发 acquire 不丢 pid（模拟进程 100/200 交错）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module, "_pid_is_running",
+                                      return_value=True), \
+                    mock.patch.object(module.os, "getpid",
+                                      side_effect=[100, 200, 300]):
+                # 两进程先后 acquire（guard 保证串行 RMW）
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3))
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3))
+                self.assertTrue(module.acquire_scrape_lock(max_concurrent=3))
+                with open(lock, encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+                self.assertEqual(lines[0], "3")
+                self.assertEqual(sorted(lines[1:]), ["100", "200", "300"],
+                                 "三个 pid 都应保留（无覆盖丢失）")
+
+    def test_scrape_lock_guard_cleaned_up(self):
+        """guard 文件在 acquire 完成后应删除（无残留）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            guard = lock + ".guard"
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock):
+                self.assertTrue(module.acquire_scrape_lock())
+                self.assertFalse(os.path.exists(guard),
+                                 "guard 用完应删除")
+                self.assertTrue(os.path.exists(lock), "锁文件保留")
+
+    # ----- CDP 熔断冷却（#5）-----
+
+    def test_cdp_cooldown_mark_and_check(self):
+        """熔断冷却：mark 后 check 返回剩余秒数。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module.time, "time",
+                                      side_effect=[1000.0, 1000.0, 1200.0]):
+                self.assertIsNone(module.check_cdp_cooldown(), "未冷却返回 None")
+                module.mark_cdp_cooldown(seconds=300)
+                remaining = module.check_cdp_cooldown()
+                self.assertIsNotNone(remaining, "冷却中应返回剩余秒数")
+                self.assertGreater(remaining, 0)
+                self.assertLessEqual(remaining, 300)
+
+    def test_cdp_cooldown_expires_and_clears(self):
+        """冷却到期：check 返回 None 且清除标记文件。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            lock = str(paths["cdp_profile"] / "scrape.lock")
+            with mock.patch.object(module, "SCRAPE_LOCK_PATH", lock), \
+                    mock.patch.object(module.time, "time",
+                                      side_effect=[1000.0, 1400.0]):
+                module.mark_cdp_cooldown(seconds=300)  # 截止 1300
+                self.assertIsNone(module.check_cdp_cooldown(), "到期应返回 None")
+                self.assertFalse(os.path.exists(module._cdp_cooldown_path()),
+                                 "到期应清除标记文件")
+
+    # ----- 风控码（#3）-----
+
+    def test_login_restricted_codes_include_common_risk_codes(self):
+        """风控码表含 BOSS 常用码 31/35/36/37/38（boss-jd-scraper 实测）。"""
+        module = load_module()
+        for code in (31, 35, 36, 37, 38):
+            self.assertIn(code, module.LOGIN_RESTRICTED_CODES,
+                          f"风控码 {code} 应被识别")
+
+    # ----- 连续空页风控静默降级（#4b）-----
+
+    def test_scrape_list_stops_after_two_empty_pages(self):
+        """连续 2 页无数据（风控静默降级信号）→ EXPORT_FAIL 停止。"""
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_eval_js(script, sid=None):
+            return json.dumps([])  # 全部空页
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with mock.patch.object(module, "resolve_city",
+                               return_value=("上海", "101020100")), \
+                mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs"), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch("sys.stdout",
+                           new_callable=__import__("io").StringIO) as out:
+            result = module.scrape_list("AI", "上海", 3, {}, None)
+        printed = out.getvalue()
+        self.assertIn("EXPORT_FAIL reason=risk_blocked", printed)
+        self.assertEqual(result["jobs"], [])
+
     def test_scrape_list_aborts_when_lock_held(self):
         module = load_module()
         with tempfile_profile() as paths:
@@ -1665,7 +1762,8 @@ class ChromeSetupTests(unittest.TestCase):
 
     # ----- 并发详情抓取：并行执行层 -----
 
-    def _fake_parallel_worker(self, active_state, ok_ids, fail_ids=()):
+    def _fake_parallel_worker(self, active_state, ok_ids, fail_ids=(),
+                              fail_reason="invalid_detail"):
         """构造模拟 worker：记录并发峰值，按 job_id 返回成功/失败。"""
         lock, active, max_active = active_state
 
@@ -1683,7 +1781,7 @@ class ChromeSetupTests(unittest.TestCase):
                 active[0] -= 1
             if job["job_id"] in fail_ids:
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
-                        "reason": "invalid_detail", "message": "too short"}
+                        "reason": fail_reason, "message": "boom"}
             return {"ok": True, "detail": {"job_id": job["job_id"],
                                            "title": job["title"], "jd": "x" * 200},
                     "job_id": job["job_id"], "reason": "", "message": ""}
@@ -1713,7 +1811,9 @@ class ChromeSetupTests(unittest.TestCase):
         state = (threading.Lock(), [0], [0])
         with mock.patch.object(module, "_scrape_one_detail",
                                new=self._fake_parallel_worker(
-                                   state, set(), fail_ids={"job-1", "job-2"})), \
+                                   state, set(),
+                                   fail_ids={"job-1", "job-2"},
+                                   fail_reason="cdp_session")), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
@@ -1723,6 +1823,26 @@ class ChromeSetupTests(unittest.TestCase):
                 limiter=limiter_cls.return_value)
         self.assertEqual(len(results), 2, "失败的 job 不应写入结果")
         self.assertEqual(pending_out, {"job-1": 1, "job-2": 1})
+
+    def test_parallel_invalid_detail_not_recorded_to_pending(self):
+        """#8 失败分类：解析类失败（invalid_detail）不进 pending（重试浪费且掩盖漂移）。"""
+        module = load_module()
+        jobs = self._sample_jobs(3)["jobs"]
+        state = (threading.Lock(), [0], [0])
+        with mock.patch.object(module, "_scrape_one_detail",
+                               new=self._fake_parallel_worker(
+                                   state, set(),
+                                   fail_ids={"job-1"},
+                                   fail_reason="invalid_detail")), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, pending_out = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=3,
+                limiter=limiter_cls.return_value)
+        self.assertEqual(len(results), 2, "成功的 job 正常收集")
+        self.assertEqual(pending_out, {}, "invalid_detail 不应进 pending")
 
     def test_parallel_stops_submitting_after_global_stop(self):
         module = load_module()

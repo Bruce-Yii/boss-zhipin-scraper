@@ -66,6 +66,7 @@ MAX_PAGES = 10          # 单次最大页数
 MAX_API_REQUESTS = 500  # 单次最大 API 请求数
 API_ATTEMPT_LIMIT = 2   # 列表 API 单页最大尝试次数（规格 NFR-3：最多 1 次自动重试）
 MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
+CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重开（防"熔断→重启→再熔断"循环）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
@@ -130,7 +131,7 @@ LOGIN_PROBE_TARGETS = (
 LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
-LOGIN_RESTRICTED_CODES = {31, 37}
+LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
 # BOSS 风控码会随平台策略变化，码表追不上时按 message 关键字兜底识别风控/限流，
 # 避免把「已登录但被风控」误判为 RESPONSE_ERROR 进而当成登录失败。
 LOGIN_RESTRICTED_MESSAGE_KEYWORDS = (
@@ -1444,6 +1445,84 @@ def _write_scrape_lock(max_concurrent, holders, risk=False):
     os.replace(tmp, SCRAPE_LOCK_PATH)
 
 
+def _scrape_lock_guard_path():
+    return SCRAPE_LOCK_PATH + ".guard"
+
+
+def _with_scrape_lock_guard(action, timeout=5.0):
+    """用 O_CREAT|O_EXCL guard 文件对锁文件读-改-写做进程间互斥（防 RMW 竞态）。
+
+    并发上限可配后（--max-concurrent>1）多进程同时 acquire 会 check-then-act：
+    两进程同读空位 → 各自覆盖写 → 前者的 pid 丢失，实际并发超限。
+    guard 原子创建保证同一时刻只有一个进程做 RMW；抢不到 spin + 超时。
+
+    Args:
+        action: 无参可调用，在持有 guard 期间执行（内部做读-改-写）。
+        timeout: 最大等待秒数。
+    """
+    guard = _scrape_lock_guard_path()
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fd = os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return False  # 超时：另一进程持 guard 过久（可能崩溃残留）
+            time.sleep(0.05)
+        except OSError:
+            return False
+    try:
+        action()
+        return True
+    finally:
+        try:
+            os.remove(guard)
+        except OSError:
+            pass
+
+
+# ============================================================
+# CDP 熔断冷却（防"熔断→立即重启→再熔断"循环）
+# ============================================================
+def _cdp_cooldown_path():
+    """冷却时间戳文件（与锁文件同目录，跨进程共享）。"""
+    return os.path.join(os.path.dirname(SCRAPE_LOCK_PATH), "cdp.cooldown")
+
+
+def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
+    """熔断时记录冷却截止时间戳（原子写）。"""
+    try:
+        os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
+        tmp = _cdp_cooldown_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(time.time() + seconds))
+        os.replace(tmp, _cdp_cooldown_path())
+    except OSError:
+        pass
+
+
+def check_cdp_cooldown():
+    """检查冷却期：未冷却返回 None；冷却中返回剩余秒数。
+
+    冷却期过后自动清除标记（下次抓取自然放行）。
+    """
+    try:
+        with open(_cdp_cooldown_path(), "r", encoding="utf-8") as f:
+            deadline = float(f.read().strip())
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    remaining = deadline - time.time()
+    if remaining > 0:
+        return int(remaining)
+    try:
+        os.remove(_cdp_cooldown_path())  # 冷却结束，清除标记
+    except OSError:
+        pass
+    return None
+
+
 def acquire_scrape_lock(max_concurrent=1):
     """获取并发锁；熔断中或存活持有者已达上限时返回 False。
 
@@ -1456,30 +1535,41 @@ def acquire_scrape_lock(max_concurrent=1):
         max_concurrent = 1
     try:
         os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
+    except OSError:
+        return False
+    # guard 内 RMW：读-存活过滤-写 全程互斥，杜绝 check-then-act 竞态
+    result = {"acquired": False}
+
+    def _do_acquire():
         max_c, holders, risk = _read_scrape_lock()
         if risk:
-            return False  # 熔断中：必须人工确认（--reset-lock）后才能重开
+            return  # 熔断中：必须人工确认（--reset-lock）后才能重开
         if os.path.exists(SCRAPE_LOCK_PATH):
             alive = [p for p in holders if _pid_is_running(p)]
             if len(alive) >= max(max_c, max_concurrent):
-                return False
+                return
         else:
             alive = []
         _write_scrape_lock(max_concurrent, alive + [str(os.getpid())])
-        return True
-    except OSError:
+        result["acquired"] = True
+
+    if not _with_scrape_lock_guard(_do_acquire):
         return False
+    return result["acquired"]
 
 
 def set_scrape_lock_risk():
     """置熔断标志：任一并发任务遇风控时广播全停（其他任务在页间检查并停止）。"""
-    try:
+    def _do_set_risk():
         if not os.path.exists(SCRAPE_LOCK_PATH):
             return
         max_c, holders, risk = _read_scrape_lock()
         if risk:
             return
         _write_scrape_lock(max_c, holders, risk=True)
+
+    try:
+        _with_scrape_lock_guard(_do_set_risk)
     except OSError:
         pass
 
@@ -1778,6 +1868,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     # 契约 meta（规格 §3.2）：实际翻页数与异常提示，随每次写盘落文件
     actual_pages = 0
     warnings = []
+    empty_pages = 0  # 连续空页计数（风控静默降级信号，>=2 即停）
 
     tid, sid = create_page_session(cdp)
 
@@ -1864,7 +1955,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     warnings.append(f"第{pg}页API未返回数据，已刷新重试")
                     cdp.send("Page.navigate",
                              {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
-                    time.sleep(random.uniform(6, 10))
+                    # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
+                    # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
+                    time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
                     is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
                     if is_risk:
                         print(f"⚠️ 刷新后 {reason}，等待人工处理...")
@@ -1894,7 +1987,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 log.warning("⚠️ API 未返回职位数据，已跳过 DOM fallback；如需强制降级可加 --allow-dom-fallback")
 
             if not jobs:
-                print("  ⚠️ 无数据")
+                # 空数据可能是风控静默降级信号（HTTP 200 + 空 jobList），
+                # 连续 N 页空则按风控处理挂起等人工，而非静默跳过
+                empty_pages += 1
+                if empty_pages >= 2:
+                    print("⚠️ 连续多页无数据（疑似风控静默降级），停止抓取（保留已抓数据）。")
+                    warnings.append("连续多页无数据（疑似风控静默降级）")
+                    print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                    return {"keyword": keyword, "city": city_name,
+                            "total": len(all_jobs), "jobs": all_jobs}
+                print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
                 continue
 
             new = 0
@@ -2606,7 +2708,7 @@ class TokenBucket:
         self.rate = rate
         self.capacity = capacity
         self._tokens = float(capacity)
-        self._last_refill = time.time()
+        self._last_refill = time.monotonic()  # monotonic：NTP 回拨不导致桶爆满/负数
         self._lock = threading.Lock()
 
     def _refill(self, now):
@@ -2617,14 +2719,14 @@ class TokenBucket:
 
     def acquire(self):
         with self._lock:
-            self._refill(time.time())
+            self._refill(time.monotonic())
             if self._tokens >= 1.0:
                 self._tokens -= 1.0
                 return
             deficit = (1.0 - self._tokens) / self.rate
         time.sleep(deficit)
         with self._lock:
-            self._last_refill = time.time()
+            self._last_refill = time.monotonic()
             self._tokens = max(0.0, self._tokens - 1.0)
 
 
@@ -2644,7 +2746,7 @@ class AdaptiveRateLimiter:
         self.pause_seconds = pause_seconds
         self._halved = False
         self._consecutive_bad = 0
-        self._window_start = time.time()
+        self._window_start = time.monotonic()  # monotonic：窗口判断不受时钟回拨影响
         self._window_total = 0
         self._window_failures = 0
         self._bucket = TokenBucket(base_rate, self.capacity)
@@ -2664,7 +2766,7 @@ class AdaptiveRateLimiter:
 
     def _record(self, failed):
         with self._lock:
-            now = time.time()
+            now = time.monotonic()
             if now - self._window_start >= self.window:
                 self._roll_window()
             self._window_total += 1
@@ -2681,7 +2783,7 @@ class AdaptiveRateLimiter:
             else:
                 self._halved = False
                 self._consecutive_bad = 0
-        self._window_start = time.time()
+        self._window_start = time.monotonic()
         self._window_total = 0
         self._window_failures = 0
 
@@ -2899,7 +3001,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 save_pending_ids(output_path, pending)
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
-                print("   可运行 --stop-chrome 后重新 --setup-chrome 再继续（已抓数据保留，剩余自动重试）。")
+                mark_cdp_cooldown()  # 熔断冷却：冷却内拒绝自动重开
+                print(f"  已进入冷却期（{CDP_COOLDOWN_SECONDS}s），可运行 --stop-chrome 后重新 --setup-chrome 再继续。")
                 break
             continue
         elif reason == "stopped":
@@ -2907,10 +3010,14 @@ def scrape_details(list_data, max_details=None, output_path=None,
         else:
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
-            print(f"  跳过无效详情页: {result['message']}")
-            if job_id:
-                pending[job_id] = pending.get(job_id, 0) + 1
-                save_pending_ids(output_path, pending)
+            if reason == "invalid_detail":
+                # 解析类失败（页面结构变了等）：重试纯浪费且掩盖结构漂移信号，不进 pending
+                print(f"  ⏭️ 跳过无效详情页（解析类失败不重试）: {result['message']}")
+            else:
+                print(f"  跳过无效详情页: {result['message']}")
+                if job_id:
+                    pending[job_id] = pending.get(job_id, 0) + 1
+                    save_pending_ids(output_path, pending)
 
         # 详情页间隔加大，随机 10-25 秒
         gap = random.uniform(10, 25)
@@ -3007,6 +3114,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             consecutive_cdp_errors += 1
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 stop_event.set()
+                mark_cdp_cooldown()  # 熔断冷却：防"熔断→立即重启→再熔断"循环
+        if reason == "invalid_detail":
+            # 解析类失败（页面结构变了等）：重试纯浪费且掩盖结构漂移信号，不进 pending
+            return
         if job_id:
             pending[job_id] = pending.get(job_id, 0) + 1
             if output_path:
@@ -3991,12 +4102,19 @@ def main():
             pending_ids = load_pending_ids(
                 args.detail_output or default_output_path("details"),
                 force_ids=args.retry_job)
-        details = scrape_details(
-            list_data, args.max_details, args.detail_output,
-            cdp_port=args.cdp_port, fmt=args.format,
-            concurrency=args.concurrency,
-            pending_ids=pending_ids,
-        )
+        # CDP 熔断冷却检查：冷却期内拒绝自动重开（防"熔断→立即重启→再熔断"循环）
+        cooldown = check_cdp_cooldown()
+        if cooldown is not None:
+            print(f"❌ CDP 会话熔断冷却中（剩余约 {cooldown}s），已停止详情抓取。")
+            print("   可运行 --stop-chrome 后重新 --setup-chrome，或等待冷却结束再继续。")
+            details = None
+        else:
+            details = scrape_details(
+                list_data, args.max_details, args.detail_output,
+                cdp_port=args.cdp_port, fmt=args.format,
+                concurrency=args.concurrency,
+                pending_ids=pending_ids,
+            )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
             details = merge_details_from_lists(merged_details, details)

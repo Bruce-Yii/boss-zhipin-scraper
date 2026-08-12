@@ -3,6 +3,7 @@
 ## v2.3.0 (2026-08-11)
 
 ### 新增
+- **并发安全加固**（最佳实践调研第二批落地）：①锁文件 RMW 竞态修复——`O_CREAT|O_EXCL` guard 文件对读-改-写做进程间互斥（多进程并发 acquire 不再丢 pid、并发上限不被突破）②TokenBucket/AdaptiveRateLimiter 计时改 `time.monotonic()`（NTP 回拨不导致桶爆满/窗口误判）③风控码表补 35/36/38（boss-jd-scraper 实测 BOSS 常用码）④凭证自愈重试加指数退避（`uniform(6,10)*2^(N-1)`，AWS full jitter 思想）⑤连续 2 页无数据按风控静默降级处理（EXPORT_FAIL 停止，不再静默跳过）⑥CDP 熔断冷却期（300s，防"熔断→立即重启→再熔断"循环，`--reset-lock` 前拒绝自动重开）⑦失败分类：解析类失败（invalid_detail）不进 pending（重试浪费且掩盖结构漂移信号），网络类（cdp_session）照常重试
 - **互斥锁升级为"并发上限可配"**（ai-pm-job-intel 规格 §3.6 修订）：锁文件从单 pid 升级为「pid 列表 + 最大并发数」（`~/.boss-zhipin-scraper/scrape.lock`，首行上限、余行持有 pid）；新增 `--max-concurrent N`（**默认 1**，现状行为不变，超上限仍 `lock_held` 拒启动）；**熔断广播**：任一并发任务遇 code 37/验证码 → 锁文件置 `risk` 标志，其余任务页间分片检查立即全停（不降并发续跑），挂起等人工，`--reset-lock` 清除后重开；并发 >1 时页间隔自动拉长 12-22s → 20-30s；SKILL.md 守则同步（并发只准指令显式开启 + 风控全停）
 - **双端契约一致校验**（与 ai-pm-job-intel 消费端对齐）：消费端校验器按 SHA 固化为 vendor 副本（`tests/fixtures/consumer_validator/`，含 v1.0.0 版本号），CI 新增 `contract-check` job 对契约样例 fixture 跑 `validate_export.py`，断言退出码 0 且输出含 `v1.0.0`（版本漂移即红，触发双端对齐）；本地回归测试同步覆盖。契约样例 fixture 重出：剔除 `security_id`/`lid`/`encrypt_*` 内部标识（新版 `tests/fixtures/sample_export_v1.json`，30 条实测通过）
 - **导出契约 v1**（ai-pm-job-intel 规格 §3.2）：导出 JSON 顶层加 `format_version: 1`；meta 补 `page_count`/`warnings`（API 空数据、风控等异常留痕）
