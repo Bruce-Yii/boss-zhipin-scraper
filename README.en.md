@@ -180,11 +180,20 @@ python3 scripts/job_summary.py --top 15
 | `--login-timeout` | Seconds to wait for login under `--setup-chrome` (default 300) |
 | `--stop-chrome` | Close the dedicated BOSS CDP Chrome (matched precisely by the isolated profile; never touches your main Chrome) |
 | `--close-chrome` | Auto-close the dedicated Chrome after a scrape finishes normally (off by default; not triggered on errors, so the login state is kept) |
-| `-v, --verbose` | Print DEBUG-level logs (CDP messages, probe details, etc.) |
+| `-v, --verbose` | Print DEBUG-level logs (stackable: `-vv`; CDP messages, probe details, etc.) |
+| `-q, --quiet` | Quiet mode: logs drop to WARNING (result/EXPORT lines still go to stdout) |
 | `--output` | List output path (default `~/.boss-zhipin-scraper/job-result/`) |
 | `--detail-output` | Detail output path (default `~/.boss-zhipin-scraper/job-result/`) |
 | `--cdp-port` | CDP port (default 9222) |
 | `--scale/--salary/--experience/--degree` | Filters |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Runtime error (login failure / risk block / unexpected exception — clean message, no traceback) |
+| 2 | CLI misuse (unknown argument / invalid value, argparse default) |
 
 ## Export Contract v1
 

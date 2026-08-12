@@ -1327,12 +1327,15 @@ def merge_unique(existing, incoming, key="job_id", new_overrides=False):
 
 
 def _atomic_write_json(path, payload):
-    """先写临时文件再原子替换，避免进程中断留下半截 JSON 覆盖旧数据。"""
+    """先写临时文件再原子替换，避免进程中断留下半截 JSON 覆盖旧数据。
+    写盘前 flush+fsync（断电不丢数据），再 os.replace 原子替换。"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     tmp_path = f"{path}.tmp{os.getpid()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
@@ -1340,6 +1343,26 @@ def _atomic_write_json(path, payload):
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+def cleanup_stale_tmp_files(result_dir, max_age_seconds=300):
+    """启动时清扫残留 .tmp 文件（崩溃/断电遗留）。
+
+    只删修改时间超过 max_age_seconds 的 tmp，避免误删并发进程中
+    正在写入的 tmp（其文件名也是 *.tmp* 形态）。
+    """
+    try:
+        for name in os.listdir(result_dir):
+            if ".tmp" not in name:
+                continue
+            path = os.path.join(result_dir, name)
+            try:
+                if time.time() - os.path.getmtime(path) > max_age_seconds:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 _SENSITIVE_KEYS = ("cookie", "token", "wt2", "zp_stoken", "zp_token",
@@ -1363,6 +1386,19 @@ def _sanitize_job(job):
             and k not in _INTERNAL_KEYS}
 
 
+# 契约必填字段（与消费端校验器 CONTRACT_FIELDS 一致）：写盘前 schema 校验，
+# 缺失即 quarantine 剔除并记录原因——防页面结构漂移产出脏数据进下游
+_CONTRACT_REQUIRED_FIELDS = ("job_id", "title", "location", "job_link", "company_name")
+
+
+def _missing_required_fields(job):
+    """返回 job 缺失的契约必填字段列表（非 dict / 空值都算缺失）。"""
+    if not isinstance(job, dict):
+        return list(_CONTRACT_REQUIRED_FIELDS)
+    return [f for f in _CONTRACT_REQUIRED_FIELDS
+            if not str(job.get(f) or "").strip()]
+
+
 def flush_jobs(path, meta, jobs):
     """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留"""
     existing_jobs = []
@@ -1374,10 +1410,24 @@ def flush_jobs(path, meta, jobs):
         except (json.JSONDecodeError, OSError, ValueError):
             pass
     merged = merge_unique(existing_jobs, jobs)
+    sanitized = [_sanitize_job(j) for j in merged]
+    quarantine = []
+    valid = []
+    for j in sanitized:
+        missing = _missing_required_fields(j)
+        if missing:
+            quarantine.append({
+                "job_id": j.get("job_id"),
+                "reason": "missing_required_fields=" + ",".join(missing),
+            })
+        else:
+            valid.append(j)
     meta["format_version"] = FORMAT_VERSION
-    meta["total"] = len(merged)
-    meta["job_count"] = len(merged)
-    meta["jobs"] = [_sanitize_job(j) for j in merged]
+    meta["total"] = len(valid)
+    meta["job_count"] = len(valid)
+    if quarantine:
+        meta["quarantine"] = quarantine
+    meta["jobs"] = valid
     _atomic_write_json(path, meta)
 
 
@@ -1434,7 +1484,7 @@ def _read_scrape_lock():
 
 
 def _write_scrape_lock(max_concurrent, holders, risk=False):
-    """原子写锁文件（tmp + os.replace，防并发撕裂）。"""
+    """原子写锁文件（tmp + os.replace + fsync，防并发撕裂/断电丢失）。"""
     tmp = SCRAPE_LOCK_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(str(max_concurrent) + "\n")
@@ -1442,6 +1492,8 @@ def _write_scrape_lock(max_concurrent, holders, risk=False):
             f.write(str(pid) + "\n")
         if risk:
             f.write(RISK_LINE + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, SCRAPE_LOCK_PATH)
 
 
@@ -1498,6 +1550,8 @@ def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
         tmp = _cdp_cooldown_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(str(time.time() + seconds))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, _cdp_cooldown_path())
     except OSError:
         pass
@@ -3820,9 +3874,27 @@ def main():
     for stream in (sys.stdout, sys.stderr):
         if stream is not None and hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    try:
+        run_cli()
+    except KeyboardInterrupt:
+        print("已取消。", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        # 退出码固化：0=成功 / 1=运行期错误（含未预期异常，干净消息无 traceback）/
+        # 2=CLI 误用（argparse 默认）
+        print(f"❌ 未预期错误: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+class _BossHelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
+                         argparse.RawDescriptionHelpFormatter):
+    """显示参数默认值，同时保留多行 epilog 原样。"""
+
+
+def build_parser():
     p = argparse.ArgumentParser(
         description=f"BOSS直聘抓取 + 分析 (CDP Raw) v{__version__}",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_BossHelpFormatter,
         epilog="""
 筛选参数示例:
   --scale 305          公司规模 (301=0-20人 302=20-99 303=100-499 304=500-999 305=1000-9999 306=10000+)
@@ -3863,88 +3935,130 @@ def main():
   %(prog)s --setup-chrome
         """)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--keyword", default="AI Agent", help="搜索关键词")
-    p.add_argument("--city", default=DEFAULT_CITY_INPUT, help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
-    p.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
-    p.add_argument("--max-jobs", type=int, default=None,
-                   help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
-    p.add_argument("--max-concurrent", type=int, default=1,
-                   help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
-                        "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
-    p.add_argument("--output", default=None, help="列表数据输出路径")
-    p.add_argument("--detail-output", default=None, help="详情数据输出路径")
-    p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
-                   help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
-    p.add_argument("--format", default="json", choices=["json", "csv"],
-                   help="输出格式 (默认 json)")
-    p.add_argument("--merge", default=None,
-                   help="合并已有 JSON 文件 (按 job_id 去重)")
 
-    # 筛选参数
-    p.add_argument("--scale", default=None, help="公司规模代码")
-    p.add_argument("--stage", default=None, help="融资阶段代码")
-    p.add_argument("--salary", default=None, help="薪资范围代码")
-    p.add_argument("--experience", default=None, help="经验要求代码")
-    p.add_argument("--degree", default=None, help="学历要求代码")
-    p.add_argument("--industry", default=None, help="行业代码")
+    # ---- 搜索参数 ----
+    g_search = p.add_argument_group("搜索参数")
+    g_search.add_argument("--keyword", default="AI Agent", help="搜索关键词")
+    g_search.add_argument("--city", default=DEFAULT_CITY_INPUT,
+                          help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
+    g_search.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
+    g_search.add_argument("--max-jobs", type=int, default=None,
+                          help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
+    g_search.add_argument("--max-concurrent", type=int, default=1,
+                          help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
+                               "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
 
-    # 功能开关
-    p.add_argument("--detail", action="store_true", default=True, help="抓取详情页 JD（默认开启）")
-    p.add_argument("--no-detail", dest="detail", action="store_false", help="不抓取详情页")
-    p.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
-    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
-                   help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
-                        "并发越高成功率越低，含全局限速与错误率自适应降速）")
-    p.add_argument("--analysis", action="store_true", help="输出分析报告")
-    p.add_argument("--input", default=None, help="从已有 JSON 文件读取（跳过抓取）")
-    p.add_argument("--allow-dom-fallback", action="store_true",
-                   help="API 无数据时允许降级 DOM 提取（薪资可能受字体反爬影响，默认关闭）")
+    # ---- 筛选参数 ----
+    g_filter = p.add_argument_group("筛选参数")
+    g_filter.add_argument("--scale", default=None, help="公司规模代码")
+    g_filter.add_argument("--stage", default=None, help="融资阶段代码")
+    g_filter.add_argument("--salary", default=None, help="薪资范围代码")
+    g_filter.add_argument("--experience", default=None, help="经验要求代码")
+    g_filter.add_argument("--degree", default=None, help="学历要求代码")
+    g_filter.add_argument("--industry", default=None, help="行业代码")
 
-    # 工具命令
-    p.add_argument("--check", action="store_true", help="运行环境诊断检查")
-    p.add_argument("--verify", action="store_true",
-                   help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
-    p.add_argument("--list-results", action="store_true",
-                   help="列出结果目录中的历史抓取结果文件")
-    p.add_argument("--batch", default=None, metavar="CONFIG.json",
-                   help="批量列表抓取：从配置文件（JSON 数组，每个元素一个任务："
-                        "keyword/city/pages/sleep/筛选字段）逐任务执行，任务间自动等待防风控")
-    p.add_argument("--archive", nargs="?", const="1", default=None,
-                   metavar="KEEP",
-                   help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
-    p.add_argument("--retry-job", action="append", default=[],
-                   metavar="JOB_ID",
-                   help="强制重试指定 job_id（可重复指定；无视 pending 重试上限，未记录的也会重抓）")
-    p.add_argument("--reset-lock", action="store_true",
-                   help="人工确认后清除并发锁的熔断状态（--max-concurrent 任务遇风控全停后重开前使用）")
-    p.add_argument("--smoke-test", action="store_true",
-                   help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
-    p.add_argument("--list-cities", nargs="?", const="", default=None,
-                   metavar="关键词",
-                   help="打印支持的城市列表（可选关键词过滤，如 --list-cities 江）；"
-                        "支持全国城市，码表见 data/city_codes.json，运行时自动从 BOSS 同步")
-    p.add_argument("--setup-chrome", action="store_true",
-                   help="自动启动 Chrome CDP 调试模式")
-    p.add_argument("--copy-login-state", action="store_true",
-                   help="手动从主 Chrome 导入 Local State + Cookie 相关文件到独立 profile（默认、首次启动、重复启动都不复制）")
-    p.add_argument("--reset-chrome-profile", action="store_true",
-                   help="重建 BOSS 专用 Chrome profile，会清除此专用浏览器内的登录态")
-    p.add_argument("--no-wait-login", action="store_true",
-                   help="--setup-chrome 启动后不等待 BOSS 登录完成")
-    p.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT,
-                   help=f"--setup-chrome 等待登录完成的秒数 (默认 {DEFAULT_LOGIN_TIMEOUT})")
-    p.add_argument("--stop-chrome", action="store_true",
-                   help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
-    p.add_argument("--close-chrome", action="store_true",
-                   help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="输出 DEBUG 级别日志（调试 CDP 消息、探测详情等）")
+    # ---- 输出参数 ----
+    g_output = p.add_argument_group("输出参数")
+    g_output.add_argument("--output", default=None, help="列表数据输出路径")
+    g_output.add_argument("--detail-output", default=None, help="详情数据输出路径")
+    g_output.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
+                          help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
+    g_output.add_argument("--format", default="json", choices=["json", "csv"],
+                          help="输出格式")
+    g_output.add_argument("--merge", default=None,
+                          help="合并已有 JSON 文件 (按 job_id 去重)")
 
-    args = p.parse_args()
+    # ---- 详情抓取 ----
+    g_detail = p.add_argument_group("详情抓取")
+    g_detail.add_argument("--detail", action="store_true", default=True,
+                          help="抓取详情页 JD（默认开启）")
+    g_detail.add_argument("--no-detail", dest="detail", action="store_false",
+                          help="不抓取详情页")
+    g_detail.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
+    g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                          help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
+                               "并发越高成功率越低，含全局限速与错误率自适应降速）")
+    g_detail.add_argument("--analysis", action="store_true", help="输出分析报告")
+    g_detail.add_argument("--input", default=None,
+                          help="从已有 JSON 文件读取（跳过抓取）")
+    g_detail.add_argument("--allow-dom-fallback", action="store_true",
+                          help="API 无数据时允许降级 DOM 提取（薪资可能受字体反爬影响，默认关闭）")
+    g_detail.add_argument("--retry-job", action="append", default=[],
+                          metavar="JOB_ID",
+                          help="强制重试指定 job_id（可重复指定；无视 pending 重试上限，未记录的也会重抓）")
 
-    if args.verbose:
+    # ---- 工具命令 ----
+    g_tool = p.add_argument_group("工具命令")
+    g_tool.add_argument("--check", action="store_true", help="运行环境诊断检查")
+    g_tool.add_argument("--verify", action="store_true",
+                        help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
+    g_tool.add_argument("--list-results", action="store_true",
+                        help="列出结果目录中的历史抓取结果文件")
+    g_tool.add_argument("--batch", default=None, metavar="CONFIG.json",
+                        help="批量列表抓取：从配置文件（JSON 数组，每个元素一个任务："
+                             "keyword/city/pages/sleep/筛选字段）逐任务执行，任务间自动等待防风控")
+    g_tool.add_argument("--archive", nargs="?", const="1", default=None,
+                        metavar="KEEP",
+                        help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
+    g_tool.add_argument("--reset-lock", action="store_true",
+                        help="人工确认后清除并发锁的熔断状态（--max-concurrent 任务遇风控全停后重开前使用）")
+    g_tool.add_argument("--smoke-test", action="store_true",
+                        help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
+    g_tool.add_argument("--list-cities", nargs="?", const="", default=None,
+                        metavar="关键词",
+                        help="打印支持的城市列表（可选关键词过滤，如 --list-cities 江）；"
+                             "支持全国城市，码表见 data/city_codes.json，运行时自动从 BOSS 同步")
+
+    # ---- Chrome 管理 ----
+    g_chrome = p.add_argument_group("Chrome 管理")
+    g_chrome.add_argument("--setup-chrome", action="store_true",
+                          help="自动启动 Chrome CDP 调试模式")
+    g_chrome.add_argument("--copy-login-state", action="store_true",
+                          help="手动从主 Chrome 导入 Local State + Cookie 相关文件到独立 profile（默认、首次启动、重复启动都不复制）")
+    g_chrome.add_argument("--reset-chrome-profile", action="store_true",
+                          help="重建 BOSS 专用 Chrome profile，会清除此专用浏览器内的登录态")
+    g_chrome.add_argument("--no-wait-login", action="store_true",
+                          help="--setup-chrome 启动后不等待 BOSS 登录完成")
+    g_chrome.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT,
+                          help=f"--setup-chrome 等待登录完成的秒数 (默认 {DEFAULT_LOGIN_TIMEOUT})")
+    g_chrome.add_argument("--stop-chrome", action="store_true",
+                          help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
+    g_chrome.add_argument("--close-chrome", action="store_true",
+                          help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
+
+    # ---- 通用参数 ----
+    g_general = p.add_argument_group("通用参数")
+    g_general.add_argument("-v", "--verbose", action="count", default=0,
+                           help="输出 DEBUG 级别日志（可叠加 -vv；调试 CDP 消息、探测详情等）")
+    g_general.add_argument("-q", "--quiet", action="store_true",
+                           help="静默模式：日志降到 WARNING 级别（结果行仍输出 stdout）")
+
+    return p
+
+
+def _apply_verbosity(verbose, quiet):
+    """verbosity → logging 级别：默认 INFO / -v DEBUG / -q WARNING（quiet 优先）。
+
+    结果流（print/EXPORT 行）始终走 stdout，诊断日志走 logging（stderr），互不干扰。
+    """
+    if quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+
+
+def run_cli():
+    p = build_parser()
+    args = p.parse_args()
+    _apply_verbosity(args.verbose, args.quiet)
+    if args.verbose:
         log.debug("已开启 DEBUG 日志")
+
+    # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
+    cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
+    cleanup_stale_tmp_files(os.path.dirname(SCRAPE_LOCK_PATH))
 
     # --check 模式
     if args.check:

@@ -3,6 +3,7 @@ import contextlib
 import csv
 import io
 import json
+import logging
 import os
 import pathlib
 import platform
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -1002,7 +1004,11 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         with tempfile_profile() as paths:
             target = str(paths["cdp_profile"] / "jobs.json")
-            module.flush_jobs(target, {"keyword": "AI"}, [{"job_id": "a"}])
+            module.flush_jobs(target, {"keyword": "AI"}, [{
+                "job_id": "a", "title": "T", "location": "深圳",
+                "job_link": "https://www.zhipin.com/job_detail/x.html",
+                "company_name": "某科技",
+            }])
             with open(target, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertEqual(data["job_count"], 1)
@@ -1307,7 +1313,11 @@ class ChromeSetupTests(unittest.TestCase):
             target = str(paths["cdp_profile"] / "jobs.json")
             meta = {"keyword": "AI", "page_count": 2,
                     "warnings": ["第3页疑似空数据"]}
-            module.flush_jobs(target, dict(meta), [{"job_id": "a", "title": "T"}])
+            module.flush_jobs(target, dict(meta), [{
+                "job_id": "a", "title": "T", "location": "深圳",
+                "job_link": "https://www.zhipin.com/job_detail/x.html",
+                "company_name": "某科技",
+            }])
             with open(target, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertEqual(data["format_version"], 1)
@@ -1459,7 +1469,9 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         with tempfile_profile() as paths:
             target = str(paths["cdp_profile"] / "jobs.json")
-            jobs = [{"job_id": f"job-{i}", "title": f"T{i}"} for i in range(10)]
+            jobs = [{"job_id": f"job-{i}", "title": f"T{i}", "location": "深圳",
+                     "job_link": f"https://www.zhipin.com/job_detail/job-{i}.html",
+                     "company_name": "某科技"} for i in range(10)]
             module.flush_jobs(target, {"keyword": "AI"}, jobs)
             with open(target, encoding="utf-8") as f:
                 first = json.load(f)
@@ -2531,8 +2543,13 @@ class ChromeSetupTests(unittest.TestCase):
             target = str(paths["cdp_profile"] / "jobs.json")
             meta = {"keyword": "Java"}
 
-            module.flush_jobs(target, dict(meta), [{"job_id": "a"}, {"job_id": "b"}])
-            module.flush_jobs(target, dict(meta), [{"job_id": "b"}, {"job_id": "c"}])
+            def full(jid):
+                return {"job_id": jid, "title": f"T-{jid}", "location": "深圳",
+                        "job_link": f"https://www.zhipin.com/job_detail/{jid}.html",
+                        "company_name": "某科技"}
+
+            module.flush_jobs(target, dict(meta), [full("a"), full("b")])
+            module.flush_jobs(target, dict(meta), [full("b"), full("c")])
 
             with open(target, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -3336,6 +3353,192 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("--close-chrome", result.stdout)
         self.assertIn("--verbose", result.stdout)
         self.assertIn("--concurrency", result.stdout)
+
+
+class _FakeFile:
+    """记录 write/flush/fsync 调用的假文件对象。"""
+
+    def __init__(self):
+        self.flushed = False
+        self.fsynced = False
+
+    def write(self, s):
+        pass
+
+    def flush(self):
+        self.flushed = True
+
+    def fileno(self):
+        return 1
+
+    def fsync(self):
+        self.fsynced = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class BestPracticesBatch2Tests(unittest.TestCase):
+    """第二批最佳实践：argparse 分组+退出码 / fsync+tmp 清扫 / 入口 schema 校验 / -v/-q。"""
+
+    CONSUMER_VALIDATOR = (
+        pathlib.Path(__file__).resolve().parents[0]
+        / "fixtures" / "consumer_validator" / "scripts" / "validate_export.py"
+    )
+
+    # ----- #6 argparse 分组 + 退出码文档化 -----
+
+    def test_parser_help_groups_arguments_and_shows_defaults(self):
+        """--help 按分组展示（不再是一堵墙），且显示参数默认值。"""
+        module = load_module()
+        parser = module.build_parser()
+        help_text = parser.format_help()
+        for title in ("搜索参数", "筛选参数", "输出参数", "详情抓取",
+                      "工具命令", "Chrome 管理", "通用参数"):
+            self.assertIn(title, help_text, f"help 缺少分组: {title}")
+        self.assertIn("default: 3", help_text,
+                      "ArgumentDefaultsHelpFormatter 应显示默认值")
+
+    def test_main_catch_all_prints_clean_message_without_traceback(self):
+        """未预期异常 → 干净错误消息（无 traceback）+ 退出码 1。"""
+        module = load_module()
+        with mock.patch.object(module, "run_cli",
+                               side_effect=RuntimeError("boom")) as run_cli, \
+             mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            with self.assertRaises(SystemExit) as exit_context:
+                module.main()
+        self.assertEqual(exit_context.exception.code, 1)
+        self.assertIn("boom", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        run_cli.assert_called_once()
+
+    # ----- #7 原子写 fsync + 启动清扫 .tmp -----
+
+    def test_atomic_write_json_fsyncs_before_replace(self):
+        """写盘前 flush+fsync（断电不丢数据），再 os.replace 原子替换。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "out.json")
+            fake = _FakeFile()
+            with mock.patch("builtins.open", return_value=fake), \
+                 mock.patch.object(module.os, "fsync") as fsync, \
+                 mock.patch.object(module.os, "replace") as replace:
+                module._atomic_write_json(target, {"jobs": []})
+            self.assertTrue(fake.flushed, "写盘前应 flush")
+            fsync.assert_called_once_with(1)
+            replace.assert_called_once()
+
+    def test_scrape_lock_write_fsyncs(self):
+        """锁文件原子写同样补 fsync（与 _atomic_write_json 同级保障）。"""
+        module = load_module()
+        fake = _FakeFile()
+        with mock.patch("builtins.open", return_value=fake), \
+             mock.patch.object(module.os, "fsync") as fsync, \
+             mock.patch.object(module.os, "replace") as replace:
+            module._write_scrape_lock(1, ["123"])
+        fsync.assert_called_once_with(1)
+        replace.assert_called_once()
+
+    def test_cleanup_stale_tmp_files_removes_only_stale(self):
+        """启动清扫：超过保留期（默认 300s）的 .tmp 残留删除，新鲜的不误删。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            result_dir = paths["cdp_profile"] / "job-result"
+            result_dir.mkdir(parents=True, exist_ok=True)
+            stale = result_dir / "boss_jobs_x.json.tmp999"
+            stale.write_text("x", encoding="utf-8")
+            old_ts = time.time() - 3600
+            os.utime(stale, (old_ts, old_ts))
+            fresh = result_dir / "boss_jobs_y.json.tmp888"
+            fresh.write_text("y", encoding="utf-8")
+            module.cleanup_stale_tmp_files(result_dir, max_age_seconds=300)
+            self.assertFalse(stale.exists(), "超过保留期应删除")
+            self.assertTrue(fresh.exists(), "新鲜 tmp 不应误删")
+
+    # ----- 入口 schema 校验（写盘前必填字段 quarantine）-----
+
+    def test_flush_jobs_quarantines_jobs_missing_required_fields(self):
+        """缺必填字段的 job 从导出剔除并记入 meta.quarantine（附原因）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            good = {"job_id": "a", "title": "T", "location": "深圳",
+                    "job_link": "https://www.zhipin.com/job_detail/x.html",
+                    "company_name": "某科技"}
+            bad = {"job_id": "b", "title": "", "location": "深圳",
+                   "job_link": "https://www.zhipin.com/job_detail/x.html",
+                   "company_name": "某科技"}
+            module.flush_jobs(target, {"keyword": "AI"}, [good, bad])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual([j["job_id"] for j in data["jobs"]], ["a"])
+            self.assertEqual(data["job_count"], 1)
+            self.assertEqual(data["quarantine"][0]["job_id"], "b")
+            self.assertIn("title", data["quarantine"][0]["reason"])
+
+    def test_flush_jobs_no_quarantine_key_when_all_valid(self):
+        """全部合法时 meta 不出现 quarantine 键（保持输出干净）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            good = {"job_id": "a", "title": "T", "location": "深圳",
+                    "job_link": "https://www.zhipin.com/job_detail/x.html",
+                    "company_name": "某科技"}
+            module.flush_jobs(target, {"keyword": "AI"}, [good])
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertNotIn("quarantine", data, "全部合法时不应出现 quarantine 键")
+
+    def test_flush_jobs_quarantine_passes_vendor_validator(self):
+        """quarantine 是 meta 扩展，不破坏消费端契约校验（vendor v1.0.0 ok=True）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            good = {"job_id": "a", "title": "T", "location": "深圳",
+                    "job_link": "https://www.zhipin.com/job_detail/x.html",
+                    "company_name": "某科技"}
+            bad = {"job_id": "b", "title": "", "location": "深圳",
+                   "job_link": "https://www.zhipin.com/job_detail/x.html",
+                   "company_name": "某科技"}
+            module.flush_jobs(target, {"keyword": "AI"}, [good, bad])
+            result = subprocess.run(
+                [sys.executable, str(BestPracticesBatch2Tests.CONSUMER_VALIDATOR),
+                 str(target)],
+                capture_output=True, text=True, encoding="utf-8", timeout=60,
+            )
+            out = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0,
+                             f"quarantine 产物应通过契约校验:\n{out}")
+            self.assertIn("ok=True", out)
+
+    # ----- -v/-q verbosity -----
+
+    def test_parser_accepts_verbose_count_and_quiet(self):
+        """-v 可叠加（count）、-q 独立开关；默认 0/False。"""
+        module = load_module()
+        parser = module.build_parser()
+        args = parser.parse_args(["-vv", "-q"])
+        self.assertEqual(args.verbose, 2)
+        self.assertTrue(args.quiet)
+        args2 = parser.parse_args([])
+        self.assertEqual(args2.verbose, 0)
+        self.assertFalse(args2.quiet)
+
+    def test_apply_verbosity_maps_to_log_levels(self):
+        """verbosity 映射：默认 INFO / -v DEBUG / -q WARNING（quiet 优先）。"""
+        module = load_module()
+        root = logging.getLogger()
+        module._apply_verbosity(0, False)
+        self.assertEqual(root.level, logging.INFO)
+        module._apply_verbosity(1, False)
+        self.assertEqual(root.level, logging.DEBUG)
+        module._apply_verbosity(0, True)
+        self.assertEqual(root.level, logging.WARNING)
+        module._apply_verbosity(2, True)
+        self.assertEqual(root.level, logging.WARNING, "quiet 优先于 verbose")
 
 
 class tempfile_profile:
