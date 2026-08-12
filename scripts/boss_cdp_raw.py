@@ -2276,8 +2276,11 @@ def load_batch_config(path):
     return tasks, errors
 
 
-def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT):
+def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
     """逐任务执行批量列表抓取；任务间按 sleep（缺省随机 30-60s）防风控。
+
+    支持 --max-concurrent 透传：多个 batch 进程并行时锁允许多个持有者
+    （如 2 个 batch 各跑一半任务 + max_concurrent=2 即并发 2）。
 
     Returns:
         int: 退出码（0 全成功 / 1 有任务失败或配置错误）
@@ -2289,7 +2292,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT):
         print("❌ 没有可执行的批量任务")
         return 1
 
-    print(f"\n=== 批量列表抓取（{len(tasks)} 个任务）===")
+    print(f"\n=== 批量列表抓取（{len(tasks)} 个任务，max_concurrent={max_concurrent}）===")
     failed = 0
     for i, task in enumerate(tasks):
         filters = {k: task[k] for k in FILTER_KEYS if k in task}
@@ -2299,6 +2302,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT):
             scrape_list(
                 task["keyword"], task["city"], task["pages"], filters, None,
                 cdp_port=cdp_port, max_jobs=None,
+                max_concurrent=max_concurrent,
             )
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
@@ -3833,7 +3837,8 @@ def main():
     if args.batch:
         if not require_runtime_dependencies("requests", "websocket"):
             sys.exit(1)
-        sys.exit(run_batch(args.batch, cdp_port=args.cdp_port))
+        sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
+                           max_concurrent=args.max_concurrent))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))

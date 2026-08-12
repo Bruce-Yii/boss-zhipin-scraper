@@ -851,6 +851,24 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(calls[0][1]["max_jobs"], None)
             self.assertEqual(sleep.call_count, 1, "两个任务之间只等一次")
 
+    def test_run_batch_passes_max_concurrent(self):
+        """--batch 透传 --max-concurrent（多 batch 进程并行时锁允许多持有者）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 1},
+            ])
+            calls = []
+            with mock.patch.object(module, "scrape_list",
+                                   side_effect=lambda *a, **k: calls.append((a, k))), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city") as rc:
+                rc.side_effect = lambda city: (city, "101020100")
+                code = module.run_batch(path, max_concurrent=2)
+            self.assertEqual(code, 0)
+            self.assertEqual(calls[0][1]["max_concurrent"], 2,
+                             "batch 任务应透传 max_concurrent")
+
     # ----- 宽 except 收紧（技术债 #2）-----
 
     def test_is_cdp_ready_lets_unexpected_errors_escape(self):
