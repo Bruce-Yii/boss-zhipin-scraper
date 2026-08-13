@@ -41,6 +41,7 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 
 - `scripts/boss_cdp_raw.py` 是一个**长单文件**，包含：`CDPSession` 类（WebSocket 连 CDP）、各种 `EXTRACT_*_JS` 注入脚本、`scrape_jobs`（列表走 `/wapi/...` API）、`scrape_details`（详情走新开 tab 渲染）、`main`（argparse）。城市码表外置到 `data/city_codes.json`，`resolve_city` 查询链为「本地静态码表 → 运行时拉 BOSS 接口 → 原样兜底」。
 - **列表页 vs 详情页路径完全不同**：列表页通过页面内 `fetch` 调 BOSS wapi（带 token，不经页面渲染）；详情页通过 `Target.createTarget` 新开 tab → `Page.navigate` → 注入 JS 提取。改其中一条路径时，另一条不受影响。
+- **详情抓取主路径 = API 通道**（2026-08-14 起）：`/wapi/zpgeek/job/detail.json?jobId=&securityId=&city=` 每岗 1 次轻量 XHR（JD 秒回）；`securityId` 由列表阶段内存收集（`scrape_list` 返回 `security_map`，**不落导出文件**——红线）；`--input` 老文件无 securityId 自动回退 DOM 渲染（`_scrape_one_detail_via_api` vs `_scrape_one_detail` 分支）。详情 API 风控码（code!=0）→ risk_timeout 全停。
 - **CDP target 焦点/可见性不变量**：统一通过 `create_page_session` 创建页面；自动化 target 默认后台打开并在导航前注册 visibility override，避免抢焦点且避免 `document.hidden=true` 触发 BOSS visibility 反爬（issue #18）。只有需要用户操作的 `wait_for_login` 显式传 `background=False`。不要绕过 helper 直接新增 `Target.createTarget`。
 - 同一个 Chrome 实例的默认 browser context 下，新开 target **本就共享 cookies**，不要被「新 tab 丢 cookie」的直觉误导。
 - `require_runtime_dependencies("requests", "websocket")` 在多个入口前置检查依赖，缺了会提示安装。
