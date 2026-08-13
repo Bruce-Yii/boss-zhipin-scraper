@@ -282,6 +282,36 @@ def filter_details_for_jobs(jobs, details):
     ]
 
 
+# 疑似销售岗过滤（2026-08-13 用户拍板）：BOSS 搜索为模糊匹配，
+# 搜"AI产品经理"会混入"AI产品销售经理/AI产品销售"等非目标岗，
+# 拉偏薪资统计与 JD 分析。title 命中特征词 → 强判定；JD 命中强特征词 → 判定。
+# 产品岗 JD 常含"销售"单字（如"提升销售转化"），JD 侧只用强特征词避免误伤。
+SALES_TITLE_TERMS = ("销售", "bd", "商务拓展", "客户经理", "sdr",
+                     "大客户", "渠道经理", "渠道销售", "招商")
+SALES_JD_TERMS = ("提成", "业绩指标", "完成业绩", "回款", "签单",
+                  "客户资源", "销售目标", "销售任务", "佣金", "业绩考核")
+
+
+def is_sales_job(job, detail=None):
+    """疑似销售岗判定：title 特征词强判定；JD 强特征词辅助。
+
+    detail 按 job_id 匹配（含 JD 正文）；缺详情时回退 title 判定与
+    job 内联 jd（--merge 数据可能自带）。
+    """
+    if not isinstance(job, dict):
+        return False
+    title = str(job.get("title") or job.get("job_name") or "").lower()
+    if any(t in title for t in SALES_TITLE_TERMS):
+        return True
+    jd = ""
+    if isinstance(detail, dict):
+        jd = str(detail.get("jd") or "")
+    if not jd:
+        jd = str(job.get("jd") or "")
+    jd_lower = jd.lower()
+    return any(t in jd_lower for t in SALES_JD_TERMS)
+
+
 def term_appears_in_jd(term, jd_text):
     normalized = str(term or "").strip()
     if not normalized:
@@ -337,6 +367,24 @@ def is_jd_noise_term(term):
 
 def build_summary(jobs, details=None, search_keyword="", city="", top=10):
     details = filter_details_for_jobs(jobs, details or [])
+    detail_by_id = {
+        str(d.get("job_id")).strip(): d
+        for d in details
+        if isinstance(d, dict) and str(d.get("job_id") or "").strip()
+    }
+
+    # 销售岗过滤：关键词模糊匹配混入的非目标岗剔除（title/JD 特征判定）
+    sales_filtered = 0
+    kept = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        detail = detail_by_id.get(str(job.get("job_id") or "").strip())
+        if is_sales_job(job, detail):
+            sales_filtered += 1
+            continue
+        kept.append(job)
+    jobs = kept
 
     salary_ranges = Counter()
     experience = Counter()
@@ -437,6 +485,7 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         "company_stages": _most_common(company_stages, top),
         "skill_tags": _most_common(skill_tags, top),
         "jd_terms": _most_common(jd_terms, top),
+        "sales_filtered": sales_filtered,
     }
 
 
@@ -489,6 +538,8 @@ def format_summary(summary):
         f"岗位市场摘要: {title}",
         f"列表岗位: {summary['total_jobs']} 条；详情 JD: {summary['total_details']} 条",
     ]
+    if summary.get("sales_filtered"):
+        lines.insert(1, f"⚠️ 已剔除 {summary['sales_filtered']} 条疑似销售岗（关键词模糊匹配混入）")
     if summary.get("sample_warning"):
         lines.insert(1, "⚠️ 样本量警示：可解析薪资不足 30 条，统计结论仅供参考")
     lines += [

@@ -112,6 +112,37 @@ class JobSummaryTests(unittest.TestCase):
         self.assertIn(("AIGC", 1), summary["skill_tags"])
         self.assertTrue(any(term == "LLM" for term, _ in summary["jd_terms"]))
 
+    def test_is_sales_job_detects_sales_titles(self):
+        module = load_summary_module()
+        self.assertTrue(module.is_sales_job({"title": "AI产品销售经理"}),
+                        "title 含销售应判定销售岗")
+        self.assertFalse(module.is_sales_job({"title": "AI产品经理"}),
+                         "正常产品岗 title 不应误伤")
+        self.assertFalse(module.is_sales_job({"title": "渠道产品经理"}),
+                         "渠道产品经理是产品岗，不应误伤")
+
+    def test_is_sales_job_detects_jd_markers(self):
+        module = load_summary_module()
+        job = {"title": "AI产品经理", "job_id": "x"}
+        detail = {"job_id": "x", "jd": "负责产品规划；有提成激励机制"}
+        self.assertTrue(module.is_sales_job(job, detail), "JD 含提成应判定销售岗")
+        detail2 = {"job_id": "x", "jd": "负责产品规划，提升销售转化率"}
+        self.assertFalse(module.is_sales_job(job, detail2), "JD 仅含销售单字不应误伤产品岗")
+
+    def test_build_summary_filters_sales_jobs(self):
+        module = load_summary_module()
+        jobs = [
+            {"job_id": "p1", "title": "AI产品经理", "salary": "30-60K", "location": "上海·浦东", "tags": "3-5年 | 本科", "boss_name": "甲公司"},
+            {"job_id": "s1", "title": "AI产品销售经理", "salary": "8-12K", "location": "上海·浦东", "tags": "1-3年 | 大专", "boss_name": "乙公司"},
+            {"job_id": "s2", "title": "AI产品销售", "salary": "10-15K", "location": "上海·徐汇", "tags": "经验不限 | 大专", "boss_name": "丙公司"},
+        ]
+        summary = module.build_summary(jobs, [], search_keyword="AI产品经理", top=5)
+        self.assertEqual(summary["total_jobs"], 1, "销售岗应被剔除")
+        self.assertEqual(summary["sales_filtered"], 2, "剔除计数应为 2")
+        self.assertEqual(summary["salary_ranges"][0][0], "30-60K", "统计只剩产品岗")
+        text = module.format_summary(summary)
+        self.assertIn("已剔除 2 条疑似销售岗", text, "摘要应标注剔除")
+
     def test_build_summary_uses_list_skills_without_details(self):
         module = load_summary_module()
         jobs = [
