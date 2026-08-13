@@ -2849,6 +2849,18 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("lid: j.lid", module.FETCH_API_JS_TEMPLATE)
         self.assertIn("encrypt_job_id: j.encryptJobId", module.FETCH_API_JS_TEMPLATE)
 
+    def test_api_extraction_includes_market_fields(self):
+        """市场信息字段：job_valid_status（官方在招状态）/icon（急·新标签）/proxy（代招标记）/job_type。"""
+        module = load_module()
+        js = module.FETCH_API_JS_TEMPLATE
+
+        self.assertIn("job_valid_status: j.jobValidStatus", js)
+        self.assertIn("icon_flags: (j.iconFlagList || []).join('|')", js)
+        self.assertIn("icon_word: j.iconWord", js)
+        self.assertIn("proxy_job: j.proxyJob", js)
+        self.assertIn("proxy_type: j.proxyType", js)
+        self.assertIn("job_type: j.jobType", js)
+
     def test_dom_fallback_is_opt_in(self):
         module = load_module()
 

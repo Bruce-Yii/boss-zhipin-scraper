@@ -3,6 +3,7 @@
 ## v2.3.0 (2026-08-11)
 
 ### 新增
+- **市场信息字段提取**（2026-08-13，探测 29 字段集对照盘点）：列表 API 新增 5 个可选字段——`job_valid_status`（BOSS 官方在招状态，可交叉校准 B 增量 last_seen 下架推断：同格状态=失效可直证下架、重见且=1 可证观测缺口/复活）、`icon_flags`/`icon_word`（"急"/"新"平台标签，"新"≈新发职位近似信号）、`proxy_job`/`proxy_type`（代招标记：猎头/外包）、`job_type`（岗位类型编码）。契约零影响（可选字段，format_version=1 不变）；测试 +1（模板字段断言），267 全绿 + ruff 全绿
 - **页面更新时间提取（page_update_date）**（2026-08-13）：详情页 DOM 存在 `页面更新时间：YYYY-MM-DD`（BOSS 唯一岗位侧日期，招聘方最后编辑岗位时间；平台不公开发布日期）——详情抓取时提取为可选字段 `page_update_date`（缺失留空），用于区分"岗位侧更新时间"与"我方抓取时间"（scraped_at）；列表 API 探测实证无任何时间字段（29 字段 timeKeys=0）。契约零影响（可选字段，format_version=1 不变）；测试 +2（提取/透传），266 全绿 + ruff 全绿
 - **告警推送补全（登录失效接入）**（2026-08-13）：登录状态探测失败（UNAUTHENTICATED/RESTRICTED/RESPONSE_ERROR）退出前调用 `send_alert`，推送 `EXPORT_FAIL reason=login_failed status=<状态> city=... keyword=...`（与规格侧告警语义对齐，运行指示 reason 枚举含 login_failed）；触发点齐备：EXPORT_FAIL risk_blocked ×4 + 验证码全停 + 登录失效。README 中英补「告警推送」小节（.env 配置、静默旁路说明）；测试 +1（三状态 subTest 断言标题/文本/city），264 全绿 + ruff 全绿
 - **分析产品化（升级方向 G 启动，pandas + matplotlib 引入）**：①**统计口径修正**（第四轮调研）——中位数取两中位均值（偶数样本此前取上中位，如 [30,45]→45 修正为 37.5）、薪资区间改 **P10/P90 分位**（极值在小样本不稳定，替代 min/max）、样本量警示（可解析 <30 条时摘要头部输出警示行）②**N薪解析** `parse_salary_annual`（"20-40K·15薪"→年薪 300-600K，无月数按 12 折算——15薪 vs 13薪按月度排名不公平）③**图表生成** `generate_charts`：薪资中位分布直方图 + 经验档位×薪资中位条形图（matplotlib Agg 无头 PNG，中文字体 Microsoft YaHei 实测可用），默认输出到结果目录 charts/，摘要尾部 Markdown 引用；CLI 新增 `--charts-dir`/`--no-charts` ④依赖新增 pandas+matplotlib（requirements 更新，CI 自动覆盖）

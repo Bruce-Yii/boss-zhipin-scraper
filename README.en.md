@@ -222,6 +222,7 @@ The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-jo
 
 - `format_version` increments on contract changes; `warnings` records scrape anomalies (empty API responses / risk blocks)
 - Required fields: `job_id`/`title`/`location`/`job_link`/`company_name`; sensitive fields are stripped before writing (credentials never land in files)
+- Optional (list scraping): `job_valid_status` (BOSS's official in-recruitment status, can calibrate de-listing inference), `icon_flags`/`icon_word` (platform labels such as "urgent"/"new"), `proxy_job`/`proxy_type` (proxy-hiring markers: headhunter/outsourcing), `job_type` (job type code)
 - Optional (detail scraping only): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — BOSS's only job-side date, the recruiter's last edit time, not a publish date; unavailable at list stage)
 - On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)
 
