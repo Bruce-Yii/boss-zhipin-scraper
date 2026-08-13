@@ -3663,6 +3663,51 @@ class BestPracticesBatch3Tests(unittest.TestCase):
                          "observed_jobs 应等于本 run 观察集合（与文件 jobs 的 job_id 一致）")
         self.assertEqual(len(observed), len(set(observed)), "观察集合应去重")
 
+    # ----- 告警推送模块（规格侧 Worker /webhook/alert）-----
+
+    def test_load_alert_config_reads_env_file(self):
+        """.env 解析：ALERT_WEBHOOK_URL/ALERT_WEBHOOK_TOKEN 读取；缺失返回空配置。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            env = str(paths["cdp_profile"] / ".env")
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            with open(env, "w", encoding="utf-8") as f:
+                f.write("ALERT_WEBHOOK_URL=https://example.com/alert\n")
+                f.write("ALERT_WEBHOOK_TOKEN=secret-token\n")
+                f.write("OTHER_KEY=ignored\n")
+            cfg = module.load_alert_config(env)
+            self.assertEqual(cfg["url"], "https://example.com/alert")
+            self.assertEqual(cfg["token"], "secret-token")
+            cfg2 = module.load_alert_config("/nonexistent/.env")
+            self.assertEqual(cfg2, {"url": "", "token": ""})
+
+    def test_send_alert_returns_true_on_200(self):
+        """send_alert：200 → True；配置缺失 → False 不抛；失败不抛异常。"""
+        module = load_module()
+        fake_requests = mock.Mock()
+        fake_requests.post.return_value.status_code = 200
+        with mock.patch.object(module, "load_alert_config",
+                               return_value={"url": "https://example.com/alert",
+                                             "token": "t"}), \
+             mock.patch.object(module, "requests", fake_requests) as fr:
+            self.assertTrue(module.send_alert("标题", "内容"))
+            _, kwargs = fr.post.call_args
+            self.assertEqual(kwargs["headers"]["Authorization"], "Bearer t")
+            body = kwargs["json"]
+            self.assertEqual(body["source"], "boss-zhipin-scraper")
+        fake_requests2 = mock.Mock()
+        fake_requests2.post.side_effect = ConnectionError("net down")
+        with mock.patch.object(module, "load_alert_config",
+                               return_value={"url": "https://example.com/alert",
+                                             "token": "t"}), \
+             mock.patch.object(module, "requests", fake_requests2):
+            self.assertFalse(module.send_alert("标题", "内容"),
+                             "发送失败应返回 False 不抛异常")
+        with mock.patch.object(module, "load_alert_config",
+                               return_value={"url": "", "token": ""}):
+            self.assertFalse(module.send_alert("标题", "内容"),
+                             "配置缺失应静默禁用")
+
     # ----- C 组：动作型 flag 互斥 + parser.error 语义 -----
 
     def test_parser_rejects_conflicting_action_flags(self):

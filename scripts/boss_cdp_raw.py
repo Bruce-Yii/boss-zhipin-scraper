@@ -1435,6 +1435,60 @@ def _scrub_secrets(text):
     if not isinstance(text, str):
         return text
     return _SECRET_KEY_PATTERN.sub(lambda m: f"{m.group(1)}=***", text)
+
+
+# ============================================================
+# 告警推送（规格侧 Worker /webhook/alert，Bearer token）
+# 配置放项目根 .env（ALERT_WEBHOOK_URL / ALERT_WEBHOOK_TOKEN，不落仓库）；
+# 推送是旁路：配置缺失/发送失败不抛异常，不影响抓取主流程。
+# ============================================================
+def load_alert_config(env_path=None):
+    """读取 .env 中的告警配置：ALERT_WEBHOOK_URL / ALERT_WEBHOOK_TOKEN。
+
+    默认查找项目根目录 .env；文件缺失或键缺失返回空配置（推送禁用）。
+    """
+    if env_path is None:
+        env_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    cfg = {"url": "", "token": ""}
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key == "ALERT_WEBHOOK_URL":
+                    cfg["url"] = value
+                elif key == "ALERT_WEBHOOK_TOKEN":
+                    cfg["token"] = value
+    except OSError:
+        pass
+    return cfg
+
+
+def send_alert(title, text, timeout=10):
+    """发送告警到规格侧 Worker 端点（requests POST，Bearer 鉴权）。
+
+    幂等由端点保证（同内容去重）；失败仅记日志返回 False。
+    """
+    cfg = load_alert_config()
+    if not cfg["url"] or not cfg["token"]:
+        return False
+    try:
+        resp = requests.post(
+            cfg["url"],
+            json={"source": "boss-zhipin-scraper", "title": title, "text": text},
+            headers={"Authorization": f"Bearer {cfg['token']}"},
+            timeout=timeout,
+        )
+        return resp.status_code == 200
+    except OSError:
+        # requests.RequestException 继承 IOError(=OSError)；网络层失败不阻塞主流程
+        log.warning("告警发送失败", exc_info=True)
+        return False
 # BOSS 内部标识字段（规格侧建议剔除：下游误读风险，非契约字段；
 # 详情抓取用 job_link 即可导航，不依赖这些参数）
 _INTERNAL_KEYS = ("security_id", "lid", "encrypt_job_id",
@@ -2098,6 +2152,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print("⚠️ 并发任务已触发风控熔断，本任务立即停止（保留已抓数据）。")
                 warnings.append("并发任务风控熔断")
                 print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                 return {"keyword": keyword, "city": city_name,
                         "total": len(all_jobs), "jobs": all_jobs}
             actual_pages = pg
@@ -2118,6 +2173,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         print("列表页风控未解除，停止抓取（保留已抓数据）。")
                         warnings.append(f"搜索页风控未解除: {reason}")
                         print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         return {"keyword": keyword, "city": city_name,
                                 "total": len(all_jobs), "jobs": all_jobs}
                 human_scroll(cdp, sid)
@@ -2188,6 +2244,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     print("⚠️ 连续多页无数据（疑似风控静默降级），停止抓取（保留已抓数据）。")
                     warnings.append("连续多页无数据（疑似风控静默降级）")
                     print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                    send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                     return {"keyword": keyword, "city": city_name,
                             "total": len(all_jobs), "jobs": all_jobs}
                 print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
@@ -2248,6 +2305,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         print("⚠️ 并发任务已触发风控熔断，本任务立即停止（保留已抓数据）。")
                         warnings.append("并发任务风控熔断")
                         print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         return {"keyword": keyword, "city": city_name,
                                 "total": len(all_jobs), "jobs": all_jobs}
                     time.sleep(d / 4)
@@ -3114,6 +3172,7 @@ def _note_detail_risk_blocked(list_output_path=None):
     契约零变更、消费端零适配。列表文件为 None 或不存在时只打印提示。
     """
     print("⚠️ 验证码命中，已全部停止（保留已抓数据）")
+    send_alert("验证码全停", "详情阶段验证码命中，已全部停止（保留已抓数据）")
     if not list_output_path or not os.path.exists(list_output_path):
         return
     try:
