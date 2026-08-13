@@ -73,7 +73,7 @@ CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减�
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
-FORMAT_VERSION = 1              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；契约变更时递增）
+FORMAT_VERSION = 2              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；v2 = B 增量扩展 mode/observed_jobs/exhausted，docs/25 §3，规格侧 T2 落档 5278260355）
 SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
 
 def get_default_chrome_path():

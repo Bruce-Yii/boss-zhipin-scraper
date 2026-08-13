@@ -1,12 +1,16 @@
-#!/usr/bin/env python
 # ---------------------------------------------------------------------------
-# 消费端契约校验器（vendor 副本，来自 ai-pm-job-intel 仓库）
+# 双端契约校验器 vendor 副本（来源：ai-pm-job-intel 私有仓库）
 #
-# 来源仓库: https://github.com/Bruce-Yii/ai-pm-job-intel（私有）
-# 来源 SHA: ab8a958（feat: 校验器版本号（v1.0.0）用于双端漂移检测）
-# 同步约定: 契约变更时由 ai-pm-job-intel 重新交付本文件与 src/python/contract_check.py，
-#           爬虫侧替换副本后 CI 自动对齐（断言输出含 v1.0.0）；勿改逻辑
+# 来源 SHA: 规格侧 T2 契约 v2 交付（Issue 5278260355，docs/25 §3 顶层扩展字段表）
+# 唯一口径: ai-pm-job-intel/src/python/contract_check.py（本文件 validate_export.py 同源）
+#
+# 同步约定（契约变更时）:
+#   1. ai-pm-job-intel 递增 VALIDATOR_VERSION 并交付最新两份文件（contract_check.py + validate_export.py）
+#   2. 同步替换本目录两份文件（tests/fixtures/consumer_validator/）
+#   3. CI 断言 validator=v2.0.0 版本匹配，漂移即红（触发双端对齐）
+#   4. 全量回归依据（私有仓不可直接引用，vendor 副本保证 CI 双端一致校验，无逻辑改动）
 # ---------------------------------------------------------------------------
+#!/usr/bin/env python
 """消费端契约校验器（爬虫侧可自检用）。
 
 用法: python scripts/validate_export.py <export.json>
@@ -43,3 +47,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

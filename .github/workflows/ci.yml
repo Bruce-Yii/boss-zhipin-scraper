@@ -19,9 +19,9 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -42,15 +42,15 @@ jobs:
   contract-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: 双端契约一致校验（消费端校验器 vendor 副本）
         run: |
-          out=$(python tests/fixtures/consumer_validator/scripts/validate_export.py tests/fixtures/sample_export_v1.json)
+          out=$(python tests/fixtures/consumer_validator/scripts/validate_export.py tests/fixtures/sample_export_v2.json)
           echo "$out"
-          echo "$out" | grep -q "validator=v1.0.0" || { echo "FAIL: 校验器版本不匹配（需与 ai-pm-job-intel 对齐）"; exit 1; }
+          echo "$out" | grep -q "validator=v2.0.0" || { echo "FAIL: 校验器版本不匹配（需与 ai-pm-job-intel 对齐）"; exit 1; }
           echo "$out" | grep -q "ok=True" || { echo "FAIL: 样例未通过消费端契约校验"; exit 1; }

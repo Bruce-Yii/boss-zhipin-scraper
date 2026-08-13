@@ -6,7 +6,7 @@
   "scraped_at": "2026-08-11T07:24:54.652864",
   "page_count": 1,
   "warnings": [],
-  "format_version": 1,
+  "format_version": 2,
   "total": 30,
   "job_count": 30,
   "jobs": [
@@ -760,5 +760,44 @@
       "welfare": "",
       "job_id": "727f65b01e159e2c"
     }
-  ]
+  ],
+  "mode": "incremental",
+  "observed_jobs": [
+    "056872b0e21610ed",
+    "11450abee2514896",
+    "1c90a050d64a5da6",
+    "2208b6b19682e7fd",
+    "3830a07686850464",
+    "535cb8e1f4d9a118",
+    "55a6abcbeec21b9f",
+    "601331ba87366973",
+    "647199c414f1b42c",
+    "727f65b01e159e2c",
+    "763e5e55a1e4baa6",
+    "7ad69c7df32a21b7",
+    "81ebd416b505d0d4",
+    "831e6e94782c35bf",
+    "8cb1f325b0f812f4",
+    "8ee997086dd166f5",
+    "8f4496c59c3260d8",
+    "8f793235638af672",
+    "8fbfab9945f5a2bb",
+    "9586aeb09720e971",
+    "96ec44013c41680f",
+    "bb89ffe0881fef83",
+    "cab643f0ed05bb59",
+    "d68b5e8fa705ba26",
+    "df0bbb2348a81e1e",
+    "df995767ca3dec96",
+    "e17d23991704bc20",
+    "e29339121ceef739",
+    "f9cdd91d12833f90",
+    "fb1249273bfb5ee6"
+  ],
+  "exhausted": false,
+  "record_counts": {
+    "new": 30,
+    "duplicate": 0,
+    "quarantine": 0
+  }
 }
