@@ -199,6 +199,13 @@ python3 scripts/job_summary.py --top 15
 | 2 | CLI 误用（未知参数/非法值/冲突命令，argparse 默认） |
 | 130 | 用户 Ctrl+C 中断（128+signal 约定） |
 
+### 告警推送
+
+异常时通过 Worker 端点推送告警（飞书卡片等下游通道由端点侧配置）：风控/验证码全停（`EXPORT_FAIL reason=risk_blocked`）、**登录失效**（`EXPORT_FAIL reason=login_failed`）、详情验证码全停（`warnings: detail_risk_blocked`）。
+
+- 配置：项目根目录 `.env`（gitignore 排除，不入仓库）——`ALERT_WEBHOOK_URL=<端点地址>`、`ALERT_WEBHOOK_TOKEN=<Bearer token>`
+- 未配置或网络失败时静默跳过，不影响抓取主流程（失败仅记日志）
+
 ## 导出契约 v1
 
 列表 JSON 为下游程序提供稳定契约（供 ai-pm-job-intel 等系统消费）：

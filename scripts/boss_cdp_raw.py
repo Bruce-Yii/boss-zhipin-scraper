@@ -4447,13 +4447,19 @@ def run_cli():
         if login_result.status is LoginProbeStatus.UNAUTHENTICATED:
             print("❌ 未检测到 BOSS直聘登录状态。请先在 Chrome 中登录 zhipin.com。")
             print("   可运行 --check 检查环境，或 --setup-chrome 启动 Chrome。")
+            send_alert("登录失效",
+                       f"EXPORT_FAIL reason=login_failed status=UNAUTHENTICATED city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.RESTRICTED:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
             print("   请先在浏览器中完成验证或稍后再试，不要重复运行登录探测。")
+            send_alert("登录失效",
+                       f"EXPORT_FAIL reason=login_failed status=RESTRICTED city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.RESPONSE_ERROR:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
+            send_alert("登录失效",
+                       f"EXPORT_FAIL reason=login_failed status=RESPONSE_ERROR city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.EMPTY:
             print(f"⚠️  {describe_login_probe_result(login_result)}；继续执行实际职位搜索。\n")

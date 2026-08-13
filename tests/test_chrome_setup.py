@@ -1511,6 +1511,37 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("未检测到 BOSS直聘登录状态", output.getvalue())
         scrape.assert_not_called(), "登录失败时零请求发出"
 
+    def test_login_failure_sends_alert(self):
+        """登录失效推送：UNAUTH/RESTRICTED/RESPONSE_ERROR → send_alert 携带 EXPORT_FAIL reason=login_failed。"""
+        module = load_module()
+        for status in (module.LoginProbeStatus.UNAUTHENTICATED,
+                       module.LoginProbeStatus.RESTRICTED,
+                       module.LoginProbeStatus.RESPONSE_ERROR):
+            with self.subTest(status=status):
+                result = module.LoginProbeResult(status)
+                with mock.patch.object(sys, "argv", [
+                        "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
+                ]), \
+                        mock.patch.object(module, "require_runtime_dependencies",
+                                          return_value=True), \
+                        mock.patch.object(module, "resolve_city",
+                                          return_value=("上海", "101020100")), \
+                        mock.patch.object(module, "check_login_state",
+                                          return_value=result), \
+                        mock.patch.object(module, "send_alert") as alert, \
+                        mock.patch.object(module, "scrape_list") as scrape, \
+                        redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exit_context:
+                        module.main()
+                self.assertEqual(exit_context.exception.code, 1)
+                alert.assert_called_once()
+                title, text = alert.call_args[0]
+                self.assertEqual(title, "登录失效")
+                self.assertIn("reason=login_failed", text)
+                self.assertIn("city=上海", text)
+                self.assertIn(status.name, text)
+                scrape.assert_not_called()
+
     def test_dod6_risk_compliance_no_bypass_no_high_frequency(self):
         """DoD 6 风控合规：源码自查——无 headless 伪装、无验证码绕过、
         页间等待有下限（低频随机节奏）。"""

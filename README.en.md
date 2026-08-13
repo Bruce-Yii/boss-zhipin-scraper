@@ -196,6 +196,13 @@ python3 scripts/job_summary.py --top 15
 | 2 | CLI misuse (unknown argument / invalid value / conflicting commands, argparse default) |
 | 130 | Interrupted by user Ctrl+C (128+signal convention) |
 
+### Alert Push
+
+On anomalies, alerts are pushed via a Worker endpoint (downstream channels such as Feishu cards are configured by the endpoint side): risk/captcha full-stop (`EXPORT_FAIL reason=risk_blocked`), **login failure** (`EXPORT_FAIL reason=login_failed`), detail captcha full-stop (`warnings: detail_risk_blocked`).
+
+- Configure in the project root `.env` (gitignored, not committed): `ALERT_WEBHOOK_URL=<endpoint URL>`, `ALERT_WEBHOOK_TOKEN=<Bearer token>`
+- Silent skip if unconfigured or on network failure (logged only); never blocks the scrape flow
+
 ## Export Contract v1
 
 The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-job-intel):
