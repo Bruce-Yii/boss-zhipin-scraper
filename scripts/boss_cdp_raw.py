@@ -3552,9 +3552,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
         elif reason == "stopped":
             break
         elif reason == "risk_timeout":
-            # E 降级：详情验证码命中 → 全部停止（不再逐条等 120s 无效重试）
+            # E 降级：详情风控命中（验证码/API 风控码）→ 全部停止
+            # （不再逐条等 120s 无效重试）；message 含实际风控形态（如 code=37），
+            # 必须打印——可观测性原则：风控形态不可见就无法区分频次限制与真验证码
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            print(f"  ⚠️ {result['message']}")
             _note_detail_risk_blocked(list_output_path,
                                       city_name=list_data.get("city", ""),
                                       keyword=list_data.get("keyword", ""))
@@ -3681,7 +3684,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         if reason == "login_required":
             stop_event.set()
         elif reason == "risk_timeout":
-            # E 降级：详情验证码命中 → 全局停止（不再逐条等 120s 无效重试）
+            # E 降级：详情风控命中（验证码/API 风控码）→ 全局停止；
+            # message 含实际风控形态（如 code=37），必须打印（可观测性）
+            print(f"  ⚠️ {result['message']}")
             stop_event.set()
             _note_detail_risk_blocked(list_output_path, city_name=city, keyword=keyword)
         elif reason == "cdp_session":
