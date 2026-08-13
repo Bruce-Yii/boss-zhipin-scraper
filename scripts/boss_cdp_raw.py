@@ -673,11 +673,15 @@ MIN_DETAIL_TEXT_LENGTH = 120
 
 
 class DetailExtractionError(ValueError):
-    """The rendered page does not contain a usable job description."""
+    """详情提取失败（页面结构漂移/内容过短），不进 pending。"""
 
 
 class DetailLoginRequiredError(DetailExtractionError):
     """The detail page is truncated because the BOSS session is not logged in."""
+
+
+class DetailRiskError(DetailExtractionError):
+    """详情 API 返回风控码（code!=0）：退避重试，连续命中走熔断全停。"""
 
 
 EXTRACT_DETAIL_JS = """
@@ -727,6 +731,106 @@ def _normalize_detail_whitespace(text):
     normalized = "\n".join(lines).strip()
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return re.sub(r"[ \t]{2,}", " ", normalized)
+
+
+# ============================================================
+# 详情 API 通道（2026-08-14，替代详情页 DOM 渲染为主路径）
+# /wapi/zpgeek/job/detail.json?jobId=&securityId=&city= 实测 code 0：
+#   postDescription = 完整 JD（纯文本，无 HTML、无截断——已实证）
+#   bossInfo/brandComInfo = HR 与公司完整信息块
+#   address/longitude/latitude = 详情级精确位置
+# securityId 来自列表 API（每岗），同进程内存传递，不落导出文件（红线）。
+# 相比详情页 DOM 渲染：每岗 1 次轻量 XHR（非整页渲染），成本降一个量级。
+# ============================================================
+DETAIL_API_JS = r"""
+(function(){
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '__API_URL__', false);
+    xhr.send();
+    if (xhr.status !== 200) return JSON.stringify({error: 'http_' + xhr.status});
+    var d;
+    try { d = JSON.parse(xhr.responseText); } catch (e) { return JSON.stringify({error: 'parse'}); }
+    if (d.code !== 0) return JSON.stringify({code: d.code, msg: d.message || ''});
+    var zp = d.zpData || {};
+    var info = zp.jobInfo || {};
+    var boss = zp.bossInfo || {};
+    var brand = zp.brandComInfo || {};
+    return JSON.stringify({
+        code: 0,
+        jd: info.postDescription || '',
+        address: info.address || '',
+        longitude: (typeof info.longitude === 'number') ? info.longitude : null,
+        latitude: (typeof info.latitude === 'number') ? info.latitude : null,
+        job_status_desc: info.jobStatusDesc || '',
+        invalid_status: (typeof info.invalidStatus === 'boolean') ? info.invalidStatus : null,
+        boss_active_status: boss.activeTimeDesc || '',
+        boss_certificated: (typeof boss.certificated === 'boolean') ? boss.certificated : null,
+        brand_introduce: brand.introduce || '',
+        brand_stage_name: brand.stageName || '',
+        brand_scale_name: brand.scaleName || '',
+        brand_industry_name: brand.industryName || ''
+    });
+})()
+"""
+
+DETAIL_API_PATH = "/wapi/zpgeek/job/detail.json"
+
+
+def build_detail_api_url(job, security_id, city_code=""):
+    """构造详情 API URL（jobId+securityId 为必需参数，city 探测实证需带）。"""
+    job_id = str(job.get("encrypt_job_id") or "")
+    if not job_id:
+        # 列表 job_link 自带 encryptJobId（详情 DOM 导航同源）
+        m = re.search(r"/job_detail/([^./]+)\.html", str(job.get("job_link") or ""))
+        if m:
+            job_id = m.group(1)
+    params = {
+        "jobId": job_id,
+        "securityId": str(security_id or ""),
+        "city": str(city_code or ""),
+    }
+    return f"{DETAIL_API_PATH}?{urlencode(params)}"
+
+
+def _parse_detail_api_value(val, job):
+    """解析详情 API 返回（DETAIL_API_JS 输出）。
+
+    Returns:
+        dict: {jd, boss_active_status, page_update_date(''), address, ...}——失败抛异常：
+        error → DetailExtractionError；code!=0 → DetailRiskError；jd 过短 → DetailExtractionError。
+    """
+    try:
+        payload = json.loads(val)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise DetailExtractionError(f"详情 API 返回不是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise DetailExtractionError("详情 API 返回结构异常")
+    if payload.get("error"):
+        raise DetailExtractionError(f"详情 API 请求失败: {payload['error']}")
+    if payload.get("code", 0) != 0:
+        raise DetailRiskError(f"详情 API 风控码: code={payload.get('code')} {payload.get('msg', '')}")
+    jd = str(payload.get("jd") or "")
+    jd = jd.replace("\u3000", " ")  # 全角空格清理（探测实证 postDescription 含全角空格）
+    jd = _normalize_detail_whitespace(jd)
+    if len(jd) < MIN_DETAIL_TEXT_LENGTH:
+        raise DetailExtractionError(
+            f"job description too short after validation: {len(jd)} < {MIN_DETAIL_TEXT_LENGTH}"
+        )
+    return {
+        "jd": jd,
+        "boss_active_status": str(payload.get("boss_active_status") or ""),
+        "page_update_date": "",  # API 通道无详情页"页面更新时间"（可选字段，退化点已记录）
+        "address": str(payload.get("address") or ""),
+        "longitude": payload.get("longitude"),
+        "latitude": payload.get("latitude"),
+        "job_status_desc": str(payload.get("job_status_desc") or ""),
+        "invalid_status": payload.get("invalid_status"),
+        "boss_certificated": payload.get("boss_certificated"),
+        "brand_introduce": str(payload.get("brand_introduce") or ""),
+        "brand_stage_name": str(payload.get("brand_stage_name") or ""),
+        "brand_scale_name": str(payload.get("brand_scale_name") or ""),
+        "brand_industry_name": str(payload.get("brand_industry_name") or ""),
+    }
 
 
 def _looks_like_navigation_page(text):
@@ -2082,7 +2186,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
         print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
         print(f"EXPORT_FAIL reason=lock_held city={city_name} keyword={keyword}")
-        return {"keyword": keyword, "city": city_name, "total": 0, "jobs": []}
+        return {"keyword": keyword, "city": city_name, "total": 0, "jobs": [],
+                "security_map": {}, "city_code": city_code}
     cdp = CDPSession(cdp_port)
     all_jobs = []
     seen = set()
@@ -2095,6 +2200,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     # B 增量同步观察集合：本 run 观察到的全部 job_id（新增+重复，raw 事实，
     # 独立于累积 jobs 数组；B 方案 A 契约字段 observed_jobs）
     observed_ids = []
+    # 详情 API 通道凭据：{job_id: securityId}——同进程内存传递（详情阶段用），
+    # 不落导出文件（红线：security_id 属内部标识）。导出时 _sanitize 剔除，此处仅内存。
+    security_map = {}
 
     # 显示筛选条件
     filter_desc = []
@@ -2171,7 +2279,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                 send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                 return {"keyword": keyword, "city": city_name,
-                        "total": len(all_jobs), "jobs": all_jobs}
+                        "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
             actual_pages = pg
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
             incr_request("list")
@@ -2192,7 +2300,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         return {"keyword": keyword, "city": city_name,
-                                "total": len(all_jobs), "jobs": all_jobs}
+                                "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                 human_scroll(cdp, sid)
                 human_mouse_jitter(cdp, sid)
 
@@ -2263,7 +2371,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                     send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                     return {"keyword": keyword, "city": city_name,
-                            "total": len(all_jobs), "jobs": all_jobs}
+                            "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                 print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
                 continue
 
@@ -2275,6 +2383,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 key = j.get('job_link') or j['title']
                 j['job_id'] = hashlib.md5(key.encode()).hexdigest()[:16]
                 observed_ids.append(j['job_id'])
+                sid_ = j.get('security_id')
+                if sid_:
+                    security_map[j['job_id']] = sid_
                 if key in seen:
                     continue
                 seen.add(key)
@@ -2328,7 +2439,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
                         return {"keyword": keyword, "city": city_name,
-                                "total": len(all_jobs), "jobs": all_jobs}
+                                "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                     time.sleep(d / 4)
 
     except KeyboardInterrupt:
@@ -2373,7 +2484,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     # AS-8 结构化结果行（规格 §3.4）：供下游程序/人 30 秒判断本次导出可信度
     print(f"EXPORT_OK jobs={len(all_jobs)} city={city_name} keyword={keyword} path={output_path}")
     return {"keyword": keyword, "city": city_name, "total": len(all_jobs),
-            "jobs": all_jobs, "output_path": output_path}
+            "jobs": all_jobs, "output_path": output_path, "security_map": security_map, "city_code": city_code}
 
 
 # ============================================================
@@ -2399,6 +2510,17 @@ def build_detail_record(job, extracted):
         "skill_tags": extracted.get("tags", []),
         "jd": extracted.get("jd", ""),
         "page_update_date": extracted.get("page_update_date", ""),
+        # 详情 API 通道新增可选字段（2026-08-14；DOM 路径缺省空，兼容）
+        "address": extracted.get("address", ""),
+        "longitude": extracted.get("longitude"),
+        "latitude": extracted.get("latitude"),
+        "job_status_desc": extracted.get("job_status_desc", ""),
+        "invalid_status": extracted.get("invalid_status"),
+        "boss_certificated": extracted.get("boss_certificated"),
+        "brand_introduce": extracted.get("brand_introduce", ""),
+        "brand_stage_name": extracted.get("brand_stage_name", ""),
+        "brand_scale_name": extracted.get("brand_scale_name", ""),
+        "brand_industry_name": extracted.get("brand_industry_name", ""),
     }
 
 
@@ -3092,7 +3214,8 @@ class AdaptiveRateLimiter:
 
 
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
-                       limiter=None, verbose=False):
+                       limiter=None, verbose=False, security_id=None,
+                       api_session=None, city_code=""):
     """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
 
     Args:
@@ -3101,6 +3224,11 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         stop_event: 可选 threading.Event；置位时提前返回（登录墙/熔断等
             全局停止信号），不再发起新会话
         limiter: 可选 AdaptiveRateLimiter；并发模式下在导航前申请全局配额
+        security_id: 列表阶段暂存的岗位 securityId（详情 API 通道凭据，
+            内存传递不落盘）；为 None 时回退详情页 DOM 渲染路径（--input 兼容）
+        api_session: 可选 (CDPSession, target_id, session_id) 共享会话——
+            详情 API 通道复用一个停靠在 zhipin 域的 tab，避免每岗导航
+        city_code: 城市码（详情 API 参数）
 
     Returns:
         dict: {"ok": bool, "detail": dict|None, "job_id": str,
@@ -3112,6 +3240,13 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
     if stop_event is not None and stop_event.is_set():
         return {"ok": False, "detail": None, "job_id": job_id,
                 "reason": "stopped", "message": "已收到停止信号"}
+
+    # 详情 API 通道（security_id 存在时优先；轻量 XHR 替代整页渲染）
+    if security_id:
+        return _scrape_one_detail_via_api(
+            job, cdp_port, stop_event=stop_event, limiter=limiter,
+            verbose=verbose, security_id=security_id,
+            api_session=api_session, city_code=city_code)
 
     ws = None
     tid = None
@@ -3189,6 +3324,60 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                 log.debug("关闭详情会话失败", exc_info=True)
 
 
+def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
+                               verbose=False, security_id="", api_session=None,
+                               city_code=""):
+    """详情 API 通道：1 次轻量 XHR 取完整 JD（替代详情页整页渲染）。
+
+    复用 api_session（共享停靠 tab，避免每岗导航）；无 api_session 时自建
+    tab 并导航搜索页（一次）。失败分类：风控码 → risk_timeout（上层全停）、
+    内容过短/结构异常 → invalid_detail（不进 pending）、网络 → cdp_session。
+    """
+    job_id = job.get("job_id", "")
+    shared = api_session is not None
+    ws = None
+    tid = None
+    sid = None
+    try:
+        if shared:
+            ws, tid, sid = api_session
+        else:
+            ws = CDPSession(cdp_port)
+            tid, sid = create_page_session(ws)
+            # 停靠轻量 zhipin 页面（搜索页），fetch 需要 zhipin 域 + 会话 cookie
+            ws.send("Page.navigate", {"url": build_search_url(
+                job.get("title", "") or "", city_code or "", 1, {})}, sid)
+            time.sleep(random.uniform(4, 8))
+
+        if limiter is not None:
+            limiter.acquire()
+        api_url = build_detail_api_url(job, security_id, city_code=city_code)
+        js = DETAIL_API_JS.replace("__API_URL__", api_url)
+        val = ws.eval_js(js, sid)
+        try:
+            fields = _parse_detail_api_value(val, job)
+        except DetailRiskError as exc:
+            # 风控码：与列表阶段同构——退避重试由上层 pending/全停逻辑接管
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "risk_timeout", "message": str(exc)}
+        except DetailExtractionError as exc:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": str(exc)}
+        return {"ok": True, "detail": build_detail_record(job, fields),
+                "job_id": job_id, "reason": "", "message": ""}
+    except _cdp_exception_types() as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "cdp_session", "message": str(exc)}
+    finally:
+        if not shared and ws is not None:
+            try:
+                if tid is not None:
+                    ws.send("Target.closeTarget", {"targetId": tid})
+                ws.close()
+            except _cdp_exception_types():
+                log.debug("关闭详情 API 会话失败", exc_info=True)
+
+
 def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
     """验证码命中 → 全停。输出 EXPORT_FAIL risk_blocked（08 规格 §3.6 语义，
     规格侧判定信号）+ 列表文件 warnings 追加原因 + 告警推送。
@@ -3217,13 +3406,16 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
 
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
-                   concurrency=DEFAULT_CONCURRENCY, list_output_path=None):
+                   concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
+                   security_map=None):
     """抓取详情。
 
     Args:
         list_output_path: 可选列表文件路径——E 降级（验证码命中全停）时
             在列表文件 meta.warnings 追加降级原因（规格侧方案：EXPORT_OK
             + warnings 承载降级信号；None 时不更新列表文件）。
+        security_map: 可选 {job_id: securityId}（scrape_list 同进程内存传递，
+            详情 API 通道凭据；为 None 时走详情页 DOM 渲染路径）。
     """
     jobs = list_data.get("jobs", [])
     if max_details:
@@ -3261,6 +3453,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             existing_results=results, output_path=output_path,
             list_output_path=list_output_path,
             keyword=list_data.get("keyword", ""),
+            security_map=security_map or {},
             city=list_data.get("city", ""))
         if pending:
             print(resume_hint(pending, output_path))
@@ -3275,6 +3468,22 @@ def scrape_details(list_data, max_details=None, output_path=None,
     serial_done = 0
     serial_reasons = {}
     start_time = time.time()
+
+    # 详情 API 通道（串行）：复用 1 个停靠 zhipin 域的共享 tab（只导航一次，
+    # 120 条详情 = 120 次轻量 XHR，避免每岗整页渲染）
+    api_session = None
+    if security_map:
+        try:
+            api_ws = CDPSession(cdp_port)
+            api_tid, api_sid = create_page_session(api_ws)
+            api_ws.send("Page.navigate", {"url": build_search_url(
+                list_data.get("keyword", ""), list_data.get("city_code", "") or "",
+                1, {})}, api_sid)
+            time.sleep(random.uniform(4, 8))
+            api_session = (api_ws, api_tid, api_sid)
+        except _cdp_exception_types():
+            log.warning("详情 API 共享会话建立失败，回退逐岗自建会话", exc_info=True)
+            api_session = None
 
     for idx, job in enumerate(jobs):
         link = job.get("job_link", "")
@@ -3300,7 +3509,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
         incr_request("detail")
 
-        result = _scrape_one_detail(job, cdp_port, verbose=True)
+        result = _scrape_one_detail(job, cdp_port, verbose=True,
+                                    security_id=(security_map or {}).get(job_id),
+                                    api_session=api_session,
+                                    city_code=list_data.get("city_code", "") or "")
         reason = result["reason"]
 
         if result["ok"]:
@@ -3367,6 +3579,15 @@ def scrape_details(list_data, max_details=None, output_path=None,
             print(progress)
         time.sleep(gap)
 
+    # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
+    if api_session is not None:
+        try:
+            api_ws, api_tid, _ = api_session
+            api_ws.send("Target.closeTarget", {"targetId": api_tid})
+            api_ws.close()
+        except _cdp_exception_types():
+            log.debug("关闭详情 API 共享会话失败", exc_info=True)
+
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
     _atomic_write_json(output_path, results)
     save_pending_ids(output_path, pending)
@@ -3387,7 +3608,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              existing_ids=None, pending_ids=None,
                              existing_results=None, output_path=None,
                              write_every=5, list_output_path=None,
-                             keyword="", city=""):
+                             keyword="", city="", security_map=None,
+                             city_code=""):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -3401,6 +3623,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         output_path: 非 None 时每 write_every 条渐进原子写盘（中断最多丢
             write_every 条，与串行"每条写盘"的可靠性差距收敛）
         write_every: 渐进写盘间隔（条数）
+        security_map: 详情 API 通道凭据（{job_id: securityId}）；为 None 走 DOM 渲染
+        city_code: 城市码（详情 API 参数）
 
     Returns:
         (results, pending): results 为全量详情（含 existing_results）；
@@ -3483,7 +3707,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         in_flight = set()
 
         def run_one(job):
-            return job, _scrape_one_detail(job, cdp_port, stop_event, limiter)
+            return job, _scrape_one_detail(
+                job, cdp_port, stop_event, limiter,
+                security_id=(security_map or {}).get(job.get("job_id", "")),
+                city_code=city_code)
 
         def fill_window():
             while len(in_flight) < window:
@@ -4543,6 +4770,9 @@ def run_cli():
                 # E 降级：验证码命中全停时，列表文件 warnings 追加降级原因
                 # （--input 模式列表文件为输入文件；抓取模式为实际落盘路径）
                 list_output_path=list_data.get("output_path") or args.input,
+                # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
+                # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
+                security_map=list_data.get("security_map"),
             )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:

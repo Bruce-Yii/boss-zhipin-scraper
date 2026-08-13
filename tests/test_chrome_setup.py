@@ -768,7 +768,8 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         list_data = {"jobs": self._sample_jobs(12)["jobs"]}
 
-        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False):
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code=""):
             return {"ok": True, "detail": {"job_id": job["job_id"],
                                            "title": job["title"],
                                            "jd": "x" * 200},
@@ -1881,7 +1882,8 @@ class ChromeSetupTests(unittest.TestCase):
         """构造模拟 worker：记录并发峰值，按 job_id 返回成功/失败。"""
         lock, active, max_active = active_state
 
-        def worker(job, cdp_port, stop_event=None, limiter=None):
+        def worker(job, cdp_port, stop_event=None, limiter=None,
+              security_id=None, api_session=None, city_code=""):
             if stop_event is not None and stop_event.is_set():
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
                         "reason": "stopped", "message": ""}
@@ -1962,7 +1964,8 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         jobs = self._sample_jobs(6)["jobs"]
 
-        def always_fail(job, cdp_port, stop_event=None, limiter=None):
+        def always_fail(job, cdp_port, stop_event=None, limiter=None,
+                     security_id=None, api_session=None, city_code=""):
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "cdp_session", "message": "boom"}
 
@@ -1988,7 +1991,8 @@ class ChromeSetupTests(unittest.TestCase):
         jobs = self._sample_jobs(20)["jobs"]
         calls = []
 
-        def always_fail(job, cdp_port, stop_event=None, limiter=None):
+        def always_fail(job, cdp_port, stop_event=None, limiter=None,
+                     security_id=None, api_session=None, city_code=""):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "cdp_session", "message": "boom"}
@@ -2092,7 +2096,8 @@ class ChromeSetupTests(unittest.TestCase):
                               existing_ids=None, pending_ids=None,
                               existing_results=None, output_path=None,
                               write_every=5, list_output_path=None,
-                              keyword="", city=""):
+                              keyword="", city="", security_map=None,
+                              city_code=""):
                 # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
                 captured["concurrency"] = concurrency
                 merged = list(existing_results or []) + [fake_detail]
@@ -2914,6 +2919,78 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("job_type: j.jobType", js)
         self.assertIn("anonymous: j.anonymous !== undefined", js)
 
+    def test_build_detail_api_url_uses_encrypt_id_and_security(self):
+        """详情 API URL：优先 encrypt_job_id，缺省从 job_link 提取 encryptJobId。"""
+        module = load_module()
+        url = module.build_detail_api_url(
+            {"encrypt_job_id": "abc123", "job_link": "https://www.zhipin.com/job_detail/xyz.html"},
+            "sec-1", city_code="101200100")
+        self.assertIn("jobId=abc123", url)
+        self.assertIn("securityId=sec-1", url)
+        self.assertIn("city=101200100", url)
+        url2 = module.build_detail_api_url(
+            {"job_link": "https://www.zhipin.com/job_detail/xyz.html"}, "sec-2", city_code="101200100")
+        self.assertIn("jobId=xyz", url2)
+
+    def test_parse_detail_api_value_ok(self):
+        """详情 API 解析：正常返回 → jd 规范化 + 扩展字段；全角空格清理。"""
+        module = load_module()
+        val = json.dumps({
+            "code": 0,
+            "jd": "岗位职责\n\u3000负责 AI 产品规划。\n" * 20,
+            "address": "武汉·洪山区",
+            "longitude": 114.3, "latitude": 30.5,
+            "job_status_desc": "招聘中", "invalid_status": False,
+            "boss_active_status": "刚刚活跃", "boss_certificated": True,
+            "brand_introduce": "AI 公司", "brand_stage_name": "A轮",
+        })
+        fields = module._parse_detail_api_value(val, {})
+        self.assertIn("负责 AI 产品规划", fields["jd"])
+        self.assertNotIn("\u3000", fields["jd"])
+        self.assertEqual(fields["address"], "武汉·洪山区")
+        self.assertEqual(fields["longitude"], 114.3)
+        self.assertEqual(fields["invalid_status"], False)
+        self.assertEqual(fields["page_update_date"], "")
+
+    def test_parse_detail_api_value_failures(self):
+        """详情 API 解析失败分类：短 JD → invalid_detail；风控码 → DetailRiskError；error → invalid_detail。"""
+        module = load_module()
+        short = json.dumps({"code": 0, "jd": "太短"})
+        with self.assertRaises(module.DetailExtractionError):
+            module._parse_detail_api_value(short, {})
+        risk = json.dumps({"code": 37, "msg": "访问受限"})
+        with self.assertRaises(module.DetailRiskError):
+            module._parse_detail_api_value(risk, {})
+        err = json.dumps({"error": "http_403"})
+        with self.assertRaises(module.DetailExtractionError):
+            module._parse_detail_api_value(err, {})
+
+    def test_scrape_list_collects_security_map(self):
+        """security_map：列表阶段内存收集 {job_id: securityId}（不落导出文件）。"""
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_eval_js(script, sid=None):
+            if "xhr.open" not in script:
+                return None
+            jobs = [{"title": f"AI岗位{i}", "salary": "20-40K",
+                     "job_link": f"https://example.com/job/{i}",
+                     "boss_name": "公司", "security_id": f"sec-{i}"} for i in range(5)]
+            return json.dumps(jobs)
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs"), \
+                mock.patch.object(module.time, "sleep"):
+            result = module.scrape_list("AI", "上海", 1, {}, None,
+                                        cdp_port=9333, max_concurrent=1)
+        smap = result.get("security_map") or {}
+        self.assertEqual(len(smap), 5, "应收集 5 个 securityId")
+        self.assertTrue(any(v.startswith("sec-") for v in smap.values()))
+
     def test_dom_fallback_is_opt_in(self):
         module = load_module()
 
@@ -3680,7 +3757,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
                  "job_link": f"https://www.zhipin.com/job/{i}"} for i in range(3)]
         calls = []
 
-        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False):
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code=""):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}
@@ -3719,7 +3797,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
                  "job_link": f"https://www.zhipin.com/job/{i}"} for i in range(6)]
         calls = []
 
-        def fake_worker(job, cdp_port, stop_event=None, limiter=None, verbose=False):
+        def fake_worker(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code=""):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}
