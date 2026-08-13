@@ -1477,6 +1477,8 @@ def send_alert(title, text, timeout=10):
     cfg = load_alert_config()
     if not cfg["url"] or not cfg["token"]:
         return False
+    if requests is None:  # 延迟导入：测试/未初始化环境静默禁用
+        return False
     try:
         resp = requests.post(
             cfg["url"],
@@ -3165,14 +3167,18 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                 log.debug("关闭详情会话失败", exc_info=True)
 
 
-def _note_detail_risk_blocked(list_output_path=None):
-    """E 降级：详情验证码命中 → 全停。列表文件 meta.warnings 追加降级原因 + 打印提示。
+def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
+    """验证码命中 → 全停。输出 EXPORT_FAIL risk_blocked（08 规格 §3.6 语义，
+    规格侧判定信号）+ 列表文件 warnings 追加原因 + 告警推送。
 
-    规格侧方案（2026-08-13 拍板）：EXPORT_OK + warnings 承载降级信号，
-    契约零变更、消费端零适配。列表文件为 None 或不存在时只打印提示。
+    注：列表阶段成功已输出 EXPORT_OK（时序事实不可撤回）；详情阶段全停
+    追加 EXPORT_FAIL 行，规格侧以 EXPORT_FAIL 为当日异常判定信号。
     """
+    fail_line = (f"EXPORT_FAIL reason=risk_blocked city={city_name} "
+                 f"keyword={keyword} detail=验证码命中已全部停止")
     print("⚠️ 验证码命中，已全部停止（保留已抓数据）")
-    send_alert("验证码全停", "详情阶段验证码命中，已全部停止（保留已抓数据）")
+    print(fail_line)
+    send_alert("验证码全停", fail_line)
     if not list_output_path or not os.path.exists(list_output_path):
         return
     try:
@@ -3231,7 +3237,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             jobs, cdp_port, concurrency,
             existing_ids=existing_ids, pending_ids=pending,
             existing_results=results, output_path=output_path,
-            list_output_path=list_output_path)
+            list_output_path=list_output_path,
+            keyword=list_data.get("keyword", ""),
+            city=list_data.get("city", ""))
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -3313,7 +3321,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             # E 降级：详情验证码命中 → 全部停止（不再逐条等 120s 无效重试）
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
-            _note_detail_risk_blocked(list_output_path)
+            _note_detail_risk_blocked(list_output_path,
+                                      city_name=list_data.get("city", ""),
+                                      keyword=list_data.get("keyword", ""))
             break
         else:
             serial_done += 1
@@ -3354,7 +3364,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
 def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              existing_ids=None, pending_ids=None,
                              existing_results=None, output_path=None,
-                             write_every=5, list_output_path=None):
+                             write_every=5, list_output_path=None,
+                             keyword="", city=""):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -3426,7 +3437,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         elif reason == "risk_timeout":
             # E 降级：详情验证码命中 → 全局停止（不再逐条等 120s 无效重试）
             stop_event.set()
-            _note_detail_risk_blocked(list_output_path)
+            _note_detail_risk_blocked(list_output_path, city_name=city, keyword=keyword)
         elif reason == "cdp_session":
             consecutive_cdp_errors += 1
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:

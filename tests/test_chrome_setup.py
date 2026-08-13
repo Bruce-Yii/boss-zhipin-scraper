@@ -2008,7 +2008,8 @@ class ChromeSetupTests(unittest.TestCase):
             def fake_parallel(jobs, cdp_port, concurrency, limiter=None,
                               existing_ids=None, pending_ids=None,
                               existing_results=None, output_path=None,
-                              write_every=5, list_output_path=None):
+                              write_every=5, list_output_path=None,
+                              keyword="", city=""):
                 # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
                 captured["concurrency"] = concurrency
                 merged = list(existing_results or []) + [fake_detail]
@@ -3574,6 +3575,7 @@ class BestPracticesBatch3Tests(unittest.TestCase):
             with open(list_path, "w", encoding="utf-8") as f:
                 json.dump({"keyword": "AI", "jobs": []}, f)
             with mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                 mock.patch.object(module, "send_alert"), \
                  mock.patch.object(module, "load_existing_detail_ids",
                                    return_value=set()), \
                  mock.patch.object(module, "load_pending_ids",
@@ -3606,6 +3608,7 @@ class BestPracticesBatch3Tests(unittest.TestCase):
                     "reason": "risk_timeout", "message": "验证码命中"}
 
         with mock.patch.object(module, "_scrape_one_detail", new=fake_worker), \
+             mock.patch.object(module, "send_alert"), \
              mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
              mock.patch.object(module, "load_existing_detail_ids",
                                return_value=set()), \
