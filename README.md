@@ -225,6 +225,7 @@ python3 scripts/job_summary.py --top 15
 
 - `format_version` 递增表示契约变更；`warnings` 记录采集异常（API 空数据/风控）
 - 必填字段：`job_id`/`title`/`location`/`job_link`/`company_name`；导出前自动过滤敏感字段（凭据不落文件）
+- 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——BOSS 唯一岗位侧日期，招聘方最后编辑岗位时间，非发布日期；列表阶段无此信息）
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词

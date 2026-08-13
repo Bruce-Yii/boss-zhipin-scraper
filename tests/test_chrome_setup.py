@@ -2625,6 +2625,27 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertNotIn("张女士", jd)
         self.assertNotIn("竞争力分析", jd)
 
+    def test_detail_extracts_page_update_date(self):
+        """页面更新时间：详情页含"页面更新时间：YYYY-MM-DD" → 提取为 page_update_date；缺失留空。"""
+        module = load_module()
+        jd = "职位描述\n负责 AI 产品规划。\n" * 8
+        page_text = f"{jd}\n页面更新时间：2026-08-13\n张女士\n今日活跃"
+        fields = module.extract_detail_fields({"jd": jd, "page_text": page_text})
+        self.assertEqual(fields["page_update_date"], "2026-08-13")
+
+        fields2 = module.extract_detail_fields({"jd": jd, "page_text": "无更新时间字段"})
+        self.assertEqual(fields2["page_update_date"], "")
+
+    def test_build_detail_record_carries_page_update_date(self):
+        """详情记录透传 page_update_date（缺省空串）。"""
+        module = load_module()
+        job = {"job_id": "j1", "title": "T", "job_link": "https://www.zhipin.com/job/x.html",
+               "boss_name": "C", "salary": "20-30K", "location": "杭州", "tags": ""}
+        rec = module.build_detail_record(job, {"jd": "JD", "page_update_date": "2026-08-13"})
+        self.assertEqual(rec["page_update_date"], "2026-08-13")
+        rec2 = module.build_detail_record(job, {"jd": "JD"})
+        self.assertEqual(rec2["page_update_date"], "")
+
     def test_extract_job_description_rejects_login_truncation(self):
         module = load_module()
         page_text = (

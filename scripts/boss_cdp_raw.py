@@ -851,7 +851,13 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
         raise DetailExtractionError(
             f"job description too short after validation: {len(jd)} < {min_length}"
         )
-    return {"jd": jd, "boss_active_status": boss_active_status}
+    # 页面更新时间：BOSS 详情页唯一岗位侧日期（招聘方最后编辑岗位时间，
+    # 非发布日期——平台不公开发布时间）；列表 API 无任何时间字段。
+    # 非契约可选字段，缺失留空；用于区分"岗位侧更新时间"与"我方抓取时间"。
+    update_m = re.search(r"页面更新时间[：:]\s*(\d{4}-\d{2}-\d{2})", page_text)
+    page_update_date = update_m.group(1) if update_m else ""
+    return {"jd": jd, "boss_active_status": boss_active_status,
+            "page_update_date": page_update_date}
 
 
 def extract_job_description(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
@@ -2378,6 +2384,7 @@ def build_detail_record(job, extracted):
         "link": link,
         "skill_tags": extracted.get("tags", []),
         "jd": extracted.get("jd", ""),
+        "page_update_date": extracted.get("page_update_date", ""),
     }
 
 
@@ -3145,6 +3152,7 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             fields = extract_detail_fields(d)
             d["jd"] = fields["jd"]
             d["boss_active_status"] = fields["boss_active_status"]
+            d["page_update_date"] = fields["page_update_date"]
         except DetailLoginRequiredError as exc:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "login_required", "message": str(exc)}
