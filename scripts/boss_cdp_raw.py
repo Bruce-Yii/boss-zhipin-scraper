@@ -595,6 +595,7 @@ FETCH_API_JS_TEMPLATE = """
             company_name: j.brandName || '',
             boss_title: j.bossTitle || '',
             boss_active_status: j.activeTimeDesc || (j.bossOnline ? '\\u5728\\u7ebf' : ''),
+            anonymous: j.anonymous !== undefined ? j.anonymous : '',
             job_valid_status: j.jobValidStatus !== undefined ? j.jobValidStatus : '',
             icon_flags: (j.iconFlagList || []).join('|'),
             icon_word: j.iconWord || '',

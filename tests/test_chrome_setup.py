@@ -2912,6 +2912,7 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("proxy_job: j.proxyJob", js)
         self.assertIn("proxy_type: j.proxyType", js)
         self.assertIn("job_type: j.jobType", js)
+        self.assertIn("anonymous: j.anonymous !== undefined", js)
 
     def test_dom_fallback_is_opt_in(self):
         module = load_module()
