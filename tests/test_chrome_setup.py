@@ -565,6 +565,58 @@ class ChromeSetupTests(unittest.TestCase):
 
     # ----- 列表抓取（max_jobs 条数上限）-----
 
+    def test_scrape_list_marks_exhausted_on_short_page(self):
+        """exhausted：单页不足一页（<30 条）→ flush meta exhausted=True（翻到底，全量观测）。"""
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_eval_js(script, sid=None):
+            if "xhr.open" not in script:
+                return None
+            jobs = [{"title": f"AI岗位{i}", "salary": "20-40K",
+                     "job_link": f"https://example.com/job/{i}",
+                     "boss_name": "公司"} for i in range(15)]
+            return json.dumps(jobs)
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs") as flush, \
+                mock.patch.object(module.time, "sleep"):
+            module.scrape_list("AI", "上海", 1, {}, "out.json",
+                               cdp_port=9333, max_concurrent=1)
+        metas = [call.args[1] for call in flush.call_args_list]
+        self.assertTrue(metas, "应有 flush 调用")
+        self.assertTrue(metas[-1]["exhausted"], "--pages 1 单页 <30 条应标记翻底")
+
+    def test_scrape_list_not_exhausted_when_pages_full(self):
+        """exhausted：每页满 30 条 → exhausted=False（未翻底，抽样观测）。"""
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_eval_js(script, sid=None):
+            if "xhr.open" not in script:
+                return None
+            jobs = [{"title": f"AI岗位{i}", "salary": "20-40K",
+                     "job_link": f"https://example.com/job/{i}",
+                     "boss_name": "公司"} for i in range(30)]
+            return json.dumps(jobs)
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs") as flush, \
+                mock.patch.object(module.time, "sleep"):
+            module.scrape_list("AI", "上海", 2, {}, "out.json",
+                               cdp_port=9333, max_concurrent=1)
+        metas = [call.args[1] for call in flush.call_args_list]
+        self.assertTrue(metas)
+        self.assertFalse(metas[-1]["exhausted"], "满页未到底应标记 false")
+
     def test_scrape_list_stops_at_max_jobs(self):
         module = load_module()
         cdp = mock.Mock()

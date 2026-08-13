@@ -59,6 +59,7 @@ DEFAULT_CDP_PORT = 45222  # 固定高位端口：绕开 BOSS 安全 JS 扫描名
 
 # API 基础路径（便于统一修改）
 API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
+PAGE_SIZE = 30  # BOSS 每页条数（exhausted 翻底判定基准：本页 <PAGE_SIZE 即已到底）
 HOT_CITY_URL = "https://www.zhipin.com/wapi/zpgeek/search/job/hot/city.json"
 CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 
@@ -2160,6 +2161,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             }, sid)
 
     try:
+        exhausted = False  # 本 run 是否翻到底（规格侧抽样感知下架判定依据：契约 v2 顶层字段）
         for pg in range(1, max_pages + 1):
             # 并发熔断检查：其他任务已广播风控 → 本任务立即全停（不降并发续跑）
             if is_scrape_lock_risk():
@@ -2264,6 +2266,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
                 continue
 
+            if len(jobs) < PAGE_SIZE:
+                exhausted = True  # 本页不足一页 → 已翻到底（--pages 1 单页 <30 同理）
+
             new = 0
             for j in jobs:
                 key = j.get('job_link') or j['title']
@@ -2299,6 +2304,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "started_at": run_started_at,
                     "mode": "incremental",
                     "observed_jobs": sorted(set(observed_ids)),
+                    "exhausted": exhausted,
                 }, all_jobs)
 
             # 条数上限：抓够即停，不再翻页（BOSS 每页 30 条，实际可能略超上限）
@@ -2352,6 +2358,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             "ended_at": datetime.now().isoformat(),
             "mode": "incremental",
             "observed_jobs": sorted(set(observed_ids)),
+            "exhausted": exhausted,
         }, all_jobs)
         print(f"已保存: {output_path}")
 

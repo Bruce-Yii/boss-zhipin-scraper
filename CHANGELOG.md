@@ -3,6 +3,7 @@
 ## v2.3.0 (2026-08-11)
 
 ### 新增
+- **exhausted 页底标志实施（B 联调 T2 契约 v2 前置，规格侧定案授权）**（2026-08-13）：scrape_list 每页判定 `len(jobs) < PAGE_SIZE(=30) → exhausted=True`（`--pages 1` 单页 <30 同理；满页未到底 false；空页走风控分支不参与）；两处 flush（中间页/最终页）meta 顶层加 `exhausted: bool`——规格侧抽样感知下架判定依据（全量观测格才判下架）。**format_version 切换（1→2）与校验器 2.0.0 同步待规格侧契约 v2 落档后一次实施**（当前字段先产出，旧校验器忽略多余字段无兼容问题）。测试 +2（短页 true/满页 false），269 全绿 + ruff 全绿
 - **市场信息字段提取**（2026-08-13，探测 29 字段集对照盘点）：列表 API 新增 5 个可选字段——`job_valid_status`（BOSS 官方在招状态，可交叉校准 B 增量 last_seen 下架推断：同格状态=失效可直证下架、重见且=1 可证观测缺口/复活）、`icon_flags`/`icon_word`（"急"/"新"平台标签，"新"≈新发职位近似信号）、`proxy_job`/`proxy_type`（代招标记：猎头/外包）、`job_type`（岗位类型编码）。契约零影响（可选字段，format_version=1 不变）；测试 +1（模板字段断言），267 全绿 + ruff 全绿
 - **页面更新时间提取（page_update_date）**（2026-08-13）：详情页 DOM 存在 `页面更新时间：YYYY-MM-DD`（BOSS 唯一岗位侧日期，招聘方最后编辑岗位时间；平台不公开发布日期）——详情抓取时提取为可选字段 `page_update_date`（缺失留空），用于区分"岗位侧更新时间"与"我方抓取时间"（scraped_at）；列表 API 探测实证无任何时间字段（29 字段 timeKeys=0）。契约零影响（可选字段，format_version=1 不变）；测试 +2（提取/透传），266 全绿 + ruff 全绿
 - **告警推送补全（登录失效接入）**（2026-08-13）：登录状态探测失败（UNAUTHENTICATED/RESTRICTED/RESPONSE_ERROR）退出前调用 `send_alert`，推送 `EXPORT_FAIL reason=login_failed status=<状态> city=... keyword=...`（与规格侧告警语义对齐，运行指示 reason 枚举含 login_failed）；触发点齐备：EXPORT_FAIL risk_blocked ×4 + 验证码全停 + 登录失效。README 中英补「告警推送」小节（.env 配置、静默旁路说明）；测试 +1（三状态 subTest 断言标题/文本/city），264 全绿 + ruff 全绿
