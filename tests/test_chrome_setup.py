@@ -2933,24 +2933,23 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("jobId=xyz", url2)
 
     def test_parse_detail_api_value_ok(self):
-        """详情 API 解析：正常返回 → jd 规范化 + 扩展字段；全角空格清理。"""
+        """详情 API 解析：正常返回 → jd 规范化 + 精简字段集；全角空格清理。"""
         module = load_module()
         val = json.dumps({
             "code": 0,
             "jd": "岗位职责\n\u3000负责 AI 产品规划。\n" * 20,
-            "address": "武汉·洪山区",
-            "longitude": 114.3, "latitude": 30.5,
-            "job_status_desc": "招聘中", "invalid_status": False,
-            "boss_active_status": "刚刚活跃", "boss_certificated": True,
+            "job_status_desc": "招聘中",
+            "boss_active_status": "刚刚活跃",
             "brand_introduce": "AI 公司", "brand_stage_name": "A轮",
         })
         fields = module._parse_detail_api_value(val, {})
         self.assertIn("负责 AI 产品规划", fields["jd"])
         self.assertNotIn("\u3000", fields["jd"])
-        self.assertEqual(fields["address"], "武汉·洪山区")
-        self.assertEqual(fields["longitude"], 114.3)
-        self.assertEqual(fields["invalid_status"], False)
+        self.assertEqual(fields["job_status_desc"], "招聘中")
+        self.assertEqual(fields["brand_introduce"], "AI 公司")
         self.assertEqual(fields["page_update_date"], "")
+        self.assertNotIn("address", fields, "地址字段已按用户拍板精简")
+        self.assertNotIn("invalid_status", fields)
 
     def test_parse_detail_api_value_failures(self):
         """详情 API 解析失败分类：短 JD → invalid_detail；风控码 → DetailRiskError；error → invalid_detail。"""
