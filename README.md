@@ -171,6 +171,7 @@ python3 scripts/job_summary.py --top 15
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
+| `--status` | 状态总览（运行态 + 缓存态，接管用；**不发请求**，登录态仍需 `--check`） |
 | `--verify` | 校验已抓取结果文件完整性（列表/详情可解析、字段齐全、JD 完整、覆盖率；只校验不抓取，不依赖 Chrome） |
 | `--list-results` | 列出结果目录中的历史抓取结果文件（分类 + 时间 + 大小） |
 | `--archive [KEEP]` | 归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 `archive/` 子目录；pending 活动文件不归档 |

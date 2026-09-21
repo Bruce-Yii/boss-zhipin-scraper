@@ -168,6 +168,7 @@ python3 scripts/job_summary.py --top 15
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
 | `--check` | Environment check (CDP + deps + login state) |
+| `--status` | Status overview (runtime + cache, for takeover; **no requests**; login still needs `--check`) |
 | `--verify` | Verify scraped result files (list/detail parseability, required fields, JD completeness, coverage; verification only, no scraping, no Chrome needed) |
 | `--list-results` | List historical result files in the result dir (kind + time + size) |
 | `--archive [KEEP]` | Archive historical results: keep the newest KEEP files per kind (default 1), move the rest into `archive/`; active pending files are never archived |

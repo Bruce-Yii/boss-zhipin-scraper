@@ -4244,6 +4244,114 @@ def run_smoke_test(cdp_port=DEFAULT_CDP_PORT):
 # ============================================================
 # --check 环境检查
 # ============================================================
+def _git_short_sha():
+    """尽力取当前 git 短 SHA（非仓库/无 git 时返回空串，不抛）。"""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def run_status(cdp_port=DEFAULT_CDP_PORT, result_dir=DEFAULT_RESULT_DIR):
+    """一条命令看清"运行态 + 缓存态"（换窗口接管用；**不发 BOSS 请求**）。
+
+    - 运行态：CDP 端口、Chrome profile、互斥锁、熔断冷却/恢复期
+    - 缓存态：结果目录文件统计 + 最新列表文件 meta 摘要（含 jd 覆盖率）
+    - 技能/入口：指向项目与工作区文档（不复制内容）
+    """
+    print("=" * 54)
+    print("  BOSS直聘 爬虫状态总览（接管用）")
+    print("=" * 54)
+
+    # ── 运行态 ──
+    print("\n[运行态]")
+    try:
+        # 局部导入：模块级 requests 是懒加载（未初始化时为 None），此处需真实可用性
+        import requests as _requests
+    except ImportError:
+        _requests = None
+    if _requests is None:
+        print("  CDP 端口        : ⚠️ 缺少 requests，无法探测")
+    else:
+        try:
+            resp = _requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=5)
+            print(f"  CDP 端口        : ✅ {cdp_port} 可连（{resp.json().get('Browser', '未知')}）")
+        except (_requests.ConnectionError, _requests.Timeout):
+            print(f"  CDP 端口        : ❌ {cdp_port} 不可连（可跑 --setup-chrome 启动）")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  CDP 端口        : ⚠️ 响应异常: {e}")
+    try:
+        profile = prepare_cdp_profile(copy_login_state=False, reset=False)
+        print(f"  Chrome profile  : ✅ {os.path.normpath(profile['path'])}")
+    except Exception as e:  # 有意宽捕：状态命令不因探测失败而崩
+        print(f"  Chrome profile  : ⚠️ 探测失败: {e}")
+    max_conc, holders, risk = _read_scrape_lock()
+    if risk:
+        print(f"  互斥锁          : ⛔ 熔断挂起（上限 {max_conc}，持有 {len(holders)}）"
+              "——人工处理后 --reset-lock")
+    elif holders:
+        print(f"  互斥锁          : 🔒 被持有（上限 {max_conc}，"
+              f"持有 {len(holders)}: {', '.join(holders[:5])}）")
+    else:
+        print(f"  互斥锁          : 🔓 空闲（上限 {max_conc}）")
+    cooldown = check_cdp_cooldown()
+    recovery = check_cdp_recovery()
+    if cooldown is not None:
+        tail = f"（后接恢复期 {recovery:.0f}s）" if recovery > 0 else ""
+        print(f"  熔断冷却        : ⏳ 剩余约 {cooldown}s{tail}")
+    elif recovery > 0:
+        print(f"  熔断恢复期      : ⏳ 剩余约 {recovery:.0f}s（限速减半）")
+    else:
+        print("  熔断冷却        : 无")
+    print("  登录态          : 未探测（跑 --check 探测；会发一次请求）")
+
+    # ── 缓存态 ──
+    print(f"\n[缓存态] {result_dir}")
+    jobs = sorted(glob.glob(os.path.join(result_dir, "boss_jobs_*.json")))
+    details = sorted(glob.glob(os.path.join(result_dir, "boss_details_*.json")))
+    pending = sorted(glob.glob(os.path.join(result_dir, "*.pending.json")))
+    archive = glob.glob(os.path.join(result_dir, "archive", "*.json"))
+    if jobs:
+        latest = jobs[-1]
+        print(f"  列表文件        : {len(jobs)} 个｜最新 {os.path.basename(latest)}")
+        try:
+            with open(latest, "r", encoding="utf-8") as f:
+                m = json.load(f)
+            cov = m.get("jd_coverage") or {}
+            extra = (f" jd={cov.get('with_jd')}/{cov.get('total_before')}" if cov else "")
+            print(f"    └ keyword={m.get('keyword')} city={m.get('city')} "
+                  f"jobs={m.get('job_count')}{extra}")
+        except (OSError, json.JSONDecodeError, ValueError):
+            print("    └ （meta 读取失败）")
+    else:
+        print("  列表文件        : 0 个")
+    print(f"  详情文件        : {len(details)} 个"
+          + (f"｜最新 {os.path.basename(details[-1])}" if details else ""))
+    print(f"  pending 文件    : {len(pending)} 个")
+    print(f"  归档文件        : {len(archive)} 个（archive/）")
+    try:
+        total = sum(os.path.getsize(p) for p in jobs + details + pending)
+        print(f"  本目录占用      : {total / 1024 / 1024:.1f} MB")
+    except OSError:
+        pass
+
+    # ── 技能 / 入口 ──
+    print("\n[技能 / 入口]（文档为准，不在此复制）")
+    print(f"  项目            : {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
+    print("    说明: SKILL.md · AGENTS.md · README.md")
+    print("  工作区文档      : docs/projects/boss-zhipin-scraper/"
+          "（架构与链路地图 / 待办总表 / 任务记录）")
+    sha = _git_short_sha()
+    if sha:
+        print(f"  版本            : HEAD {sha}")
+    print()
+    return 0
+
+
 def run_check(cdp_port=DEFAULT_CDP_PORT):
     """运行环境诊断检查"""
     print("=" * 50)
@@ -4768,6 +4876,8 @@ def build_parser():
     # --setup-chrome 的辅助 flag（--no-wait-login/--login-timeout 等）不在组内，可正常组合。
     g_tool_excl = g_tool.add_mutually_exclusive_group()
     g_tool_excl.add_argument("--check", action="store_true", help="运行环境诊断检查")
+    g_tool_excl.add_argument("--status", action="store_true",
+                             help="状态总览（运行态+缓存态，接管用；不发 BOSS 请求）")
     g_tool_excl.add_argument("--verify", action="store_true",
                              help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
     g_tool_excl.add_argument("--list-results", action="store_true",
@@ -4842,6 +4952,10 @@ def run_cli():
     # --check 模式
     if args.check:
         sys.exit(run_check(args.cdp_port))
+
+    # --status 模式（状态总览：运行态 + 缓存态，接管用；不发 BOSS 请求）
+    if args.status:
+        sys.exit(run_status(args.cdp_port))
 
     # --verify 模式（只校验结果文件，不抓取、不依赖 Chrome）
     if args.verify:

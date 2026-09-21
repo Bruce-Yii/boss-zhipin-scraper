@@ -1092,6 +1092,41 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(result, (1, 0))
             self.assertTrue(os.path.exists(target))
 
+    def test_status_reports_runtime_and_cache(self):
+        """--status：离线汇总运行态 + 缓存态（无网络请求）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            rd = paths["cdp_profile"] / "job-result"
+            os.makedirs(rd, exist_ok=True)
+            module.flush_jobs(str(rd / "boss_jobs_x.json"),
+                              {"keyword": "AI", "city": "杭州"}, [
+                {"job_id": "a", "title": "A", "location": "杭州",
+                 "job_link": "https://x/a.html", "company_name": "C1"}])
+            with mock.patch.object(module, "requests", None), \
+                    mock.patch.object(module, "prepare_cdp_profile",
+                                      return_value={"path": str(paths["cdp_profile"])}), \
+                    mock.patch.object(module, "SCRAPE_LOCK_PATH",
+                                      str(paths["cdp_profile"] / "scrape.lock")), \
+                    mock.patch.object(module, "check_cdp_cooldown", return_value=None), \
+                    mock.patch.object(module, "check_cdp_recovery", return_value=0), \
+                    mock.patch("sys.stdout",
+                               new_callable=__import__("io").StringIO) as out:
+                code = module.run_status(cdp_port=45222, result_dir=str(rd))
+            printed = out.getvalue()
+            self.assertEqual(code, 0)
+            self.assertIn("[运行态]", printed)
+            self.assertIn("[缓存态]", printed)
+            self.assertIn("互斥锁", printed)
+            self.assertIn("列表文件        : 1 个", printed)
+            self.assertIn("keyword=AI city=杭州", printed)
+
+    def test_cli_accepts_status_flag(self):
+        """CLI 表面：--status 与 --check 互斥（动作型命令组）。"""
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT_PATH), "--status", "--check"],
+            capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(proc.returncode, 2, "互斥动作命令应 exit 2")
+
     def test_run_batch_integrity_check_passes_when_files_match(self):
         """batch 完成校验：任务数 = 新增文件数 → 通过。"""
         module = load_module()

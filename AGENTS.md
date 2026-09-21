@@ -2,8 +2,17 @@
 
 指引给未来的 ZCode agent。先读这份，再动代码。
 
-## 这是什么
+## 换窗口接管（无需复杂交接）
 
+状态分三类，**真相全在磁盘、可一条命令问清**：
+
+1. **技能**（怎么跑）：本文件 + `SKILL.md` + `README.md`；工作区文档 `docs/projects/boss-zhipin-scraper/`（架构与链路地图 / 待办总表 / 任务记录）
+2. **运行态**（此刻能不能跑）：`python scripts/boss_cdp_raw.py --status` → CDP 端口/Chrome profile/互斥锁/熔断冷却；登录态用 `--check` 探测
+3. **缓存态**（攒下的数据）：`~/.boss-zhipin-scraper/job-result/`（列表/详情/pending/archive），文件自带 meta（`format_version`/`mode`/`observed_jobs`/`exhausted`/`jd_coverage`）
+
+接管三步：`--status` 看全局 → `--check` 确认可跑 → `--list-results`/`--verify` 看数据是否完整。
+
+## 这是什么
 `boss-zhipin-scraper` —— 通过 Chrome CDP（远程调试端口）连接**用户本人已登录的 Chrome**，抓取 BOSS直聘的公开职位数据（列表 + 详情），并可生成求职分析摘要。仅用于个人求职分析，非大规模爬虫（见 `CONTRIBUTING.md` 的合规一节）。
 
 ## 目录结构
