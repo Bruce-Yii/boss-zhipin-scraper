@@ -165,7 +165,7 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
-| `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速） |
+| `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
