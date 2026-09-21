@@ -769,7 +769,8 @@ class ChromeSetupTests(unittest.TestCase):
         list_data = {"jobs": self._sample_jobs(12)["jobs"]}
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
-                    security_id=None, api_session=None, city_code=""):
+                    security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
             return {"ok": True, "detail": {"job_id": job["job_id"],
                                            "title": job["title"],
                                            "jd": "x" * 200},
@@ -1883,7 +1884,8 @@ class ChromeSetupTests(unittest.TestCase):
         lock, active, max_active = active_state
 
         def worker(job, cdp_port, stop_event=None, limiter=None,
-              security_id=None, api_session=None, city_code=""):
+              security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
             if stop_event is not None and stop_event.is_set():
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
                         "reason": "stopped", "message": ""}
@@ -1920,6 +1922,114 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertLessEqual(state[2][0], 2, "并发峰值不应超过 concurrency")
         self.assertEqual(state[2][0], 2, "5 个任务在 2 并发下应出现并发峰值 2")
         self.assertEqual(pending_out, {})
+
+    def test_parallel_api_channel_uses_shared_tab_pool(self):
+        """并发 API 通道：预建 concurrency 个共享 tab（每个只导航一次，用真实
+        关键词），worker 复用池会话（非每岗自建），结束时统一关闭。"""
+        module = load_module()
+        jobs = self._sample_jobs(6)["jobs"]
+        security_map = {j["job_id"]: f"sec-{i}" for i, j in enumerate(jobs)}
+        navigations, closed, created, seen_sessions = [], [], [], []
+        tids = iter(f"tid-{i}" for i in range(3))
+
+        def make_ws():
+            ws = mock.Mock()
+
+            def _send(method, params=None, sid=None):
+                if method == "Page.navigate":
+                    navigations.append(params.get("url", ""))
+                elif method == "Target.closeTarget":
+                    closed.append(params.get("targetId", ""))
+            ws.send.side_effect = _send
+            return ws
+
+        def fake_cdp_session(port=None):
+            ws = make_ws()
+            created.append(ws)
+            return ws
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            seen_sessions.append(api_session)
+            return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        with mock.patch.object(module, "CDPSession", side_effect=fake_cdp_session), \
+                mock.patch.object(module, "create_page_session",
+                                  side_effect=lambda ws: (next(tids), "sid")), \
+                mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, pending_out = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=3,
+                limiter=limiter_cls.return_value,
+                security_map=security_map, city_code="101010100", keyword="AI产品经理")
+        self.assertEqual(len(results), 6)
+        self.assertEqual(len(created), 3, "应只预建 concurrency 个共享会话（非每岗一个）")
+        self.assertEqual(len(navigations), 3, "每个共享会话只导航一次")
+        expected_nav = module.build_search_url("AI产品经理", "101010100", 1, {})
+        self.assertTrue(all(u == expected_nav for u in navigations),
+                        "停靠页应使用真实关键词而非岗位标题")
+        self.assertEqual(len(closed), 3, "结束后应关闭全部共享会话")
+        self.assertTrue(all(s is not None for s in seen_sessions), "worker 应复用池会话")
+        used = {id(s[0]) for s in seen_sessions}
+        self.assertEqual(used, {id(w) for w in created}, "使用的会话应全部来自池")
+
+    def test_parallel_api_channel_paces_detail_requests(self):
+        """并发 API 通道：自建限速器基线应为 concurrency/PACE（每 worker 至少
+        PACE 秒），而非 DOM 路径的 concurrency*0.5/秒——防止详情接口被过快请求。"""
+        module = load_module()
+        jobs = self._sample_jobs(2)["jobs"]
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        with mock.patch.object(module, "CDPSession", return_value=mock.Mock()), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "check_cdp_recovery", return_value=0), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2,
+                security_map={j["job_id"]: "sec" for j in jobs},
+                city_code="101010100", keyword="AI产品经理")
+        api_base = limiter_cls.call_args.kwargs.get("base_rate")
+        self.assertAlmostEqual(
+            api_base, 2 / module.DETAIL_API_PACE_SECONDS,
+            msg="API 通道基线应为 concurrency/PACE（每 worker 至少 PACE 秒）")
+
+    def test_parallel_dom_path_keeps_permissive_baseline(self):
+        """DOM 路径（无 security_map）：保持旧基线 concurrency*0.5/秒
+        （单条渲染 20-30s 天然限速，令牌桶仅弱错峰）。"""
+        module = load_module()
+        jobs = self._sample_jobs(2)["jobs"]
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        with mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "check_cdp_recovery", return_value=0), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2)
+        dom_base = limiter_cls.call_args.kwargs.get("base_rate")
+        self.assertAlmostEqual(dom_base, 1.0, msg="DOM 路径基线保持 concurrency*0.5")
 
     def test_parallel_records_failed_jobs_to_pending(self):
         module = load_module()
@@ -1965,7 +2075,8 @@ class ChromeSetupTests(unittest.TestCase):
         jobs = self._sample_jobs(6)["jobs"]
 
         def always_fail(job, cdp_port, stop_event=None, limiter=None,
-                     security_id=None, api_session=None, city_code=""):
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "cdp_session", "message": "boom"}
 
@@ -1992,7 +2103,8 @@ class ChromeSetupTests(unittest.TestCase):
         calls = []
 
         def always_fail(job, cdp_port, stop_event=None, limiter=None,
-                     security_id=None, api_session=None, city_code=""):
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "cdp_session", "message": "boom"}
@@ -3757,7 +3869,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
         calls = []
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
-                    security_id=None, api_session=None, city_code=""):
+                    security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}
@@ -3797,7 +3910,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
         calls = []
 
         def fake_worker(job, cdp_port, stop_event=None, limiter=None, verbose=False,
-                     security_id=None, api_session=None, city_code=""):
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}

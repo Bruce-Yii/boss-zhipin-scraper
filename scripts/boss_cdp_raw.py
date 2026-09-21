@@ -39,6 +39,7 @@ import signal
 import logging
 import ntpath
 import threading
+import queue
 import uuid
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from dataclasses import dataclass
@@ -71,6 +72,9 @@ MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览�
 CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重开（防"熔断→重启→再熔断"循环）
 CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
+DETAIL_API_PACE_SECONDS = 15.0  # 详情 API 通道每 worker 最小间隔（秒）：API 单次约 1s，
+                                # 无渲染等待，限速器是唯一刹车 → 并发 N 时全局基线 N/15 次/秒
+                                # （避免旧公式 concurrency*0.5/秒 对详情接口过快触发风控）
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 FORMAT_VERSION = 2              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；v2 = B 增量扩展 mode/observed_jobs/exhausted，docs/25 §3，规格侧 T2 落档 5278260355）
@@ -3200,7 +3204,7 @@ class AdaptiveRateLimiter:
 
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                        limiter=None, verbose=False, security_id=None,
-                       api_session=None, city_code=""):
+                       api_session=None, city_code="", search_keyword=""):
     """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
 
     Args:
@@ -3214,6 +3218,7 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         api_session: 可选 (CDPSession, target_id, session_id) 共享会话——
             详情 API 通道复用一个停靠在 zhipin 域的 tab，避免每岗导航
         city_code: 城市码（详情 API 参数）
+        search_keyword: 本次抓取关键词（详情 API 通道自建 tab 时的停靠页参数）
 
     Returns:
         dict: {"ok": bool, "detail": dict|None, "job_id": str,
@@ -3231,7 +3236,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         return _scrape_one_detail_via_api(
             job, cdp_port, stop_event=stop_event, limiter=limiter,
             verbose=verbose, security_id=security_id,
-            api_session=api_session, city_code=city_code)
+            api_session=api_session, city_code=city_code,
+            search_keyword=search_keyword)
 
     ws = None
     tid = None
@@ -3311,12 +3317,13 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
 
 def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
                                verbose=False, security_id="", api_session=None,
-                               city_code=""):
+                               city_code="", search_keyword=""):
     """详情 API 通道：1 次轻量 XHR 取完整 JD（替代详情页整页渲染）。
 
     复用 api_session（共享停靠 tab，避免每岗导航）；无 api_session 时自建
-    tab 并导航搜索页（一次）。失败分类：风控码 → risk_timeout（上层全停）、
-    内容过短/结构异常 → invalid_detail（不进 pending）、网络 → cdp_session。
+    tab 并导航搜索页（一次，用真实关键词而非岗位标题——避免误导性额外搜索）。
+    失败分类：风控码 → risk_timeout（上层全停）、内容过短/结构异常 →
+    invalid_detail（不进 pending）、网络 → cdp_session。
     """
     job_id = job.get("job_id", "")
     shared = api_session is not None
@@ -3329,9 +3336,11 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
         else:
             ws = CDPSession(cdp_port)
             tid, sid = create_page_session(ws)
-            # 停靠轻量 zhipin 页面（搜索页），fetch 需要 zhipin 域 + 会话 cookie
+            # 停靠 zhipin 域页面（搜索页），fetch 需要同域 + 会话 cookie；
+            # 用真实关键词而非岗位标题（岗位标题会导致每次都是一次无关搜索，
+            # 既浪费也增加风控暴露——2026-09-22 审计修复）
             ws.send("Page.navigate", {"url": build_search_url(
-                job.get("title", "") or "", city_code or "", 1, {})}, sid)
+                search_keyword or "", city_code or "", 1, {})}, sid)
             time.sleep(random.uniform(4, 8))
 
         if limiter is not None:
@@ -3497,7 +3506,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
         result = _scrape_one_detail(job, cdp_port, verbose=True,
                                     security_id=(security_map or {}).get(job_id),
                                     api_session=api_session,
-                                    city_code=list_data.get("city_code", "") or "")
+                                    city_code=list_data.get("city_code", "") or "",
+                                    search_keyword=list_data.get("keyword", "") or "")
         reason = result["reason"]
 
         if result["ok"]:
@@ -3621,10 +3631,19 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
     existing_ids = existing_ids if existing_ids is not None else set()
     pending = dict(pending_ids) if pending_ids is not None else {}
     if limiter is None:
-        # 默认全局限速：令牌桶仅提供弱错峰（容量=并发，错开同时导航的瞬时
-        # 突发）；实际请求间隔主要由每条详情固有的加载/滚动等待（约 20-30s）
-        # 决定。失败率升高时由 AdaptiveRateLimiter 降半/暂停兜底。
-        limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
+        if security_map:
+            # 详情 API 通道：单次请求约 1s（无整页渲染等待），限速器是唯一刹车。
+            # 按"每 worker 至少 DETAIL_API_PACE_SECONDS 间隔"设基线
+            # （并发 N → 全局约 N/PACE 次/秒），与串行 10-25s 间隔同量级；
+            # 旧公式 concurrency*0.5/秒 是为 DOM 渲染路径设计的（其加载/滚动
+            # 20-30s 天然限速），对 API 通道过快（2026-09-22 审计修复）。
+            base_rate = max(concurrency / DETAIL_API_PACE_SECONDS, 0.07)
+        else:
+            # DOM 路径：单条加载/滚动 20-30s 天然限速，令牌桶仅提供弱错峰
+            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时由
+            # AdaptiveRateLimiter 降半/暂停兜底。
+            base_rate = max(concurrency * 0.5, 0.5)
+        limiter = AdaptiveRateLimiter(base_rate=base_rate)
         # 熔断恢复期：冷却结束后渐变恢复，恢复期内限速减半（不跳回全速）
         recovery = check_cdp_recovery()
         if recovery > 0:
@@ -3687,6 +3706,27 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             if output_path:
                 save_pending_ids(output_path, pending)
 
+    # 详情 API 通道并发：预建共享 tab 池（每 worker 一个停靠 tab，只导航一次）。
+    # 修复点（2026-09-22 审计）：此前并发模式每岗自建 tab 且用岗位标题导航
+    # 搜索页——既慢又制造大量无关搜索请求（风控暴露）。池化后每格仅 concurrency
+    # 次导航，其余全部为轻量 XHR。
+    api_pool = None
+    api_sessions = []
+    if security_map:
+        api_pool = queue.Queue()
+        nav_url = build_search_url(keyword, city_code, 1, {})
+        for idx in range(concurrency):
+            try:
+                ws = CDPSession(cdp_port)
+                tid, sid = create_page_session(ws)
+                ws.send("Page.navigate", {"url": nav_url}, sid)
+                time.sleep(random.uniform(4, 8))  # 等页面就绪（顺序错峰，避免同时打搜索页）
+                api_sessions.append((ws, tid, sid))
+                api_pool.put((ws, tid, sid))
+                print(f"  ℹ️ 详情 API 共享会话 {len(api_sessions)}/{concurrency} 就绪")
+            except _cdp_exception_types():
+                log.warning("详情 API 共享会话建立失败（该槽位将按需自建）", exc_info=True)
+
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
         # 每完成一个补提交一个；停止信号（熔断/登录墙）后不再补提交。
@@ -3697,10 +3737,18 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         in_flight = set()
 
         def run_one(job):
-            return job, _scrape_one_detail(
-                job, cdp_port, stop_event, limiter,
-                security_id=(security_map or {}).get(job.get("job_id", "")),
-                city_code=city_code)
+            job_id = job.get("job_id", "")
+            session = api_pool.get() if api_pool is not None else None
+            try:
+                return job, _scrape_one_detail(
+                    job, cdp_port, stop_event, limiter,
+                    security_id=(security_map or {}).get(job_id),
+                    api_session=session,
+                    city_code=city_code,
+                    search_keyword=keyword)
+            finally:
+                if api_pool is not None and session is not None:
+                    api_pool.put(session)  # 归还池（下次任务复用同一 tab）
 
         def fill_window():
             while len(in_flight) < window:
@@ -3745,6 +3793,13 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         if completed:
             print(run_summary(time.time() - start_time,
                               completed, parallel_ok, parallel_reasons))
+    # 关闭详情 API 共享会话池（复用 tab 释放）
+    for ws, tid, _sid in api_sessions:
+        try:
+            ws.send("Target.closeTarget", {"targetId": tid})
+            ws.close()
+        except _cdp_exception_types():
+            log.debug("关闭详情 API 共享会话失败", exc_info=True)
     if output_path:
         persist()
     return results, pending
