@@ -2731,6 +2731,7 @@ def load_batch_config(path):
 
     每个任务支持字段：keyword(必填)、city(默认上海)、pages(默认 3，
     自动限制在 1..MAX_PAGES)、sleep(任务间等待秒数，缺省随机 30-60)、
+    detail(可选布尔，覆盖全局"默认抓完整"设置；false = 仅列表)、
     scale/stage/salary/experience/degree/industry（筛选）。非法任务
     跳过并记录错误，不中断其余任务。
 
@@ -2773,6 +2774,8 @@ def load_batch_config(path):
                 task["sleep"] = max(float(item["sleep"]), 0)
             except (TypeError, ValueError):
                 errors.append(f"任务 {i + 1}: sleep 必须是数字，已忽略该字段")
+        if item.get("detail") is not None:
+            task["detail"] = bool(item["detail"])
         for key in FILTER_KEYS:
             if item.get(key):
                 task[key] = item[key]
@@ -2780,8 +2783,35 @@ def load_batch_config(path):
     return tasks, errors
 
 
-def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
-    """逐任务执行批量列表抓取；任务间按 sleep（缺省随机 30-60s）防风控。
+def _detail_path_for_list(list_path):
+    """由列表文件路径推导详情文件路径（同名 boss_details_*）；无法推导返回 None。"""
+    if not list_path:
+        return None
+    base = os.path.basename(list_path)
+    if not base.startswith("boss_jobs_"):
+        return None
+    return os.path.join(os.path.dirname(list_path),
+                        "boss_details_" + base[len("boss_jobs_"):])
+
+
+def _list_has_detail_risk(list_path):
+    """列表文件 warnings 是否含详情风控降级标记（detail_risk_blocked）。"""
+    try:
+        with open(list_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return any("detail_risk_blocked" in str(w)
+                   for w in (meta.get("warnings") or []))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return False
+
+
+def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
+              detail=True, detail_concurrency=1):
+    """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
+
+    与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
+    securityId 由列表阶段内存传递）。命中详情风控（验证码/风控码）时全停并
+    提前结束批量（不硬闯、不重试风暴），等人工处理后重跑（断点续抓自动补齐）。
 
     支持 --max-concurrent 透传：多个 batch 进程并行时锁允许多个持有者
     （如 2 个 batch 各跑一半任务 + max_concurrent=2 即并发 2）。
@@ -2791,7 +2821,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
     （并发/撞名/写盘异常时立即暴露，不必等人工数文件）。
 
     Returns:
-        int: 退出码（0 全成功 / 1 有任务失败或配置错误）
+        int: 退出码（0 全成功 / 1 有任务失败、配置错误或详情风控命中提前结束）
     """
     tasks, errors = load_batch_config(config_path)
     for err in errors:
@@ -2814,7 +2844,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
         print(f"\n[{i + 1}/{len(tasks)}] {task['keyword']} @ {task['city']} "
               f"（{task['pages']} 页）")
         try:
-            scrape_list(
+            list_data = scrape_list(
                 task["keyword"], task["city"], task["pages"], filters, None,
                 cdp_port=cdp_port, max_jobs=None,
                 max_concurrent=max_concurrent,
@@ -2822,6 +2852,32 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1):
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
             print(f"  ❌ 任务失败: {e}")
+            list_data = None
+
+        # 默认抓完整：列表抓完即接详情（详情 API 通道；--no-detail/任务级
+        # detail=false 时跳过）；风控命中则全停并提前结束批量
+        task_detail = task.get("detail", detail)
+        has_jobs = (isinstance(list_data, dict)
+                    and isinstance(list_data.get("jobs"), list)
+                    and list_data["jobs"])
+        if task_detail and has_jobs:
+            raw_path = list_data.get("output_path")
+            list_path = raw_path if isinstance(raw_path, str) else ""
+            try:
+                scrape_details(
+                    list_data, output_path=_detail_path_for_list(list_path),
+                    cdp_port=cdp_port, concurrency=detail_concurrency,
+                    list_output_path=list_path or None,
+                    security_map=list_data.get("security_map"),
+                )
+            except Exception as e:  # 有意宽捕：详情失败不中断批量其余任务
+                failed += 1
+                print(f"  ❌ 详情抓取失败: {e}")
+            if list_path and _list_has_detail_risk(list_path):
+                print("\n⚠️ 详情风控命中（已全停），批量任务提前结束；"
+                      "请人工处理后重跑（断点续抓自动补齐）。")
+                return 1
+
         if i < len(tasks) - 1:
             gap = task.get("sleep") or random.uniform(30, 60)
             print(f"任务间等待 {gap:.0f}s 防风控...")
@@ -4574,8 +4630,9 @@ def build_parser():
     g_tool_excl.add_argument("--list-results", action="store_true",
                              help="列出结果目录中的历史抓取结果文件")
     g_tool_excl.add_argument("--batch", default=None, metavar="CONFIG.json",
-                             help="批量列表抓取：从配置文件（JSON 数组，每个元素一个任务："
-                                  "keyword/city/pages/sleep/筛选字段）逐任务执行，任务间自动等待防风控")
+                             help="批量抓取（默认列表+详情）：从配置文件（JSON 数组，每个元素一个任务："
+                                  "keyword/city/pages/sleep/detail/筛选字段）逐任务执行，任务间自动等待防风控；"
+                                  "--no-detail 或任务级 detail=false 可仅列表")
     g_tool_excl.add_argument("--archive", nargs="?", const="1", default=None,
                              metavar="KEEP",
                              help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
@@ -4667,12 +4724,13 @@ def run_cli():
             p.error(f"--archive 参数必须是正整数: {args.archive}")
         sys.exit(run_archive(keep_latest=keep))
 
-    # --batch 模式（批量列表抓取）
+    # --batch 模式（批量抓取；默认列表 + 详情，--no-detail 可仅列表）
     if args.batch:
         if not require_runtime_dependencies("requests", "websocket"):
             sys.exit(1)
         sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
-                           max_concurrent=args.max_concurrent))
+                           max_concurrent=args.max_concurrent,
+                           detail=args.detail, detail_concurrency=args.concurrency))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))

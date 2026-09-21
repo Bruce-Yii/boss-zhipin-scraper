@@ -957,6 +957,85 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(calls[0][1]["max_concurrent"], 2,
                              "batch 任务应透传 max_concurrent")
 
+    def test_run_batch_fetches_details_by_default(self):
+        """--batch 默认抓完整：列表后接详情，透传 security_map 与推导的详情路径。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 1}])
+            list_result = {
+                "keyword": "AI", "city": "上海",
+                "jobs": [{"job_id": "j1", "job_link": "https://x"}],
+                "output_path": str(paths["cdp_profile"] / "boss_jobs_20260101_000000_1.json"),
+                "security_map": {"j1": "sec-1"},
+            }
+            detail_calls = []
+            with mock.patch.object(module, "scrape_list", return_value=list_result), \
+                    mock.patch.object(module, "scrape_details",
+                                      side_effect=lambda *a, **k: detail_calls.append((a, k))), \
+                    mock.patch.object(module, "_list_has_detail_risk", return_value=False), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city",
+                                      side_effect=lambda city: (city, "101020100")), \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[["old.json"],
+                                                   ["old.json", "boss_jobs_new1.json"]]):
+                code = module.run_batch(path)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(detail_calls), 1, "默认应抓详情")
+            _, kwargs = detail_calls[0]
+            self.assertEqual(kwargs["security_map"], {"j1": "sec-1"},
+                             "详情应复用列表阶段 security_map（内存传递）")
+            self.assertTrue(kwargs["output_path"].endswith(
+                "boss_details_20260101_000000_1.json"), "详情路径应由列表文件推导")
+            self.assertTrue(kwargs["list_output_path"].endswith("boss_jobs_20260101_000000_1.json"))
+
+    def test_run_batch_no_detail_skips_details(self):
+        """--batch --no-detail（detail=False）：仅列表，不触发详情。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 1}])
+            list_result = {"keyword": "AI", "city": "上海",
+                           "jobs": [{"job_id": "j1", "job_link": "https://x"}],
+                           "output_path": "", "security_map": {"j1": "s"}}
+            with mock.patch.object(module, "scrape_list", return_value=list_result), \
+                    mock.patch.object(module, "scrape_details") as sd, \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city",
+                                      side_effect=lambda city: (city, "101020100")), \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[["old.json"],
+                                                   ["old.json", "boss_jobs_new1.json"]]):
+                code = module.run_batch(path, detail=False)
+            self.assertEqual(code, 0)
+            sd.assert_not_called()
+
+    def test_run_batch_task_level_detail_override(self):
+        """任务级 detail=false 可覆盖全局默认（仅该任务跳过详情）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            path = self._write_batch(paths, [
+                {"keyword": "AI", "city": "上海", "pages": 1, "detail": False},
+                {"keyword": "Java", "city": "上海", "pages": 1}])
+            base = {"jobs": [{"job_id": "j1", "job_link": "https://x"}],
+                    "output_path": "", "security_map": {"j1": "s"}}
+            calls = []
+            with mock.patch.object(module, "scrape_list", return_value=dict(base)), \
+                    mock.patch.object(module, "scrape_details",
+                                      side_effect=lambda *a, **k: calls.append(a)), \
+                    mock.patch.object(module, "_list_has_detail_risk", return_value=False), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city",
+                                      side_effect=lambda city: (city, "101020100")), \
+                    mock.patch.object(module.os, "listdir",
+                                      side_effect=[["old.json"],
+                                                   ["old.json", "boss_jobs_a.json",
+                                                    "boss_jobs_b.json"]]):
+                code = module.run_batch(path)
+            self.assertEqual(code, 0)
+            self.assertEqual(len(calls), 1, "仅第二个任务抓详情")
+
     def test_run_batch_integrity_check_passes_when_files_match(self):
         """batch 完成校验：任务数 = 新增文件数 → 通过。"""
         module = load_module()
