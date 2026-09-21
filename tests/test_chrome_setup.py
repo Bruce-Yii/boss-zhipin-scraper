@@ -2110,6 +2110,87 @@ class ChromeSetupTests(unittest.TestCase):
         dom_base = limiter_cls.call_args.kwargs.get("base_rate")
         self.assertAlmostEqual(dom_base, 1.0, msg="DOM 路径基线保持 concurrency*0.5")
 
+    def test_parallel_api_channel_rotates_tab_on_budget(self):
+        """预算轮换：同一 tab 达 DETAIL_API_TAB_BUDGET 次后自动换新 tab（支撑批量）。"""
+        module = load_module()
+        jobs = self._sample_jobs(9)["jobs"]  # 预算 4 → 4+4+1 = 3 个 tab
+        tids = iter(f"tid-{i}" for i in range(10))
+        created, navigations = [], []
+
+        def fake_cdp(port=None):
+            ws = mock.Mock()
+
+            def _send(method, params=None, sid=None):
+                if method == "Page.navigate":
+                    navigations.append(params.get("url", ""))
+            ws.send.side_effect = _send
+            created.append(ws)
+            return ws
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        with mock.patch.object(module, "CDPSession", side_effect=fake_cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  side_effect=lambda ws: (next(tids), "s")), \
+                mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, _ = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=1,
+                limiter=limiter_cls.return_value,
+                security_map={j["job_id"]: "sec" for j in jobs},
+                city_code="101010100", keyword="AI产品经理")
+        self.assertEqual(len(results), 9)
+        self.assertEqual(len(created), 3,
+                         "9 条 / 预算 4 → 应轮换出 3 个 tab（初始 + 2 次轮换）")
+        self.assertEqual(len(navigations), 3, "每个 tab 只导航一次")
+
+    def test_parallel_api_channel_retries_after_risk_by_rotating_tab(self):
+        """风控码疑似配额耗尽：换 tab 重试一次，成功则继续（不误判全停）。"""
+        module = load_module()
+        jobs = self._sample_jobs(2)["jobs"]
+        tids = iter(f"tid-{i}" for i in range(6))
+        created, calls = [], {"n": 0}
+
+        def fake_cdp(port=None):
+            ws = mock.Mock()
+            created.append(ws)
+            return ws
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": False, "detail": None, "job_id": job["job_id"],
+                        "reason": "risk_timeout", "message": "详情 API 风控码: code=37"}
+            return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        with mock.patch.object(module, "CDPSession", side_effect=fake_cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  side_effect=lambda ws: (next(tids), "s")), \
+                mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "_note_detail_risk_blocked") as risk_note, \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            results, _ = module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=1,
+                limiter=limiter_cls.return_value,
+                security_map={j["job_id"]: "sec" for j in jobs},
+                city_code="101010100", keyword="AI产品经理")
+        self.assertEqual(len(results), 2, "换 tab 重试后两条都应成功（不应全停）")
+        self.assertGreaterEqual(len(created), 2, "应发生一次 tab 轮换")
+        risk_note.assert_not_called()
+
     def test_parallel_records_failed_jobs_to_pending(self):
         module = load_module()
         jobs = self._sample_jobs(4)["jobs"]

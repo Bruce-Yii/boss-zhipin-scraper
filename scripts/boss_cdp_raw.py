@@ -75,6 +75,8 @@ DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保�
 DETAIL_API_PACE_SECONDS = 15.0  # 详情 API 通道每 worker 最小间隔（秒）：API 单次约 1s，
                                 # 无渲染等待，限速器是唯一刹车 → 并发 N 时全局基线 N/15 次/秒
                                 # （避免旧公式 concurrency*0.5/秒 对详情接口过快触发风控）
+DETAIL_API_TAB_BUDGET = 4       # 详情 API 每 tab 预算：实测同一 tab 连续约 4-5 次后返回
+                                # code 37，换新 tab 立即重置（2026-09-22 实证）→ 主动轮换支撑批量
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 FORMAT_VERSION = 2              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；v2 = B 增量扩展 mode/observed_jobs/exhausted，docs/25 §3，规格侧 T2 落档 5278260355）
@@ -789,6 +791,47 @@ def build_detail_api_url(job, security_id, city_code=""):
         "city": str(city_code or ""),
     }
     return f"{DETAIL_API_PATH}?{urlencode(params)}"
+
+
+def _open_api_tab(cdp_port, keyword, city_code):
+    """开一个停靠在 zhipin 域搜索页的 tab（详情 API 通道用）。
+
+    返回**可变会话列表** ``[ws, target_id, session_id, hits]``（第 4 位记录本 tab
+    已成功详情数，用于按 ``DETAIL_API_TAB_BUDGET`` 主动轮换）。
+    """
+    ws = CDPSession(cdp_port)
+    tid, sid = create_page_session(ws)
+    ws.send("Page.navigate",
+            {"url": build_search_url(keyword or "", city_code or "", 1, {})}, sid)
+    time.sleep(random.uniform(4, 8))
+    return [ws, tid, sid, 0]
+
+
+def _close_api_tab(session):
+    """关闭详情 API tab（无 session 时静默返回）。"""
+    if not session:
+        return
+    try:
+        session[0].send("Target.closeTarget", {"targetId": session[1]})
+        session[0].close()
+    except _cdp_exception_types():
+        log.debug("关闭详情 API 会话失败", exc_info=True)
+
+
+def _rotate_api_tab(session, cdp_port, keyword, city_code):
+    """轮换详情 API tab：关旧开新并**原地**更新 session（hits 归零）。
+
+    实测同一 tab 连续约 4-5 次详情后 code 37，换 tab 立即重置；轮换用于
+    批量抓取与"风控码疑似配额耗尽"时的重试。返回是否轮换成功。
+    """
+    _close_api_tab(session)
+    try:
+        fresh = _open_api_tab(cdp_port, keyword, city_code)
+    except _cdp_exception_types():
+        log.warning("轮换详情 API tab 失败", exc_info=True)
+        return False
+    session[0], session[1], session[2], session[3] = fresh
+    return True
 
 
 def _parse_detail_api_value(val, job):
@@ -3388,7 +3431,7 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
     sid = None
     try:
         if shared:
-            ws, tid, sid = api_session
+            ws, tid, sid = api_session[0], api_session[1], api_session[2]
         else:
             ws = CDPSession(cdp_port)
             tid, sid = create_page_session(ws)
@@ -3519,18 +3562,15 @@ def scrape_details(list_data, max_details=None, output_path=None,
     serial_reasons = {}
     start_time = time.time()
 
-    # 详情 API 通道（串行）：复用 1 个停靠 zhipin 域的共享 tab（只导航一次，
-    # 120 条详情 = 120 次轻量 XHR，避免每岗整页渲染）
+    # 详情 API 通道（串行）：停靠 zhipin 域 tab，按 DETAIL_API_TAB_BUDGET 主动
+    # 轮换（实测同一 tab 连续约 4-5 次详情后 code 37，换 tab 立即重置），
+    # 从而支撑批量抓取（余下均为轻量 XHR，避免整页渲染）
     api_session = None
+    detail_keyword = list_data.get("keyword", "") or ""
+    detail_city_code = list_data.get("city_code", "") or ""
     if security_map:
         try:
-            api_ws = CDPSession(cdp_port)
-            api_tid, api_sid = create_page_session(api_ws)
-            api_ws.send("Page.navigate", {"url": build_search_url(
-                list_data.get("keyword", ""), list_data.get("city_code", "") or "",
-                1, {})}, api_sid)
-            time.sleep(random.uniform(4, 8))
-            api_session = (api_ws, api_tid, api_sid)
+            api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
         except _cdp_exception_types():
             log.warning("详情 API 共享会话建立失败，回退逐岗自建会话", exc_info=True)
             api_session = None
@@ -3559,11 +3599,32 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
         incr_request("detail")
 
+        # 预算轮换：同一 tab 连续详情达预算即换新 tab（否则下一次必 code 37）
+        job_security = (security_map or {}).get(job_id)
+        if api_session is not None and api_session[3] >= DETAIL_API_TAB_BUDGET:
+            if _rotate_api_tab(api_session, cdp_port, detail_keyword, detail_city_code):
+                print(f"  ♻️ 详情 API 轮换新 tab（每 tab 预算 {DETAIL_API_TAB_BUDGET} 次）")
+            else:
+                api_session = None
+
         result = _scrape_one_detail(job, cdp_port, verbose=True,
-                                    security_id=(security_map or {}).get(job_id),
+                                    security_id=job_security,
                                     api_session=api_session,
-                                    city_code=list_data.get("city_code", "") or "",
-                                    search_keyword=list_data.get("keyword", "") or "")
+                                    city_code=detail_city_code,
+                                    search_keyword=detail_keyword)
+        # 风控码可能是"本 tab 配额耗尽"：换 tab 重试一次；仍失败才判定真风控（全停）
+        if (result["reason"] == "risk_timeout" and job_security
+                and api_session is not None):
+            incr_request("detail")
+            if _rotate_api_tab(api_session, cdp_port, detail_keyword, detail_city_code):
+                print("  ♻️ 命中风控码，换 tab 重试该岗位一次...")
+                result = _scrape_one_detail(job, cdp_port, verbose=True,
+                                            security_id=job_security,
+                                            api_session=api_session,
+                                            city_code=detail_city_code,
+                                            search_keyword=detail_keyword)
+        if result["ok"] and api_session is not None:
+            api_session[3] += 1
         reason = result["reason"]
 
         if result["ok"]:
@@ -3634,13 +3695,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         time.sleep(gap)
 
     # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
-    if api_session is not None:
-        try:
-            api_ws, api_tid, _ = api_session
-            api_ws.send("Target.closeTarget", {"targetId": api_tid})
-            api_ws.close()
-        except _cdp_exception_types():
-            log.debug("关闭详情 API 共享会话失败", exc_info=True)
+    _close_api_tab(api_session)
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
     _atomic_write_json(output_path, results)
@@ -3770,15 +3825,11 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
     api_sessions = []
     if security_map:
         api_pool = queue.Queue()
-        nav_url = build_search_url(keyword, city_code, 1, {})
         for idx in range(concurrency):
             try:
-                ws = CDPSession(cdp_port)
-                tid, sid = create_page_session(ws)
-                ws.send("Page.navigate", {"url": nav_url}, sid)
-                time.sleep(random.uniform(4, 8))  # 等页面就绪（顺序错峰，避免同时打搜索页）
-                api_sessions.append((ws, tid, sid))
-                api_pool.put((ws, tid, sid))
+                sess = _open_api_tab(cdp_port, keyword, city_code)  # 顺序错峰，避免同时打搜索页
+                api_sessions.append(sess)
+                api_pool.put(sess)
                 print(f"  ℹ️ 详情 API 共享会话 {len(api_sessions)}/{concurrency} 就绪")
             except _cdp_exception_types():
                 log.warning("详情 API 共享会话建立失败（该槽位将按需自建）", exc_info=True)
@@ -3794,17 +3845,30 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
 
         def run_one(job):
             job_id = job.get("job_id", "")
+            job_security = (security_map or {}).get(job_id)
             session = api_pool.get() if api_pool is not None else None
             try:
-                return job, _scrape_one_detail(
+                # 预算轮换：该 tab 详情数达预算即换新 tab（否则下次必 code 37）
+                if session is not None and session[3] >= DETAIL_API_TAB_BUDGET:
+                    _rotate_api_tab(session, cdp_port, keyword, city_code)
+                result = _scrape_one_detail(
                     job, cdp_port, stop_event, limiter,
-                    security_id=(security_map or {}).get(job_id),
-                    api_session=session,
-                    city_code=city_code,
-                    search_keyword=keyword)
+                    security_id=job_security, api_session=session,
+                    city_code=city_code, search_keyword=keyword)
+                # 风控码疑似"配额耗尽"：换 tab 重试一次；仍失败才判定真风控
+                if (result["reason"] == "risk_timeout" and job_security
+                        and session is not None):
+                    if _rotate_api_tab(session, cdp_port, keyword, city_code):
+                        result = _scrape_one_detail(
+                            job, cdp_port, stop_event, limiter,
+                            security_id=job_security, api_session=session,
+                            city_code=city_code, search_keyword=keyword)
+                if result["ok"] and session is not None:
+                    session[3] += 1
+                return job, result
             finally:
                 if api_pool is not None and session is not None:
-                    api_pool.put(session)  # 归还池（下次任务复用同一 tab）
+                    api_pool.put(session)  # 归还池（下次任务复用/轮换后的 tab）
 
         def fill_window():
             while len(in_flight) < window:
@@ -3850,12 +3914,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             print(run_summary(time.time() - start_time,
                               completed, parallel_ok, parallel_reasons))
     # 关闭详情 API 共享会话池（复用 tab 释放）
-    for ws, tid, _sid in api_sessions:
-        try:
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-        except _cdp_exception_types():
-            log.debug("关闭详情 API 共享会话失败", exc_info=True)
+    for sess in api_sessions:
+        _close_api_tab(sess)
     if output_path:
         persist()
     return results, pending
