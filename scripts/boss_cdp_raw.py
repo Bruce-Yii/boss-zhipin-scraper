@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 import json
 import math
@@ -1579,7 +1579,8 @@ _SENSITIVE_KEYS = ("cookie", "token", "wt2", "zp_stoken", "zp_token",
                    "password", "account", "auth", "secret")
 # 日志/错误输出脱敏：key=value 形态的凭据值替换为 ***（凭证不进日志/异常/stderr）
 _SECRET_KEY_PATTERN = re.compile(
-    r"(__zp_stoken__|wt2|zp_token|zp_stoken|cookie|token|password|secret)"
+    r"(__zp_stoken__|wt2|zp_token|zp_stoken|cookie|token|password|secret"
+    r"|securityid|security_id)"
     r"=([^&\s\"'<>]+)",
     re.IGNORECASE,
 )
@@ -3304,16 +3305,17 @@ class TokenBucket:
             self._last_refill = now
 
     def acquire(self):
-        with self._lock:
-            self._refill(time.monotonic())
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return
-            deficit = (1.0 - self._tokens) / self.rate
-        time.sleep(deficit)
-        with self._lock:
-            self._last_refill = time.monotonic()
-            self._tokens = max(0.0, self._tokens - 1.0)
+        # 循环取令牌：仅在锁内判定/扣减，锁外睡眠等待补充后**重新复核**。
+        # 修复（2026-09-22 审计）：原实现锁外 sleep 后不再复核令牌，
+        # 并发下 N 个线程会同sleep 同一时长、醒来各自扣减 → 突发超速。
+        while True:
+            with self._lock:
+                self._refill(time.monotonic())
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                deficit = (1.0 - self._tokens) / self.rate
+            time.sleep(deficit)
 
 
 class AdaptiveRateLimiter:
@@ -3337,6 +3339,7 @@ class AdaptiveRateLimiter:
         self._window_failures = 0
         self._bucket = TokenBucket(base_rate, self.capacity)
         self._lock = threading.Lock()
+        self._pause_lock = threading.Lock()  # 保证"连续坏窗口暂停"只由单线程执行一次
 
     def current_rate(self):
         """当前生效速率（降半后的值）。"""
@@ -3375,11 +3378,21 @@ class AdaptiveRateLimiter:
 
     def acquire(self):
         """申请一个请求配额；连续坏窗口时先暂停，再走令牌桶。"""
-        if self._consecutive_bad >= 2:
-            time.sleep(self.pause_seconds)
-            self._consecutive_bad = 0
+        self._pause_if_needed()
         self._bucket.rate = self.current_rate()
         self._bucket.acquire()
+
+    def _pause_if_needed(self):
+        """连续坏窗口触发一次全局暂停（单飞）。
+
+        修复（2026-09-22 审计）：原实现每个线程各自 sleep(pause_seconds)，
+        并发下形成"N 个线程同时长睡"的暂停风暴；改用独立锁保证只暂停一次，
+        其余线程等待该暂停结束后继续（读 _consecutive_bad 的竞态可容忍）。
+        """
+        with self._pause_lock:
+            if self._consecutive_bad >= 2:
+                time.sleep(self.pause_seconds)
+                self._consecutive_bad = 0
 
 
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
@@ -3628,7 +3641,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             list_output_path=list_output_path,
             keyword=list_data.get("keyword", ""),
             security_map=security_map or {},
-            city=list_data.get("city", ""))
+            city=list_data.get("city", ""),
+            city_code=list_data.get("city_code", ""))
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -3767,8 +3781,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
                     pending[job_id] = pending.get(job_id, 0) + 1
                     save_pending_ids(output_path, pending)
 
-        # 详情页间隔加大，随机 10-25 秒
-        gap = random.uniform(10, 25)
+        # 详情页间隔：API 通道每 worker ≥ DETAIL_API_PACE_SECONDS（规格硬线，
+        # API 无渲染等待、限速器/间隔是唯一刹车）；DOM 通道沿用 10-25s。
+        if security_map:
+            gap = random.uniform(DETAIL_API_PACE_SECONDS, DETAIL_API_PACE_SECONDS * 1.6)
+        else:
+            gap = random.uniform(10, 25)
         print(f"  等待 {gap:.0f}s 后抓下一个...\n")
         progress = progress_line(idx + 1, len(jobs), serial_ok)
         if progress:
@@ -5128,9 +5146,10 @@ def run_cli():
                 cdp_port=args.cdp_port, fmt=args.format,
                 concurrency=args.concurrency,
                 pending_ids=pending_ids,
-                # E 降级：验证码命中全停时，列表文件 warnings 追加降级原因
-                # （--input 模式列表文件为输入文件；抓取模式为实际落盘路径）
-                list_output_path=list_data.get("output_path") or args.input,
+                # E 降级：验证码命中全停时，往实际落盘的列表文件追加降级原因。
+                # 修复（2026-09-22 审计）：--input 模式为只读，绝不把输入文件当输出
+                # 改写（否则风控回调会把用户文件追加 warnings 写坏）。
+                list_output_path=None if args.input else list_data.get("output_path"),
                 # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
                 # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
                 security_map=list_data.get("security_map"),

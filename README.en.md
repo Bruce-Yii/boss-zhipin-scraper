@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.3 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.4 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.3.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.4.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -204,13 +204,13 @@ On anomalies, alerts are pushed via a Worker endpoint (downstream channels such 
 - Configure in the project root `.env` (gitignored, not committed): `ALERT_WEBHOOK_URL=<endpoint URL>`, `ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - Silent skip if unconfigured or on network failure (logged only); never blocks the scrape flow
 
-## Export Contract v1
+## Export Contract v2
 
 The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-job-intel):
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "keyword": "AI产品经理", "city": "上海",
   "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
   "jobs": [

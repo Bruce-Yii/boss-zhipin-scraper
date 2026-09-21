@@ -1824,32 +1824,63 @@ class ChromeSetupTests(unittest.TestCase):
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()
         bucket = module.TokenBucket(rate=2.0, capacity=2)
-        with mock.patch.object(module.time, "sleep") as sleep_mock, \
-                mock.patch.object(module.time, "time", side_effect=[0.0, 0.1, 0.2]):
+        with mock.patch.object(module.time, "sleep") as sleep_mock:
             bucket.acquire()
             bucket.acquire()
         sleep_mock.assert_not_called(), "容量内不应阻塞"
 
     def test_token_bucket_blocks_when_depleted(self):
         module = load_module()
-        bucket = module.TokenBucket(rate=1.0, capacity=1)
-        with mock.patch.object(module.time, "sleep") as sleep_mock, \
-                mock.patch.object(module.time, "time", side_effect=[0.0, 0.1, 1.1]):
-            bucket.acquire()   # 消耗唯一令牌
-            bucket.acquire()   # 需要等 1 秒补充
+        clock = [0.0]
+
+        def _sleep(d):
+            clock[0] += d
+
+        with mock.patch.object(module.time, "monotonic",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(module.time, "sleep", side_effect=_sleep) as sleep_mock:
+            bucket = module.TokenBucket(rate=1.0, capacity=1)  # 假时钟构造（_last_refill=0）
+            bucket.acquire()   # t=0 消耗唯一令牌
+            bucket.acquire()   # 需等约 1 秒补充后重新复核
         sleep_mock.assert_called_once()
         self.assertGreaterEqual(sleep_mock.call_args[0][0], 0.9,
                                 "等待时长应覆盖令牌补充间隔")
 
     def test_token_bucket_accumulates_tokens_over_time(self):
         module = load_module()
-        bucket = module.TokenBucket(rate=2.0, capacity=10)
-        with mock.patch.object(module.time, "sleep"), \
-                mock.patch.object(module.time, "time", side_effect=[0.0, 5.0]):
-            # 5 秒空闲后应有 10 个令牌（受容量上限）
+        clock = [0.0]
+        with mock.patch.object(module.time, "monotonic",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(module.time, "sleep") as sleep_mock:
+            bucket = module.TokenBucket(rate=2.0, capacity=10)  # 假时钟构造
+            for _ in range(10):
+                bucket.acquire()   # 耗尽 10 个令牌
+            clock[0] += 0.5        # 空闲 0.5s → 按速率补充 1 个令牌
+            bucket.acquire()       # 应无阻塞
+        sleep_mock.assert_not_called()
+
+    def test_token_bucket_serializes_concurrent_acquires(self):
+        # 回归（2026-09-22）：容量 1、rate=10/s、4 线程并发取令牌时，
+        # 授予应串行化（≈3 个间隔 0.3s），而非旧实现"同睡同醒"突发放行。
+        module = load_module()
+        bucket = module.TokenBucket(rate=10.0, capacity=1)
+        grants = []
+        lock = threading.Lock()
+        start = time.monotonic()
+
+        def worker():
             bucket.acquire()
-        # 无阻塞即说明令牌已按速率累计
-        self.assertTrue(True)
+            with lock:
+                grants.append(time.monotonic() - start)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(grants), 4)
+        self.assertGreaterEqual(max(grants), 0.2,
+                                "并发取令牌应串行化，不应突发放行（锁外 sleep 回归）")
 
     def test_adaptive_limiter_halves_rate_on_high_failure_window(self):
         module = load_module()

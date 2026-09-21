@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.3（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.4（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.3.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.4.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -207,13 +207,13 @@ python3 scripts/job_summary.py --top 15
 - 配置：项目根目录 `.env`（gitignore 排除，不入仓库）——`ALERT_WEBHOOK_URL=<端点地址>`、`ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - 未配置或网络失败时静默跳过，不影响抓取主流程（失败仅记日志）
 
-## 导出契约 v1
+## 导出契约 v2
 
 列表 JSON 为下游程序提供稳定契约（供 ai-pm-job-intel 等系统消费）：
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "keyword": "AI产品经理", "city": "上海",
   "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
   "jobs": [

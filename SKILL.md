@@ -1,16 +1,16 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.3.0
+version: 2.4.0
 author: eatmoreduck
 license: MIT
-platforms: [macos, linux]
+platforms: [macos, linux, windows]
 metadata:
   hermes:
     tags: [scraper, jobs, career, cdp, chrome, zhipin, boss直聘]
 ---
 
-# BOSS直聘职位抓取工具 v2.3
+# BOSS直聘职位抓取工具 v2.4
 
 通过 Chrome CDP 协议抓取 BOSS直聘 (zhipin.com) 职位数据，输出结构化 JSON/CSV（含明文薪资），并可对已抓取结果生成聚合摘要和求职材料优化提示词。
 
@@ -46,12 +46,12 @@ SUMMARY_PATH=$(find ~/.hermes/skills -name "job_summary.py" -type f 2>/dev/null 
 
 ## 依赖安装（首次使用必须执行）
 
-脚本依赖 `websocket-client` 和 `requests`。在用户项目的 venv 中安装：
+脚本依赖 `websocket-client`、`requests`（抓取）与 `pandas`、`matplotlib`（摘要与图表，`job_summary.py` 顶层导入）。在用户项目的 venv 中安装：
 
 ```bash
-uv add websocket-client requests
+uv add websocket-client requests pandas matplotlib
 # 或
-pip install websocket-client requests
+pip install websocket-client requests pandas matplotlib
 ```
 
 ## 自动化流程
@@ -61,7 +61,7 @@ pip install websocket-client requests
 ### 第 1 步：检查环境
 
 ```bash
-python3 "$SCRIPT_PATH" --check --cdp-port 9222
+python3 "$SCRIPT_PATH" --check --cdp-port 45222
 ```
 
 检查三项：Python 依赖 → CDP 连通性 → 登录态。
@@ -74,14 +74,14 @@ python3 "$SCRIPT_PATH" --check --cdp-port 9222
 ### 第 2 步：启动 Chrome CDP（仅在 --check CDP 不通时）
 
 ```bash
-python3 "$SCRIPT_PATH" --setup-chrome --cdp-port 9222
+python3 "$SCRIPT_PATH" --setup-chrome --cdp-port 45222
 ```
 
 这会自动完成：
 1. 创建或复用持久隔离 Chrome profile
    - `~/.boss-zhipin-scraper/chrome-profile`
 2. 只关闭使用该隔离 profile 的旧 BOSS CDP Chrome，不关闭用户主 Chrome
-3. 以 CDP 模式启动 Chrome（`--remote-debugging-port=9222`）
+3. 以 CDP 模式启动 Chrome（`--remote-debugging-port=45222`）
 4. 等待 CDP 端口就绪（最多 30 秒）
 5. 打开 BOSS 登录页并等待登录完成，直到搜索接口返回明文 `salaryDesc`
 
@@ -90,7 +90,7 @@ python3 "$SCRIPT_PATH" --setup-chrome --cdp-port 9222
 仅当用户明确要求从主 Chrome 手动导入 BOSS 登录态时，可使用：
 
 ```bash
-python3 "$SCRIPT_PATH" --setup-chrome --copy-login-state --cdp-port 9222
+python3 "$SCRIPT_PATH" --setup-chrome --copy-login-state --cdp-port 45222
 ```
 
 `--copy-login-state` 每次运行都会覆盖隔离 profile 内对应的 Cookie 相关文件；日常启动不要加这个参数。它只复制 `Local State` 和 `Default/Cookies*`、`Default/Network/Cookies*` 这类 Cookie 数据库相关文件，不复制密码库或完整 profile。不要默认使用该参数，也不要告诉用户首次启动会自动导入主 Chrome 登录态。
@@ -113,7 +113,7 @@ python3 "$SCRIPT_PATH" --keyword "关键词" --city 城市 --pages 3 --detail --
 python3 "$SUMMARY_PATH" --top 15
 
 # 真实浏览器/API smoke test（不写结果文件）
-python3 "$SCRIPT_PATH" --smoke-test --cdp-port 9222
+python3 "$SCRIPT_PATH" --smoke-test --cdp-port 45222
 
 # 合并多次抓取（去重）
 python3 "$SCRIPT_PATH" --keyword "关键词" --city 北京 --pages 3 --merge ~/.boss-zhipin-scraper/job-result/jobs.json --output ~/.boss-zhipin-scraper/job-result/jobs_merged.json
@@ -125,7 +125,7 @@ python3 "$SCRIPT_PATH" --keyword "关键词" --city 北京 --pages 3 --merge ~/.
 
 ```bash
 # 关闭 BOSS 专用 Chrome（只关隔离 profile，不碰主 Chrome）
-python3 "$SCRIPT_PATH" --stop-chrome --cdp-port 9222
+python3 "$SCRIPT_PATH" --stop-chrome --cdp-port 45222
 
 # 或：让本次抓取正常结束就自动关闭
 python3 "$SCRIPT_PATH" --keyword "关键词" --city 城市 --pages 3 --close-chrome
@@ -149,16 +149,24 @@ python3 "$SUMMARY_PATH" \
 | `--keyword` | AI Agent | 搜索关键词 |
 | `--city` | 上海 | 城市名（中文）或 9 位代码；没传时默认上海，无法识别的城市名会报错退出 |
 | `--pages` | 3 | 抓取页数（上限 10，每页 30 条） |
+| `--max-jobs N` | 全部 | 列表条数上限，抓够即停 |
+| `--industry` | - | 行业代码（见下方筛选参数） |
+| `--input FILE` | - | 从已有 JSON 读取（跳过列表抓取；此时无 securityId，详情退化为 DOM 渲染） |
+| `--list-cities [关键词]` | - | 打印支持的城市列表（可选关键词过滤） |
 | `--output` | ~/.boss-zhipin-scraper/job-result/... | 列表输出路径 |
 | `--detail-output` | ~/.boss-zhipin-scraper/job-result/... | 详情输出路径 |
 | `--format` | json | 输出格式: json / csv；csv 同时导出列表和详情 CSV |
-| `--detail` | 开启（默认） | 抓取详情页 JD |
+| `--detail` | 开启（默认） | 抓取详情（默认走详情 API 通道） |
 | `--no-detail` | - | 不抓取详情页（关闭默认行为） |
 | `--max-details` | 全部 | 详情页数量上限 |
 | `--analysis` | 关闭 | 输出分析报告 |
+| `--concurrency N` | 1 | 详情抓取并发度（2-3 推荐；越高成功率越低，含全局限速与错误率自适应降速） |
+| `--max-concurrent N` | 1 | 并发抓取任务数上限（规格硬防线；仅指令显式开启，任一任务风控即全停） |
+| `--keep-without-jd` | 关闭 | 保留无 JD 岗位（默认口径一：详情抓完后剔除无 JD 岗位） |
+| `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |
 | `--allow-dom-fallback` | 关闭 | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--merge FILE` | - | 合并已有 JSON（按 job_id 去重） |
-| `--cdp-port` | 9222 | CDP 端口 |
+| `--cdp-port` | 45222 | CDP 端口 |
 | `--setup-chrome` | 关闭 | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 关闭 | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile；默认、首次启动、重复启动都不复制 |
 | `--reset-chrome-profile` | 关闭 | 重建 BOSS 专用 profile，会清除此专用浏览器登录态 |
@@ -168,6 +176,11 @@ python3 "$SUMMARY_PATH" \
 | `--close-chrome` | 关闭 | 抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态） |
 | `--check` | 关闭 | 环境检查 |
 | `--smoke-test` | 关闭 | 真实 Chrome/CDP 搜索 API smoke test，不写结果文件 |
+| `--status` | 关闭 | 状态总览（运行态+缓存态，接管用；不发请求） |
+| `--verify` | 关闭 | 校验结果文件完整性（只校验不抓取） |
+| `--list-results` | 关闭 | 列出结果目录中的历史抓取结果文件 |
+| `--archive [KEEP]` | 1 | 归档历史结果：每类保留最新 KEEP 个，其余移入 archive/ |
+| `--batch CONFIG.json` | - | 批量抓取（默认列表+详情；任务级 `detail:false` 或 `--no-detail` 可仅列表） |
 | `--version` | - | 查看版本号 |
 
 ### 筛选参数
@@ -189,25 +202,38 @@ python3 "$SUMMARY_PATH" \
 
 ```json
 {
+  "format_version": 2,
   "keyword": "AI Agent",
   "city": "上海",
-  "total": 60,
+  "page_count": 3,
+  "total": 90,
+  "job_count": 89,
+  "exhausted": true,
+  "warnings": [],
+  "jd_coverage": {"with_jd": 89, "total_before": 90, "dropped_no_jd": 1},
+  "dropped_no_jd": ["d86a000c3d5d50e3"],
   "jobs": [
     {
       "job_id": "c4420e8bce3a6e25",
       "title": "AI Agent工程师",
       "salary": "30-60K·15薪",
+      "salary_source": "api",
       "location": "上海·闵行区·虹桥",
       "tags": "5-10年 | 本科",
+      "experience": "5-10年",
+      "education": "本科",
       "boss_name": "SHEIN",
+      "company_name": "SHEIN",
       "boss_title": "招聘者",
+      "boss_active_status": "刚刚活跃",
       "company_scale": "10000人以上",
       "company_stage": "D轮及以上",
       "company_industry": "电子商务",
-      "skills": "Java | Spring | AI",
+      "skills": ["Java", "Spring", "AI"],
       "job_link": "https://www.zhipin.com/job_detail/xxx.html",
       "company_link": "https://www.zhipin.com/gongsi/xxx.html",
-      "welfare": "节日福利 | 零食下午茶 | 定期体检"
+      "welfare": "节日福利 | 零食下午茶 | 定期体检",
+      "jd": "……（详情抓取后并入；默认口径一会剔除无 jd 岗位）"
     }
   ]
 }
@@ -220,12 +246,12 @@ python3 "$SUMMARY_PATH" \
 ## 工作原理
 
 1. 通过 Chrome DevTools Protocol (CDP) 连接到已打开的 Chrome 浏览器
-2. 在 BOSS直聘页面内注入 JS，用同步 XHR 调用 `/wapi/zpgeek/search/joblist.json` API
-3. API 返回明文 `salaryDesc`（如 `30-60K·15薪`），绕过前端字体反爬
-4. 列表 API 保留 `securityId` / `lid` 等上下文，进入详情页时带上这些参数
-5. 默认禁用 DOM fallback，避免把字体反爬后的薪资写入结果；只有显式 `--allow-dom-fallback` 才降级
-6. 每页 30 条，每页抓完立即写入文件，异常退出不丢数据
-7. 按 `job_id`（job_link 的 MD5 哈希前 16 位）去重
+2. **列表**：在 BOSS直聘页面内注入 JS，用同步 XHR 调用 `/wapi/zpgeek/search/joblist.json` API，返回明文 `salaryDesc`（如 `30-60K·15薪`），绕过前端字体反爬
+3. **详情（默认 API 通道）**：调用 `/wapi/zpgeek/job/detail.json`（每岗 1 次轻量 XHR 取完整 JD）；`securityId` 由列表阶段同进程内存传递、**不落导出文件**（红线）；每 tab 约 4 次配额，程序按预算自动轮换 tab；`--input` 老文件无 `securityId` 时自动回退 DOM 渲染
+4. 默认禁用 DOM fallback，避免把字体反爬后的薪资写入结果；只有显式 `--allow-dom-fallback` 才降级
+5. 每页 30 条，每页抓完立即写入文件，异常退出不丢数据
+6. 按 `job_id`（job_link 的 MD5 哈希前 16 位）去重
+7. 默认口径一：详情抓完后把 `jd` 并入导出并剔除无 JD 岗位（`--keep-without-jd` 可保留）
 
 ## 数据安全策略
 
@@ -236,7 +262,7 @@ python3 "$SUMMARY_PATH" \
 需要清空 BOSS 专用浏览器登录态时使用：
 
 ```bash
-python3 "$SCRIPT_PATH" --setup-chrome --reset-chrome-profile --cdp-port 9222
+python3 "$SCRIPT_PATH" --setup-chrome --reset-chrome-profile --cdp-port 45222
 ```
 
 ## 常见问题
@@ -245,8 +271,8 @@ python3 "$SCRIPT_PATH" --setup-chrome --reset-chrome-profile --cdp-port 9222
 2. **--check 未登录** → 在专用 Chrome 中访问 zhipin.com 登录，或重新运行 `--setup-chrome`
 3. **薪资空白** → 通常是未登录、登录态失效或接口未返回 `salaryDesc`；先重新登录，不要优先做字体解密或 DOM fallback
 4. **抓取中断** → 重新运行即可，增量写入 + 自动去重
-5. **端口占用** → `--cdp-port 9223` 换端口
-6. **Chrome 启动失败** → `--cdp-port 9223` 换端口，或用 `--reset-chrome-profile` 重建专用 profile
+5. **端口占用** → `--cdp-port 45223` 换端口
+6. **Chrome 启动失败** → `--cdp-port 45223` 换端口，或用 `--reset-chrome-profile` 重建专用 profile
 
 ## 注意事项
 
