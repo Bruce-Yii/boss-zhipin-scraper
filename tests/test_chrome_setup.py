@@ -1036,6 +1036,62 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(len(calls), 1, "仅第二个任务抓详情")
 
+    def test_merge_jd_into_export_strict_drops_without_jd(self):
+        """口径一：jd 并入列表 + 剔除无 JD 岗位 + meta 记录覆盖率/剔除清单。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            module.flush_jobs(target, {"keyword": "AI", "city": "上海"}, [
+                {"job_id": "a", "title": "A", "location": "上海",
+                 "job_link": "https://www.zhipin.com/job_detail/a.html", "company_name": "C1"},
+                {"job_id": "b", "title": "B", "location": "上海",
+                 "job_link": "https://www.zhipin.com/job_detail/b.html", "company_name": "C2"},
+            ])
+            result = module._merge_jd_into_export(target, [{"job_id": "a", "jd": "岗位职责X"}])
+            self.assertEqual(result, (1, 1))
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(len(data["jobs"]), 1)
+            self.assertEqual(data["jobs"][0]["jd"], "岗位职责X")
+            self.assertEqual(data["job_count"], 1)
+            self.assertEqual(data["jd_coverage"]["with_jd"], 1)
+            self.assertEqual(data["jd_coverage"]["total_before"], 2)
+            self.assertEqual(data["jd_coverage"]["dropped_no_jd"], 1)
+            self.assertEqual(data["dropped_no_jd"], ["b"])
+            self.assertTrue(any("口径一" in w for w in data.get("warnings", [])))
+
+    def test_merge_jd_into_export_keep_without_jd(self):
+        """--keep-without-jd：保留无 JD 岗位（仅标注），in_jd 统计仍准。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            module.flush_jobs(target, {"keyword": "AI"}, [
+                {"job_id": "a", "title": "A", "location": "上海",
+                 "job_link": "https://www.zhipin.com/job_detail/a.html", "company_name": "C1"},
+                {"job_id": "b", "title": "B", "location": "上海",
+                 "job_link": "https://www.zhipin.com/job_detail/b.html", "company_name": "C2"},
+            ])
+            result = module._merge_jd_into_export(
+                target, [{"job_id": "a", "jd": "x"}], keep_without_jd=True)
+            self.assertEqual(result, (2, 0))
+            with open(target, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(len(data["jobs"]), 2)
+            self.assertEqual(data["jd_coverage"]["with_jd"], 1)
+            self.assertEqual(data["jd_coverage"]["dropped_no_jd"], 0)
+
+    def test_merge_jd_into_export_uses_base_when_target_missing(self):
+        """--input 无输出文件时：以 base 列表为准写入 target。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "merged.json")
+            base = {"keyword": "AI", "jobs": [
+                {"job_id": "a", "title": "A", "location": "上海",
+                 "job_link": "https://x/a.html", "company_name": "C1"}]}
+            result = module._merge_jd_into_export(target, [{"job_id": "a", "jd": "J"}], base=base)
+            self.assertEqual(result, (1, 0))
+            self.assertTrue(os.path.exists(target))
+
     def test_run_batch_integrity_check_passes_when_files_match(self):
         """batch 完成校验：任务数 = 新增文件数 → 通过。"""
         module = load_module()

@@ -2710,6 +2710,77 @@ def list_results(result_dir=DEFAULT_RESULT_DIR):
     return entries
 
 
+def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False):
+    """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
+
+    - 每条 job 追加 `jd` 字段（有详情时）
+    - `keep_without_jd=False`（默认）：**剔除无 JD 的岗位**——用户口径"没 JD 的
+      岗位毫无意义"，避免下游再筛
+    - meta 记录 `jd_coverage`（with_jd/total_before/dropped_no_jd）与 `dropped_no_jd`
+      （被剔除 job_id 列表，可追溯）；`job_count`/`total` 同步为保留数
+
+    Args:
+        target_path: 列表文件路径（存在则以其为准，否则用 base）
+        details: 详情记录列表（每条含 job_id/jd）
+        base: target 不存在时的基础列表 dict（如 --input 模式）
+        keep_without_jd: True 时保留无 JD 岗位（仅标注）
+
+    Returns:
+        (kept, dropped) 或 None（无法处理时）
+    """
+    data = None
+    if target_path and os.path.exists(target_path):
+        try:
+            with open(target_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            data = None
+    if not isinstance(data, dict):
+        data = base
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        return None
+
+    jd_map = {}
+    for d in details or []:
+        if isinstance(d, dict) and d.get("job_id") and str(d.get("jd") or "").strip():
+            jd_map[str(d["job_id"])] = d["jd"]
+
+    jobs = data["jobs"]
+    kept, dropped_ids = [], []
+    with_jd = 0
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        jid = str(job.get("job_id") or "")
+        jd = jd_map.get(jid)
+        if jd:
+            job = {**job, "jd": jd}
+            kept.append(job)
+            with_jd += 1
+        elif keep_without_jd:
+            kept.append(job)
+        else:
+            dropped_ids.append(jid)
+
+    total_before = len(jobs)
+    data["jobs"] = kept
+    data["job_count"] = len(kept)
+    data["total"] = len(kept)
+    data["jd_coverage"] = {
+        "with_jd": with_jd,
+        "total_before": total_before,
+        "dropped_no_jd": len(dropped_ids),
+    }
+    if dropped_ids:
+        data["dropped_no_jd"] = dropped_ids
+        warnings = list(data.get("warnings") or [])
+        warnings.append(
+            f"口径一：已剔除 {len(dropped_ids)} 条无 JD 岗位（见 meta.dropped_no_jd）")
+        data["warnings"] = warnings
+    _atomic_write_json(target_path, data)
+    return len(kept), len(dropped_ids)
+
+
 def archive_results(result_dir=DEFAULT_RESULT_DIR, keep_latest=1, archive_dir=None):
     """归档结果目录中的历史结果文件。
 
@@ -2849,7 +2920,7 @@ def _list_has_detail_risk(list_path):
 
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
-              detail=True, detail_concurrency=1):
+              detail=True, detail_concurrency=1, keep_without_jd=False):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -2907,7 +2978,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
             raw_path = list_data.get("output_path")
             list_path = raw_path if isinstance(raw_path, str) else ""
             try:
-                scrape_details(
+                details_result = scrape_details(
                     list_data, output_path=_detail_path_for_list(list_path),
                     cdp_port=cdp_port, concurrency=detail_concurrency,
                     list_output_path=list_path or None,
@@ -2916,10 +2987,20 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
             except Exception as e:  # 有意宽捕：详情失败不中断批量其余任务
                 failed += 1
                 print(f"  ❌ 详情抓取失败: {e}")
+                details_result = None
             if list_path and _list_has_detail_risk(list_path):
                 print("\n⚠️ 详情风控命中（已全停），批量任务提前结束；"
                       "请人工处理后重跑（断点续抓自动补齐）。")
                 return 1
+            # 口径一：把 jd 并入列表并剔除无 JD 岗位（与单命令路径一致）
+            if list_path and isinstance(details_result, list):
+                merged_export = _merge_jd_into_export(
+                    list_path, details_result, base=list_data,
+                    keep_without_jd=keep_without_jd)
+                if merged_export:
+                    kept, dropped = merged_export
+                    print(f"  ✅ 口径一：{task['keyword']}@{task['city']} 导出 {kept} 条"
+                          + (f"，剔除无 JD {dropped} 条" if dropped else ""))
 
         if i < len(tasks) - 1:
             gap = task.get("sleep") or random.uniform(30, 60)
@@ -4667,6 +4748,8 @@ def build_parser():
     g_detail.add_argument("--no-detail", dest="detail", action="store_false",
                           help="不抓取详情页")
     g_detail.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
+    g_detail.add_argument("--keep-without-jd", action="store_true",
+                          help="保留无 JD 岗位（默认口径一：详情抓完后把 jd 并入列表并剔除无 JD 岗位）")
     g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                           help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
@@ -4790,7 +4873,8 @@ def run_cli():
             sys.exit(1)
         sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
                            max_concurrent=args.max_concurrent,
-                           detail=args.detail, detail_concurrency=args.concurrency))
+                           detail=args.detail, detail_concurrency=args.concurrency,
+                           keep_without_jd=args.keep_without_jd))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
@@ -4945,6 +5029,22 @@ def run_cli():
             if args.format == "csv":
                 detail_csv = args.detail_output.rsplit(".", 1)[0] + ".csv"
                 write_detail_csv(detail_csv, details)
+
+        # 口径一：详情抓完后把 jd 并入列表导出并剔除无 JD 岗位（--keep-without-jd 可保留）
+        if details is not None:
+            export_path = list_data.get("output_path")
+            if not export_path and args.input and args.output:
+                export_path = args.output
+            if export_path:
+                merged_export = _merge_jd_into_export(
+                    export_path, details, base=list_data,
+                    keep_without_jd=args.keep_without_jd)
+                if merged_export:
+                    kept, dropped = merged_export
+                    print(f"✅ 口径一：导出 {kept} 条（含 jd）"
+                          + (f"，剔除无 JD {dropped} 条" if dropped else ""))
+            elif args.input:
+                print("ℹ️  --input 模式未指定 --output，跳过 jd 并入（原列表保持原样）")
 
     # 分析
     if args.analysis:

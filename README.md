@@ -227,7 +227,8 @@ python3 scripts/job_summary.py --top 15
 - 必填字段：`job_id`/`title`/`location`/`job_link`/`company_name`；导出前自动过滤敏感字段（凭据不落文件）
 - 可选字段（列表抓取时）：`exhausted`（bool，本 run 是否翻到底：任一副页返回 <30 条 → true；`--pages 1` 单页 <30 条 → true；满页未到底 → false。规格侧抽样感知下架判定依据；随契约 v2 正式纳入，字段缺失按 false 处理）、`anonymous`（匿名岗位标记 0/1——招聘方隐藏公司名）、`job_valid_status`（BOSS 官方在招状态，可校准下架推断）、`icon_flags`/`icon_word`（"急"/"新"等平台标签）、`proxy_job`/`proxy_type`（代招标记：猎头/外包）、`job_type`（岗位类型编码）
 - 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）
-- **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；`--input` 补抓老文件时自动回退 DOM 渲染
+- **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；每 tab 约 4-5 次配额，程序自动轮换 tab；`--input` 补抓老文件时自动回退 DOM 渲染
+- **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词
