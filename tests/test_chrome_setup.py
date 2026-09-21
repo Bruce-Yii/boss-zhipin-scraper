@@ -1828,6 +1828,15 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIs(module.AdaptiveRateLimiter, rl.AdaptiveRateLimiter)
         self.assertEqual(module.DETAIL_API_PACE_SECONDS, 15.0)
 
+    def test_export_contract_module_is_reexported(self):
+        module = load_module()
+        from scripts import export_contract as ex
+        self.assertIs(module._sanitize_job, ex._sanitize_job)
+        self.assertIs(module.flush_jobs, ex.flush_jobs)
+        self.assertIs(module._merge_jd_into_export, ex._merge_jd_into_export)
+        self.assertIs(module.merge_unique, ex.merge_unique)
+        self.assertEqual(module.FORMAT_VERSION, 2)
+
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()
         bucket = module.TokenBucket(rate=2.0, capacity=2)
