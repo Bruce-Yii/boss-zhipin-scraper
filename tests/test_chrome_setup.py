@@ -1821,6 +1821,13 @@ class ChromeSetupTests(unittest.TestCase):
 
     # ----- 并发详情抓取：全局限速令牌桶 -----
 
+    def test_ratelimit_module_is_reexported(self):
+        module = load_module()
+        from scripts import ratelimit as rl
+        self.assertIs(module.TokenBucket, rl.TokenBucket)
+        self.assertIs(module.AdaptiveRateLimiter, rl.AdaptiveRateLimiter)
+        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 15.0)
+
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()
         bucket = module.TokenBucket(rate=2.0, capacity=2)
