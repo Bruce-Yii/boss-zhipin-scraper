@@ -90,6 +90,17 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--detail-channel", r.stdout)
         self.assertIn("panel", r.stdout)
 
+    def test_help_documents_detail_channel_encrypt_flag(self):
+        """--detail-channel 含 encrypt（encryptJobId 兜底通道，#49）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("encrypt", r.stdout)
+
+    def test_detail_channel_encrypt_choice_accepted(self):
+        """--detail-channel encrypt 合法（argparse 层，不真抓）。"""
+        r = self._run("--detail-channel", "encrypt", "--version")
+        self.assertEqual(r.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

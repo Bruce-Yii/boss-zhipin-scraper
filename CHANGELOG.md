@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.16.0 (2026-09-23)
+
+### 新增（详情 encryptJobId 兜底通道 · 详情 API 专题 §7-1 / #49）
+- **`--detail-channel encrypt` + auto 兜底**：`/wapi/zpgeek/job/detail.json` 支持仅带 `jobId`（encryptJobId 长期有效，boss-agent-cli 低风险通道实证），不依赖一次性 securityId。`auto` 下缺 securityId 的岗位先试 encryptJobId API，`invalid_params`/解析类/会话类失败回退 DOM；**真风控（risk_timeout 且非 invalid_params）照旧 fail-closed 上抛全停，不落 DOM 硬闯**。`--input` 老文件无 sidecar 也可走 API 快通道。
+- 强制 `encrypt` 通道仅串行实现（同 panel 策略，并发请求自动降串行）；共享 tab 与 `DETAIL_API_TAB_BUDGET=4` 轮换、BurstThrottle 节律对 encrypt 请求同样生效。
+- meta `detail_channel` 新增 `encrypt` 标记；`--input` 无 sidecar 提示按通道区分（auto=先试 encrypt，api 严格模式=直接 DOM）。
+- 真机对照（code37 率）待账号冷却后补做；本版先行代码 + 全 mock 离线测试。
+
 ## v2.15.3 (2026-09-23)
 
 ### 测试卫生（"野进程"实为测试污染审计日志）

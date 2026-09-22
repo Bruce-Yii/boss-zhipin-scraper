@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.15 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.16 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.15.3-orange.svg)
+![Version](https://img.shields.io/badge/version-2.16.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -171,7 +171,7 @@ python3 scripts/job_summary.py --top 15
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
 | `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors). **The API channel reuses a shared tab pool** and paces about 15s per worker (`DETAIL_API_PACE_SECONDS`), i.e. about N/15 requests per second at concurrency N |
-| `--detail-channel` | Detail channel: `auto` (default; API when securityId is present, else DOM) / `api` / `dom` / `panel` (reuse the search page, click a card and read the right panel's JD — zero extra requests, serial; upstream #84 idea) |
+| `--detail-channel` | Detail channel: `auto` (default; API when securityId is present, else try the encryptJobId API first and fall back to DOM) / `api` (strict securityId) / `dom` / `encrypt` (force the encryptJobId API — no dependency on one-shot securityId, serial) / `panel` (reuse the search page, click a card and read the right panel's JD — zero extra requests, serial; upstream #84 idea) |
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--filter-inactive` | Drop long-inactive (zombie) jobs by HR activity (matches only "active N weeks/months/years ago"; does not drop this-week/this-month activity); off by default |
 | `--foreground-capture` | Use a foreground Target for list / login probe / detail DOM; for environments where Chrome on Linux/Xvfb cannot capture search responses with a background Target (stays background by default) |
@@ -243,7 +243,7 @@ The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-jo
 - Optional (detail scraping): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — DOM path only, unavailable via the API channel), `job_status_desc` (job status description), `brand_introduce` (company intro), `brand_stage_name`/`brand_scale_name`/`brand_industry_name` (company semantic dimensions), `brand_active_time` (company-level activity time from the detail API `brandComInfo.activeTime`, no extra request)
 - **Detail scraping uses the API channel** (2026-08-14): one lightweight request per job (`/wapi/zpgeek/job/detail.json`) instead of full-page rendering — JD returns in ~0s; `securityId` is passed in-process from the list stage (never written to export files, red line preserved); each tab allows ~4-5 requests and the program rotates tabs automatically; `--input` backfill of old files automatically falls back to DOM rendering
 - **Mode 1 (default): jd merged into the export, jobs without JD are dropped** (2026-09-22): every job carries `jd` inline; JD-less jobs are removed (meta records `jd_coverage` and `dropped_no_jd`); `--keep-without-jd` keeps them with a marker
-- **Explicit dual-channel** (2026-09-22): the detail phase records `detail_channel` in meta (`api`/`dom`/`mixed`) — API fast path when `securityId` is available, otherwise the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it falls back to DOM **with an explicit warning**
+- **Explicit multi-channel** (2026-09-22; encrypt added 2026-09-23): the detail phase records `detail_channel` in meta (`api`/`encrypt`/`dom`/`mixed`) — API fast path when `securityId` is available; when credentials are missing it first tries the **encryptJobId API** (a lightweight XHR carrying only jobId — `encryptJobId` is long-lived and does not depend on the one-shot securityId; endpoint rejection or parse failures fall back to DOM, while real risk signals still stop everything instead of pushing through), and only then the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it follows the same fallback chain **with an explicit notice**
 - **securityId restricted sidecar** (2026-09-22, red-line exception): stored under `~/.boss-zhipin-scraper/.session/` (outside the repo), `chmod 600`, 60-min TTL, deleted on normal finish; **never enters exports/logs/git**; the login cookie is never persisted. See `AGENTS.md`/`CONTRIBUTING.md`
 - **Optional SQLite incremental store (P4c-2)**: enable with `--db [PATH]` (default `~/.boss-zhipin-scraper/boss.db`, **outside the repo, never committed**; zero new deps — stdlib `sqlite3`). WAL mode plus a `job_id`-keyed incremental upsert (`first_seen_at` preserved, `updated_at` overwritten), coexisting with JSON/CSV instead of replacing them; stored details seed cross-run resume (works even with a fresh output file, so no re-fetch). Records are sanitized before insert (cookie/token/securityId/internal IDs never persisted)
 - On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)

@@ -792,7 +792,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                     security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", id_mode="security"):
             return {"ok": True, "detail": {"job_id": job["job_id"],
                                            "title": job["title"],
                                            "jd": "x" * 200},
@@ -802,6 +802,8 @@ class ChromeSetupTests(unittest.TestCase):
             out = str(paths["cdp_profile"] / "details.json")
             with mock.patch.object(module, "_scrape_one_detail",
                                    new=fake_one), \
+                    mock.patch.object(module, "_open_api_tab",
+                                      return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
                     mock.patch.object(module, "load_pending_ids",
@@ -3686,6 +3688,84 @@ class ChromeSetupTests(unittest.TestCase):
             {"job_link": "https://www.zhipin.com/job_detail/xyz.html"}, "sec-2", city_code="101200100")
         self.assertIn("jobId=xyz", url2)
 
+    def test_build_detail_api_url_encrypt_mode_only_jobid(self):
+        """encrypt 模式：仅 jobId 参数（boss-agent-cli 低风险通道，不依赖 securityId）。"""
+        module = load_module()
+        url = module.build_detail_api_url(
+            {"encrypt_job_id": "abc123",
+             "job_link": "https://www.zhipin.com/job_detail/xyz.html"},
+            "sec-ignored", city_code="101200100", id_mode="encrypt")
+        self.assertEqual(url, "/wapi/zpgeek/job/detail.json?jobId=abc123")
+        self.assertNotIn("securityId", url)
+        self.assertNotIn("city", url)
+
+    def test_scrape_one_detail_encrypt_success_skips_dom(self):
+        """encrypt 兜底：API 命中 → 直接返回，不建 DOM 会话。"""
+        module = load_module()
+        api_result = {"ok": True, "detail": {"job_id": "job-1", "jd": "x" * 200},
+                      "job_id": "job-1", "reason": "", "message": ""}
+        with mock.patch.object(module, "_scrape_one_detail_via_api",
+                               return_value=api_result) as api_mock, \
+                mock.patch.object(module, "CDPSession",
+                                  side_effect=AssertionError("不应建 DOM 会话")):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222, id_mode="encrypt")
+        self.assertTrue(result["ok"])
+        api_mock.assert_called_once()
+        self.assertEqual(api_mock.call_args.kwargs.get("id_mode"), "encrypt")
+        self.assertEqual(api_mock.call_args.kwargs.get("security_id"), "")
+
+    def test_scrape_one_detail_encrypt_risk_propagates_without_dom(self):
+        """encrypt 兜底：真风控（env_risk）→ 原样上抛，不落 DOM 硬闯（fail-closed）。"""
+        module = load_module()
+        api_result = {"ok": False, "detail": None, "job_id": "job-1",
+                      "reason": "risk_timeout", "message": "code=37",
+                      "category": "env_risk"}
+        with mock.patch.object(module, "_scrape_one_detail_via_api",
+                               return_value=api_result), \
+                mock.patch.object(module, "CDPSession",
+                                  side_effect=AssertionError("不应建 DOM 会话")):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222, id_mode="encrypt")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "risk_timeout")
+        self.assertEqual(result["category"], "env_risk")
+
+    def test_scrape_one_detail_encrypt_invalid_params_falls_back_to_dom(self):
+        """encrypt 兜底：invalid_params（接口不收 jobId-only）→ 回退 DOM 路径。"""
+        module = load_module()
+        api_result = {"ok": False, "detail": None, "job_id": "job-1",
+                      "reason": "risk_timeout", "message": "code=17",
+                      "category": "invalid_params"}
+        with mock.patch.object(module, "_scrape_one_detail_via_api",
+                               return_value=api_result), \
+                self._mock_detail_page(module, "Build AI agents " * 20):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222, id_mode="encrypt")
+        self.assertTrue(result["ok"], "invalid_params 应回退 DOM 而非全停")
+
+    def test_scrape_one_detail_encrypt_without_job_id_goes_dom(self):
+        """encrypt 兜底：无 encryptJobId 可提取 → 跳过 API 尝试直接 DOM。"""
+        module = load_module()
+        job = self._detail_job()
+        job["job_link"] = "https://www.zhipin.com/job/x"  # 无 /job_detail/{id}.html
+        job.pop("encrypt_job_id", None)
+        with mock.patch.object(module, "_scrape_one_detail_via_api",
+                               side_effect=AssertionError("不应调 API 通道")), \
+                self._mock_detail_page(module, "Build AI agents " * 20):
+            result = module._scrape_one_detail(job, cdp_port=9222, id_mode="encrypt")
+        self.assertTrue(result["ok"])
+
+    def test_scrape_one_detail_security_mode_without_sid_skips_encrypt(self):
+        """默认 security 模式：无 securityId → 直接 DOM，不尝试 encrypt（兼容旧行为）。"""
+        module = load_module()
+        with mock.patch.object(module, "_scrape_one_detail_via_api",
+                               side_effect=AssertionError("不应调 API 通道")), \
+                self._mock_detail_page(module, "Build AI agents " * 20):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222, id_mode="security")
+        self.assertTrue(result["ok"])
+
     def test_parse_detail_api_value_ok(self):
         """详情 API 解析：正常返回 → jd 规范化 + 精简字段集；全角空格清理。"""
         module = load_module()
@@ -4537,7 +4617,7 @@ class BestPracticesBatch3Tests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                     security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", id_mode="security"):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}
@@ -4549,6 +4629,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
             with open(list_path, "w", encoding="utf-8") as f:
                 json.dump({"keyword": "AI", "jobs": []}, f)
             with mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                 mock.patch.object(module, "_open_api_tab",
+                                   return_value=[mock.Mock(), "t", "s", 0]), \
                  mock.patch.object(module, "send_alert"), \
                  mock.patch.object(module, "load_existing_detail_ids",
                                    return_value=set()), \
