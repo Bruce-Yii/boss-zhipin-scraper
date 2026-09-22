@@ -1,7 +1,7 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.7.0
+version: 2.8.0
 author: eatmoreduck
 license: MIT
 platforms: [macos, linux, windows]
@@ -10,7 +10,7 @@ metadata:
     tags: [scraper, jobs, career, cdp, chrome, zhipin, boss直聘]
 ---
 
-# BOSS直聘职位抓取工具 v2.7
+# BOSS直聘职位抓取工具 v2.8
 
 通过 Chrome CDP 协议抓取 BOSS直聘 (zhipin.com) 职位数据，输出结构化 JSON/CSV（含明文薪资），并可对已抓取结果生成聚合摘要和求职材料优化提示词。
 
@@ -166,6 +166,7 @@ python3 "$SUMMARY_PATH" \
 | `--keep-without-jd` | 关闭 | 保留无 JD 岗位（默认口径一：详情抓完后剔除无 JD 岗位） |
 | `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |
 | `--allow-dom-fallback` | 关闭 | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
+| `--filter-inactive` | 关闭 | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃） |
 | `--merge FILE` | - | 合并已有 JSON（按 job_id 去重） |
 | `--db [PATH]` | 关闭 | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值用 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
 | `--cdp-port` | 45222 | CDP 端口 |

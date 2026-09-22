@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.7（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.8（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.7.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.8.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -167,6 +167,7 @@ python3 scripts/job_summary.py --top 15
 | `--no-detail` | 不抓取详情页 |
 | `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
+| `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--db [PATH]` | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值时用默认库 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
@@ -228,7 +229,7 @@ python3 scripts/job_summary.py --top 15
 - `format_version` 递增表示契约变更；`warnings` 记录采集异常（API 空数据/风控）
 - 必填字段：`job_id`/`title`/`location`/`job_link`/`company_name`；导出前自动过滤敏感字段（凭据不落文件）
 - 可选字段（列表抓取时）：`exhausted`（bool，本 run 是否翻到底：任一副页返回 <30 条 → true；`--pages 1` 单页 <30 条 → true；满页未到底 → false。规格侧抽样感知下架判定依据；随契约 v2 正式纳入，字段缺失按 false 处理）、`anonymous`（匿名岗位标记 0/1——招聘方隐藏公司名）、`job_valid_status`（BOSS 官方在招状态，可校准下架推断）、`icon_flags`/`icon_word`（"急"/"新"等平台标签）、`proxy_job`/`proxy_type`（代招标记：猎头/外包）、`job_type`（岗位类型编码）
-- 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）
+- 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）、`publish_time`（相对发布时间，仅 DOM 路径 `div.info-publis>p`）、`brand_active_time`（公司级活跃时间，详情 API `brandComInfo.activeTime`，零额外请求）
 - **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；每 tab 约 4-5 次配额，程序自动轮换 tab；`--input` 补抓老文件时自动回退 DOM 渲染
 - **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
 - **显式双通道**（2026-09-22）：详情抓取在 meta 记 `detail_channel`（`api`/`dom`/`mixed`）——有 `securityId` 走 API 快通道、否则 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则 DOM 并**明确告警**
