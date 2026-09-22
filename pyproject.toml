@@ -28,7 +28,8 @@ all = [
 ]
 dev = [
     "ruff==0.16.4",
-    "coverage>=7.4",
+    # [toml] extra：Python 3.10 无内置 tomllib，需 tomli 才能读 [tool.coverage]
+    "coverage[toml]>=7.4",
 ]
 
 [project.scripts]

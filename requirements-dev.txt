@@ -1,4 +1,5 @@
 # 开发/CI 依赖（运行时依赖见 requirements.txt）
 # 固定 ruff 版本：避免 CI 因 ruff 漂移产生非预期规则变更
 ruff==0.16.4
-coverage>=7.4
+# [toml] extra：Python 3.10 无内置 tomllib，coverage 需 tomli 才能读 pyproject 的 [tool.coverage]
+coverage[toml]>=7.4
