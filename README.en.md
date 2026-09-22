@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.6 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.7 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.6.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.7.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -166,6 +166,7 @@ python3 scripts/job_summary.py --top 15
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
+| `--db [PATH]` | Enable the SQLite incremental store (WAL) + cross-run detail resume; without a value it uses the default DB `~/.boss-zhipin-scraper/boss.db` (outside the repo, never committed); JSON/CSV exports are unchanged |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
 | `--check` | Environment check (CDP + deps + login state) |
 | `--status` | Status overview (runtime + cache, for takeover; **no requests**; login still needs `--check`) |
@@ -229,6 +230,7 @@ The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-jo
 - **Mode 1 (default): jd merged into the export, jobs without JD are dropped** (2026-09-22): every job carries `jd` inline; JD-less jobs are removed (meta records `jd_coverage` and `dropped_no_jd`); `--keep-without-jd` keeps them with a marker
 - **Explicit dual-channel** (2026-09-22): the detail phase records `detail_channel` in meta (`api`/`dom`/`mixed`) — API fast path when `securityId` is available, otherwise the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it falls back to DOM **with an explicit warning**
 - **securityId restricted sidecar** (2026-09-22, red-line exception): stored under `~/.boss-zhipin-scraper/.session/` (outside the repo), `chmod 600`, 60-min TTL, deleted on normal finish; **never enters exports/logs/git**; the login cookie is never persisted. See `AGENTS.md`/`CONTRIBUTING.md`
+- **Optional SQLite incremental store (P4c-2)**: enable with `--db [PATH]` (default `~/.boss-zhipin-scraper/boss.db`, **outside the repo, never committed**; zero new deps — stdlib `sqlite3`). WAL mode plus a `job_id`-keyed incremental upsert (`first_seen_at` preserved, `updated_at` overwritten), coexisting with JSON/CSV instead of replacing them; stored details seed cross-run resume (works even with a fresh output file, so no re-fetch). Records are sanitized before insert (cookie/token/securityId/internal IDs never persisted)
 - On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)
 
 ## Post-Scrape Summary & Prompt

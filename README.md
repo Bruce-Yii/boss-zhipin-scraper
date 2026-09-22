@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.6（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.7（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.6.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.7.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -169,6 +169,7 @@ python3 scripts/job_summary.py --top 15
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
+| `--db [PATH]` | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值时用默认库 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
 | `--status` | 状态总览（运行态 + 缓存态，接管用；**不发请求**，登录态仍需 `--check`） |
@@ -232,6 +233,7 @@ python3 scripts/job_summary.py --top 15
 - **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
 - **显式双通道**（2026-09-22）：详情抓取在 meta 记 `detail_channel`（`api`/`dom`/`mixed`）——有 `securityId` 走 API 快通道、否则 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则 DOM 并**明确告警**
 - **securityId 受限 sidecar**（2026-09-22，红线例外）：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、60 分钟 TTL、run 结束即删；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
+- **SQLite 增量存储（可选，P4c-2）**：`--db [PATH]` 启用（默认 `~/.boss-zhipin-scraper/boss.db`，**仓库外、不进 git**；零新依赖——stdlib `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 不变、`updated_at` 覆盖），与 JSON/CSV **并存不替换**；库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓）。入库前统一脱敏（cookie/token/securityId/内部标识不落库）
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词

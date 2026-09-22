@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 import argparse
 import csv
@@ -36,6 +36,7 @@ import random
 import re
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -81,6 +82,20 @@ _atomic_write_json = _export_contract._atomic_write_json
 cleanup_stale_tmp_files = _export_contract.cleanup_stale_tmp_files
 flush_jobs = _export_contract.flush_jobs
 _merge_jd_into_export = _export_contract._merge_jd_into_export
+
+try:
+    from scripts import db_store as _db_store
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import db_store as _db_store
+
+# SQLite 增量层（P4c-2）：主文件 re-export，保持 scripts.boss_cdp_raw.X 导入面
+DEFAULT_DB_PATH = _db_store.DEFAULT_DB_PATH
+open_db_store = _db_store.open_store
+upsert_db_jobs = _db_store.upsert_jobs
+upsert_db_details = _db_store.upsert_details
+load_db_details = _db_store.load_details
+db_store_stats = _db_store.stats
+record_db_run = _db_store.record_run
 
 # ============================================================
 # 全局常量
@@ -3555,7 +3570,7 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
                    concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
-                   security_map=None, max_seconds=None):
+                   security_map=None, max_seconds=None, preloaded_details=None):
     """抓取详情。
 
     Args:
@@ -3564,6 +3579,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             + warnings 承载降级信号；None 时不更新列表文件）。
         security_map: 可选 {job_id: securityId}（scrape_list 同进程内存传递，
             详情 API 通道凭据；为 None 时走详情页 DOM 渲染路径）。
+        preloaded_details: 可选 [detail dict]——SQLite 增量层读回的历史详情
+            （P4c-2 断点续抓）：并入 results 并计入 existing_ids，既免重抓，
+            又保证这些岗位仍带 JD 进入本 run 导出（避免"跳过即丢 JD"）。
     """
     jobs = list_data.get("jobs", [])
     if max_details:
@@ -3583,8 +3601,28 @@ def scrape_details(list_data, max_details=None, output_path=None,
         except (json.JSONDecodeError, OSError, ValueError):
             log.warning(f"加载已有详情文件失败，从空开始: {output_path}")
     seen_links = set()
+    # P4c-2：SQLite 断点续抓——把库中已有详情并入 results（按 job_id 去重，
+    # 文件版本优先），使其既被跳过、又保留在本 run 导出里（避免"跳过即丢 JD"）。
+    if preloaded_details:
+        have = {str(d.get("job_id")) for d in results
+                if isinstance(d, dict) and d.get("job_id")}
+        added = 0
+        for detail in preloaded_details:
+            if not isinstance(detail, dict):
+                continue
+            jid = str(detail.get("job_id") or "")
+            if jid and jid not in have:
+                results.append(detail)
+                have.add(jid)
+                added += 1
+        if added:
+            print(f"🗄️  已从 SQLite 载入 {added} 条历史详情（断点续抓，免重抓）")
+
     # 历史 job_id 预加载：已抓过的详情直接跳过（省请求、降风控触发概率）
     existing_ids = load_existing_detail_ids(output_path)
+    if preloaded_details:
+        existing_ids |= {str(d.get("job_id")) for d in preloaded_details
+                         if isinstance(d, dict) and d.get("job_id")}
     if existing_ids:
         print(f"ℹ️  已加载 {len(existing_ids)} 个历史详情 job_id，命中直接跳过")
     # 断点续跑：上次失败待重试的 job_id（即使已在结果文件里也重新抓取）
@@ -4861,6 +4899,10 @@ def build_parser():
                           help="输出格式")
     g_output.add_argument("--merge", default=None,
                           help="合并已有 JSON 文件 (按 job_id 去重)")
+    g_output.add_argument("--db", nargs="?", const=DEFAULT_DB_PATH, default=None,
+                          metavar="PATH",
+                          help="启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；"
+                               f"不带值用默认库 {DEFAULT_DB_PATH}（仓库外，不进 git）")
 
     # ---- 详情抓取 ----
     g_detail = p.add_argument_group("详情抓取")
@@ -4997,6 +5039,8 @@ def run_cli():
 
     # --batch 模式（批量抓取；默认列表 + 详情，--no-detail 可仅列表）
     if args.batch:
+        if args.db:
+            print("⚠️  --db 暂未接入 --batch（本版仅单 run 流程生效）；本次忽略 --db。")
         if not require_runtime_dependencies("requests", "websocket"):
             sys.exit(1)
         sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
@@ -5116,6 +5160,17 @@ def run_cli():
         sidecar_owned = write_security_sidecar(
             list_data.get("output_path"), list_data.get("security_map"))
 
+    # SQLite 增量层（P4c-2）：--db 启用；列表/详情与 JSON/CSV 并存、增量入库
+    db_conn = None
+    db_run_id = None
+    if args.db:
+        try:
+            db_conn = open_db_store(args.db)
+        except (OSError, sqlite3.Error) as e:
+            p.error(f"无法打开 SQLite 库 {args.db}: {e}")
+        db_run_id = uuid.uuid4().hex
+        print(f"🗄️  SQLite 增量层已启用: {args.db}")
+
     # 合并外部文件
     merged_details = None
     if args.merge:
@@ -5139,6 +5194,11 @@ def run_cli():
         # 同时加载旧详情，供后续详情抓取/分析合并（按 job_id 去重）
         merged_details = merge_details(args.merge, [])
 
+    # P4c-2：列表增量入库（唯一键 upsert，与 JSON/CSV 并存）
+    if db_conn is not None:
+        ins, upd = upsert_db_jobs(db_conn, list_data.get("jobs", []), run_id=db_run_id)
+        print(f"🗄️  列表入库: 新增 {ins}，更新 {upd}")
+
     # 抓详情
     details = None
     if args.detail and list_data.get("jobs"):
@@ -5155,11 +5215,20 @@ def run_cli():
             print("   可运行 --stop-chrome 后重新 --setup-chrome，或等待冷却结束再继续。")
             details = None
         else:
+            # P4c-2：先取库中已有详情作为续抓种子（换输出文件也能续）
+            preloaded_details = None
+            if db_conn is not None:
+                _job_ids = [j.get("job_id") for j in list_data.get("jobs", [])
+                            if isinstance(j, dict)]
+                preloaded_details = load_db_details(db_conn, _job_ids)
+                if preloaded_details:
+                    print(f"🗄️  SQLite 命中 {len(preloaded_details)} 条历史详情（断点续抓）")
             details = scrape_details(
                 list_data, args.max_details, args.detail_output,
                 cdp_port=args.cdp_port, fmt=args.format,
                 concurrency=args.concurrency,
                 pending_ids=pending_ids,
+                preloaded_details=preloaded_details,
                 # E 降级：验证码命中全停时，往实际落盘的列表文件追加降级原因。
                 # 修复（2026-09-22 审计）：--input 模式为只读，绝不把输入文件当输出
                 # 改写（否则风控回调会把用户文件追加 warnings 写坏）。
@@ -5177,6 +5246,11 @@ def run_cli():
             if args.format == "csv":
                 detail_csv = args.detail_output.rsplit(".", 1)[0] + ".csv"
                 write_detail_csv(detail_csv, details)
+
+        # P4c-2：详情增量入库（置于口径一之前，确保风控中断也保留已抓详情）
+        if db_conn is not None and details:
+            dins, dupd = upsert_db_details(db_conn, details, run_id=db_run_id)
+            print(f"🗄️  详情入库: 新增 {dins}，更新 {dupd}")
 
         # 口径一：详情抓完后把 jd 并入列表导出并剔除无 JD 岗位（--keep-without-jd 可保留）
         if details is not None:
@@ -5216,6 +5290,19 @@ def run_cli():
         if not details:
             details = load_existing_details(args.input, args.detail_output)
         analyze(list_data, details, search_keyword=args.keyword)
+
+    # P4c-2：记录本 run 并打印库统计（收尾；与 JSON/CSV 并存）
+    if db_conn is not None:
+        try:
+            record_db_run(db_conn, db_run_id, mode="single",
+                          keyword=args.keyword, city=args.city,
+                          job_count=len(list_data.get("jobs", [])),
+                          detail_count=len(details or []))
+            s = db_store_stats(db_conn)
+            print(f"\n🗄️  SQLite: 列表 {s['jobs']}｜详情 {s['details']}"
+                  f"（含 JD {s['details_with_jd']}）｜runs {s['runs']}｜{s['db_path']}")
+        finally:
+            db_conn.close()
 
     # 抓取正常结束后按需收尾（仅成功路径；异常/登录失败走 sys.exit，不会触发，保留登录态）
     if args.close_chrome:
