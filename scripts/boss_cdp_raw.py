@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.12.1"
+__version__ = "2.13.0"
 
 import argparse
 import base64
@@ -2748,6 +2748,41 @@ def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
                 log.debug("关闭被动捕获 tab 失败", exc_info=True)
 
 
+def split_keywords(raw):
+    """把 ``--keyword`` 拆成关键词列表（逗号分隔；去空白、去空项、保序去重）。
+
+    单关键词返回 ``[raw]``；全空返回 ``[]``。
+    """
+    seen = set()
+    out = []
+    for part in str(raw or "").split(","):
+        key = part.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+def merge_list_data(base, incoming):
+    """按 job_id 合并两次列表抓取结果（并集，先到优先），并合并 security_map。
+
+    多关键词（§4.1）依次抓取后调用；``keyword`` 字段以逗号连接作为统一标签。
+    """
+    if not isinstance(incoming, dict):
+        return base
+    if base is None:
+        return incoming
+    merged_jobs = merge_unique(base.get("jobs") or [], incoming.get("jobs") or [])
+    merged_map = dict(base.get("security_map") or {})
+    merged_map.update(incoming.get("security_map") or {})
+    base["jobs"] = merged_jobs
+    base["total"] = len(merged_jobs)
+    base["security_map"] = merged_map
+    labels = [x for x in (base.get("keyword", ""), incoming.get("keyword", "")) if x]
+    base["keyword"] = ",".join(labels)
+    return base
+
+
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr"):
@@ -5283,7 +5318,9 @@ def build_parser():
 
     # ---- 搜索参数 ----
     g_search = p.add_argument_group("搜索参数")
-    g_search.add_argument("--keyword", default="AI Agent", help="搜索关键词")
+    g_search.add_argument("--keyword", default="AI Agent",
+                          help="搜索关键词；支持逗号分隔多关键词（依次抓取并按 job_id 自动合并，"
+                               "如 \"Java 后端,Java 风控\"）")
     g_search.add_argument("--city", default=DEFAULT_CITY_INPUT,
                           help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
     g_search.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
@@ -5584,15 +5621,54 @@ def run_cli():
         swept = close_orphan_dock_tabs(args.cdp_port)
         if swept:
             print(f"🧹 已清扫 {swept} 个残留停靠 tab")
-        list_data = scrape_list(
-            args.keyword, args.city, args.pages, filters, args.output,
-            cdp_port=args.cdp_port, fmt=args.format,
-            allow_dom_fallback=args.allow_dom_fallback,
-            max_jobs=args.max_jobs,
-            max_concurrent=args.max_concurrent,
-            pages_parallel=args.pages_parallel,
-            list_mode=args.list_mode,
-        )
+        keywords = split_keywords(args.keyword) or [args.keyword]
+        if len(keywords) == 1:
+            list_data = scrape_list(
+                keywords[0], args.city, args.pages, filters, args.output,
+                cdp_port=args.cdp_port, fmt=args.format,
+                allow_dom_fallback=args.allow_dom_fallback,
+                max_jobs=args.max_jobs,
+                max_concurrent=args.max_concurrent,
+                pages_parallel=args.pages_parallel,
+                list_mode=args.list_mode,
+            )
+        else:
+            # §4.1 多关键词：依次抓取（复用单关键词链路），按 job_id 合并为一份列表
+            print(f"ℹ️  多关键词模式：依次抓 {len(keywords)} 个关键词并合并 → "
+                  f"{', '.join(keywords)}")
+            list_data = None
+            for idx, kw in enumerate(keywords, 1):
+                print(f"\n=== [{idx}/{len(keywords)}] 关键词: {kw} ===")
+                part = scrape_list(
+                    kw, args.city, args.pages, filters, None,
+                    cdp_port=args.cdp_port, fmt=args.format,
+                    allow_dom_fallback=args.allow_dom_fallback,
+                    max_jobs=args.max_jobs,
+                    max_concurrent=args.max_concurrent,
+                    pages_parallel=args.pages_parallel,
+                    list_mode=args.list_mode,
+                )
+                list_data = merge_list_data(list_data, part)
+                if idx < len(keywords):
+                    gap = random.uniform(8, 15)
+                    print(f"  关键词间等待 {gap:.0f}s（防风控）...\n")
+                    time.sleep(gap)
+            # 合并结果落盘（单一输出文件；各关键词中间文件保留作断点续抓）
+            merged_path = args.output or default_output_path("jobs")
+            flush_jobs(merged_path, {
+                "keyword": list_data.get("keyword", ""),
+                "city": list_data.get("city", ""),
+                "filters": filters,
+                "scraped_at": datetime.now().isoformat(),
+                "multi_keyword": keywords,
+            }, list_data.get("jobs") or [])
+            list_data["output_path"] = merged_path
+            print(f"\n✅ 多关键词合并完成：{len(list_data.get('jobs') or [])} 条 → {merged_path}")
+            if args.format == "csv":
+                write_csv(merged_path.rsplit(".", 1)[0] + ".csv",
+                          list_data.get("jobs") or [])
+        # 统一后续流程的关键词标签（单/多关键词一致）
+        args.keyword = list_data.get("keyword") or args.keyword
         # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
         sidecar_owned = write_security_sidecar(
             list_data.get("output_path"), list_data.get("security_map"))

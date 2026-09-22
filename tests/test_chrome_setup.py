@@ -4857,6 +4857,38 @@ def _normalize_version(raw):
     return f"{major}.{minor}"
 
 
+class MultiKeywordTests(unittest.TestCase):
+    """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
+
+    def test_split_keywords_trims_dedups_and_drops_empty(self):
+        module = load_module()
+        self.assertEqual(module.split_keywords("A,B"), ["A", "B"])
+        self.assertEqual(module.split_keywords(" A , B "), ["A", "B"])
+        self.assertEqual(module.split_keywords("A,,B,"), ["A", "B"])
+        self.assertEqual(module.split_keywords("A,A,B"), ["A", "B"])
+        self.assertEqual(module.split_keywords(""), [])
+        self.assertEqual(module.split_keywords(None), [])
+        self.assertEqual(module.split_keywords("单关键词"), ["单关键词"])
+
+    def test_merge_list_data_unions_jobs_and_security_map(self):
+        module = load_module()
+        base = {"keyword": "A", "city": "杭州", "jobs": [{"job_id": "1", "title": "x"}],
+                "security_map": {"1": "s1"}, "total": 1}
+        incoming = {"keyword": "B", "city": "杭州",
+                    "jobs": [{"job_id": "1", "title": "x"}, {"job_id": "2", "title": "y"}],
+                    "security_map": {"2": "s2"}, "total": 2}
+        merged = module.merge_list_data(base, incoming)
+        self.assertEqual([j["job_id"] for j in merged["jobs"]], ["1", "2"])
+        self.assertEqual(merged["total"], 2)
+        self.assertEqual(merged["security_map"], {"1": "s1", "2": "s2"})
+        self.assertEqual(merged["keyword"], "A,B")
+
+    def test_merge_list_data_base_none_returns_incoming(self):
+        module = load_module()
+        incoming = {"keyword": "A", "jobs": [], "security_map": {}}
+        self.assertIs(module.merge_list_data(None, incoming), incoming)
+
+
 class PassiveCaptureTests(unittest.TestCase):
     """上游 #55 移植：Network 域被动捕获（--list-mode passive）+ Python 字段映射。"""
 

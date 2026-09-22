@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.12 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.13 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.12.1-orange.svg)
+![Version](https://img.shields.io/badge/version-2.13.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -162,7 +162,7 @@ python3 scripts/job_summary.py --top 15
 
 | Parameter | Description |
 |-----------|-------------|
-| `--keyword` | Search keyword (default "AI Agent") |
+| `--keyword` | Search keyword (default "AI Agent"); comma-separated multi-keyword supported (scraped in turn and merged by job_id, e.g. `"Java 后端,Java 风控"`) |
 | `--city` | City (Chinese name or 9-digit code, default Shanghai). **Supports cities nationwide** (300+, incl. tier-3/4/5); city codes auto-sync from BOSS at runtime. See [`data/city_codes.json`](data/city_codes.json), or run `--list-cities`. An unrecognized city name now exits with an error instead of silently producing zero results |
 | `--list-cities [keyword]` | Print the supported city list, optional keyword filter, e.g. `--list-cities 江` |
 | `--pages` | Number of pages (max 10) |
