@@ -1510,12 +1510,64 @@ class ChromeSetupTests(unittest.TestCase):
     # ----- 连续空页风控静默降级（#4b）-----
 
     def test_scrape_list_stops_after_two_empty_pages(self):
-        """连续 2 页无数据（风控静默降级信号）→ EXPORT_FAIL 停止。"""
+        """连续 2 页无数据 + 页面**确认风控** → EXPORT_FAIL 停止（双确认）。"""
         module = load_module()
         cdp = mock.Mock()
 
         def fake_eval_js(script, sid=None):
             return json.dumps([])  # 全部空页
+
+        cdp.eval_js.side_effect = fake_eval_js
+        with mock.patch.object(module, "resolve_city",
+                               return_value=("上海", "101020100")), \
+                mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "API_ATTEMPT_LIMIT", 1), \
+                mock.patch.object(module, "probe_risk_page",
+                                  side_effect=[{}, {"hasSlider": True}]), \
+                mock.patch.object(module, "flush_jobs"), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch("sys.stdout",
+                           new_callable=__import__("io").StringIO) as out:
+            result = module.scrape_list("AI", "上海", 3, {}, None)
+        printed = out.getvalue()
+        self.assertIn("EXPORT_FAIL reason=risk_blocked", printed)
+        self.assertEqual(result["jobs"], [])
+
+    def test_scrape_list_empty_pages_without_risk_stops_neutrally(self):
+        """连续 2 页无数据但页面**未确认风控** → 按无数据停止，不判风控/不写冷却（防误停）。"""
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.eval_js.side_effect = lambda script, sid=None: json.dumps([])
+        with mock.patch.object(module, "resolve_city",
+                               return_value=("上海", "101020100")), \
+                mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("t", "s")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "flush_jobs"), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch("sys.stdout",
+                           new_callable=__import__("io").StringIO) as out:
+            result = module.scrape_list("AI", "上海", 3, {}, None)
+        printed = out.getvalue()
+        self.assertNotIn("EXPORT_FAIL reason=risk_blocked", printed)
+        self.assertIn("未确认风控", printed)
+        self.assertEqual(result["jobs"], [])
+
+    def test_scrape_list_stops_on_repeated_page_set(self):
+        """翻页失效（本页 job 集合与之前完全相同）→ 提前结束，不再重复翻页。"""
+        module = load_module()
+        cdp = mock.Mock()
+
+        def fake_eval_js(script, sid=None):
+            if "xhr.open" not in script:
+                return None
+            jobs = [{"title": f"AI岗位{i}", "salary": "20-40K",
+                     "job_link": f"https://example.com/job/{i}",
+                     "boss_name": "公司"} for i in range(30)]
+            return json.dumps(jobs)  # 每页完全相同
 
         cdp.eval_js.side_effect = fake_eval_js
         with mock.patch.object(module, "resolve_city",
@@ -1529,9 +1581,17 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch("sys.stdout",
                            new_callable=__import__("io").StringIO) as out:
             result = module.scrape_list("AI", "上海", 3, {}, None)
-        printed = out.getvalue()
-        self.assertIn("EXPORT_FAIL reason=risk_blocked", printed)
-        self.assertEqual(result["jobs"], [])
+        self.assertIn("内容重复（翻页失效）", out.getvalue())
+        self.assertEqual(len(result["jobs"]), 30)  # 第 2 页判重即停，不再增长
+
+    def test_page_fingerprint_is_set_of_job_keys(self):
+        module = load_module()
+        self.assertEqual(
+            module.page_fingerprint([{"job_link": "a"}, {"title": "t"},
+                                     {"job_link": "a"}, {}]),
+            frozenset({"a", "t"}))
+        self.assertEqual(module.page_fingerprint([]), frozenset())
+        self.assertEqual(module.page_fingerprint(None), frozenset())
 
     def test_scrape_list_aborts_when_lock_held(self):
         module = load_module()

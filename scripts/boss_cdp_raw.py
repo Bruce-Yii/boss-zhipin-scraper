@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.13.0"
+__version__ = "2.13.1"
 
 import argparse
 import base64
@@ -2783,6 +2783,17 @@ def merge_list_data(base, incoming):
     return base
 
 
+def page_fingerprint(jobs):
+    """整页 job 指纹（job_link/标题 的 frozenset）——用于"翻页失效=内容重复"判停。"""
+    keys = set()
+    for j in jobs or []:
+        if isinstance(j, dict):
+            key = j.get("job_link") or j.get("title") or ""
+            if key:
+                keys.add(key)
+    return frozenset(keys)
+
+
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr"):
@@ -2846,6 +2857,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     actual_pages = 0
     warnings = []
     empty_pages = 0  # 连续空页计数（风控静默降级信号，>=2 即停）
+    seen_page_fingerprints = set()  # 整页 job 指纹：重复=翻页失效，提前停（BossHunter 手法）
 
     tid, sid = create_page_session(cdp, background=page_background_default())
 
@@ -2996,17 +3008,31 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
             if not jobs:
                 # 空数据可能是风控静默降级信号（HTTP 200 + 空 jobList），
-                # 连续 N 页空则按风控处理挂起等人工，而非静默跳过
+                # 连续 N 页空 → 先"双确认"：探测页面是否真有风控/验证码；
+                # 无风控证据时按"无数据"停止，**不判风控、不写冷却、不告警**（防误停/防冷却污染）。
                 empty_pages += 1
                 if empty_pages >= 2:
-                    print("⚠️ 连续多页无数据（疑似风控静默降级），停止抓取（保留已抓数据）。")
-                    warnings.append("连续多页无数据（疑似风控静默降级）")
-                    print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
-                    send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                    is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                    if is_risk:
+                        print(f"⚠️ 连续多页无数据且页面命中风控（{reason}），停止抓取（保留已抓数据）。")
+                        warnings.append(f"连续多页无数据+风控页确认: {reason}")
+                        print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                    else:
+                        print("⚠️ 连续多页无数据（页面未确认风控），按无数据停止（保留已抓数据）。")
+                        warnings.append("连续多页无数据（页面未确认风控）")
                     return {"keyword": keyword, "city": city_name,
                             "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                 print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
                 continue
+
+            # 重复页指纹停：本页 job 集合与之前某页完全相同 → 翻页失效（新版列表 page=N 无效），提前结束
+            page_fp = page_fingerprint(jobs)
+            if page_fp and page_fp in seen_page_fingerprints:
+                print(f"  第 {pg} 页与之前页内容重复（翻页失效），提前结束")
+                warnings.append(f"第{pg}页与之前重复（翻页失效），提前结束")
+                break
+            seen_page_fingerprints.add(page_fp)
 
             if len(jobs) < PAGE_SIZE:
                 exhausted = True  # 本页不足一页 → 已翻到底（--pages 1 单页 <30 同理）
