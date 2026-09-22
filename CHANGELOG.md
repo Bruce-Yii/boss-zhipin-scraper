@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.12.1 (2026-09-22)
+
+### 工程 / CI
+- **对齐上游 #81（适配移植）**：`ci.yml` 增最小权限 `permissions: contents: read` 与各 job `timeout-minutes`（防挂死占 runner）。**不采纳**上游 #81 的 `ci.yml` 重写（其面向 3.10/3.13 + uv、无 ruff/覆盖率/契约校验，弱于现有 CI）与 `pullfrog.yml`（第三方 AI 审查机器人，需 secrets，非必需）
+
 ## v2.12.0 (2026-09-22)
 
 ### 新增
