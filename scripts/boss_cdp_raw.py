@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.0"
+__version__ = "2.16.1"
 
 import argparse
 import base64
@@ -1384,6 +1384,18 @@ def _rotate_api_tab(session, cdp_port, keyword, city_code):
         return False
     session[0], session[1], session[2], session[3] = fresh
     return True
+
+
+def _open_dom_tab(cdp_port):
+    """开一个共享 DOM 详情 tab（串行 dom 通道用，#51）。
+
+    与 ``_open_api_tab`` 不同：**不停靠搜索页**（首个导航即详情 URL）、
+    无 4-8s 停靠等待。返回可变会话列表 ``[ws, target_id, session_id, nav_count]``
+    （第 4 位记录导航数，供后续观测/轮换策略用）。
+    """
+    ws = CDPSession(cdp_port)
+    tid, sid = create_page_session(ws, background=page_background_default())
+    return [ws, tid, sid, 0]
 
 
 def _parse_detail_api_value(val, job):
@@ -4006,7 +4018,7 @@ def capture_debug_screenshot(ws, sid, tag):
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                        limiter=None, verbose=False, security_id=None,
                        api_session=None, city_code="", search_keyword="",
-                       id_mode="security"):
+                       id_mode="security", dom_session=None):
     """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
 
     Args:
@@ -4024,6 +4036,9 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         id_mode: "security"=jobId+securityId+city；"encrypt"=仅 jobId
             （securityId 缺失时的兜底通道；invalid_params/解析类/会话类
             失败回退 DOM，真风控 fail-closed 上抛）
+        dom_session: 可选共享 DOM 详情会话（串行 dom 通道，#51）——提供时
+            DOM 路径复用该 tab 逐岗导航，**finally 不关闭**（由调用方管理）；
+            为 None 时逐岗自建 WS+tab 并自行关闭（旧行为，并发模式沿用）
 
     Returns:
         dict: {"ok": bool, "detail": dict|None, "job_id": str,
@@ -4065,9 +4080,14 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
 
     ws = None
     tid = None
+    shared_dom = dom_session is not None
     try:
-        ws = CDPSession(cdp_port)
-        tid, sid = create_page_session(ws, background=page_background_default())
+        if shared_dom:
+            # 共享 DOM tab（串行 dom 通道，#51）：复用会话逐岗导航，不重开 WS/tab
+            ws, tid, sid = dom_session[0], dom_session[1], dom_session[2]
+        else:
+            ws = CDPSession(cdp_port)
+            tid, sid = create_page_session(ws, background=page_background_default())
 
         detail_url = build_detail_url(job)
         # 并发模式全局限速：导航（真实请求）前申请配额
@@ -4131,7 +4151,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         return {"ok": False, "detail": None, "job_id": job_id,
                 "reason": "cdp_session", "message": str(exc)}
     finally:
-        if ws is not None:
+        # 共享 DOM tab（#51）生命周期归调用方，单岗不得关闭
+        if not shared_dom and ws is not None:
             try:
                 if tid is not None:
                     ws.send("Target.closeTarget", {"targetId": tid})
@@ -4374,6 +4395,19 @@ def scrape_details(list_data, max_details=None, output_path=None,
             api_session = None
             api_tab_failed = True
 
+    # 共享 DOM 详情 tab（#51，仅串行 + dom 通道）：逐岗 Page.navigate 复用同一
+    # tab，省每岗 WS/tab 重开（~0.4s/岗）；中途 cdp_session 失败自动关旧重建，
+    # 重建失败回退逐岗自建。auto/api 通道的 DOM 兜底决策在 worker 内部，仍走
+    # 逐岗自建（保持本 PR 范围最小）。
+    dom_session = None
+    dom_tab_failed = False
+    if detail_channel == "dom" and jobs:
+        try:
+            dom_session = _open_dom_tab(cdp_port)
+        except _cdp_exception_types():
+            log.warning("共享 DOM tab 建立失败，回退逐岗自建会话", exc_info=True)
+            dom_tab_failed = True
+
     for idx, job in enumerate(jobs):
         if max_seconds and time.time() - start_time >= max_seconds:
             print(f"⏱️ 已达 --max-seconds={max_seconds}s 预算，优雅停止详情"
@@ -4432,12 +4466,26 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 api_tab_failed = True
                 api_session = None
 
+        # 共享 DOM tab 重建（#51）：坏档后下一岗尝试重建（此前重建失败则不自愈，
+        # 由 worker 逐岗自建兜底）
+        if (detail_channel == "dom" and dom_session is None
+                and not dom_tab_failed):
+            try:
+                dom_session = _open_dom_tab(cdp_port)
+                print("  🧷 已重建共享 DOM tab")
+            except _cdp_exception_types():
+                log.warning("共享 DOM tab 重建失败，回退逐岗自建会话",
+                            exc_info=True)
+                dom_tab_failed = True
+                dom_session = None
+
         result = _scrape_one_detail(job, cdp_port, verbose=True,
                                     security_id=job_security,
                                     api_session=api_session,
                                     city_code=detail_city_code,
                                     search_keyword=detail_keyword,
-                                    id_mode=job_id_mode)
+                                    id_mode=job_id_mode,
+                                    dom_session=dom_session)
         # 风控码二分：仅 token_expired（会话/令牌过期）值得换 tab 刷新后重试一次；
         # env_risk/account_risk/security_block 换 tab 无用 → 不重试，直接全停冷却
         if (result["reason"] == "risk_timeout" and job_security
@@ -4451,7 +4499,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
                                             api_session=api_session,
                                             city_code=detail_city_code,
                                             search_keyword=detail_keyword,
-                                            id_mode=job_id_mode)
+                                            id_mode=job_id_mode,
+                                            dom_session=dom_session)
         if result["ok"] and api_session is not None:
             api_session[3] += 1
         reason = result["reason"]
@@ -4484,6 +4533,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
             if job_id:
                 pending[job_id] = pending.get(job_id, 0) + 1
                 save_pending_ids(output_path, pending)
+            # 共享 DOM tab 疑似损坏（#51）：关闭置空，下一岗尝试重建
+            if dom_session is not None:
+                _close_api_tab(dom_session)
+                dom_session = None
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
                 mark_cdp_cooldown()  # 熔断冷却：冷却内拒绝自动重开
@@ -4533,6 +4586,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
     # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
     _close_api_tab(api_session)
+    # 关闭共享 DOM 详情 tab（#51，串行 dom 通道）
+    if dom_session is not None:
+        _close_api_tab(dom_session)
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
     _atomic_write_json(output_path, results)

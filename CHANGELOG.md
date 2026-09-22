@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.16.1 (2026-09-23)
+
+### 优化（DOM 链路优化方案 · 优化点 B / #51）
+- **DOM 详情共享停靠 tab（串行 `--detail-channel dom`）**：新增 `_open_dom_tab`（不停靠搜索页、无 4-8s 等待），全程一个 tab 逐岗 `Page.navigate` 复用——省每岗 WS 握手 + tab 创建/销毁（~0.4s/岗）+ 减少对象 churn；顺序同 tab 浏览也比"每岗新开 tab"更像真人。中途 `cdp_session` 失败自动关旧重建（重建失败回退逐岗自建），结束统一关闭。
+- `_scrape_one_detail` 增 `dom_session` 参数：提供则复用（单岗不关闭，生命周期归调用方）；缺省逐岗自建（旧行为，并发模式与 auto/api 的 DOM 兜底不变）。
+- 节律参数不动（`DETAIL_DOM_GAP_SECONDS` 调整属 #31 实验范围）。
+
 ## v2.16.0 (2026-09-23)
 
 ### 新增（详情 encryptJobId 兜底通道 · 详情 API 专题 §7-1 / #49）
