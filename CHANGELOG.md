@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.8.0 (2026-09-22)
+
+### 新增
+- **P4d 时间字段三件套**：
+  - **详情 API 富化（零额外请求）**：`DETAIL_API_JS` 增取 `brandComInfo.activeTime` → 详情记录新增 `brand_active_time`（公司级活跃时间）；复用既有每岗一次详情请求，**不为时间字段单独拉详情**（同行因"列表时间需拉详情"被秒封，故天然满足配额/错峰/失败降级）
+  - **DOM 保底**：`EXTRACT_DETAIL_JS` 增取 `div.info-publis>p`（`publish_time` 相对发布时间）与 `.boss-active-time`（HR 活跃）；`extract_detail_fields` 在 recruiter 卡无活跃行时用 `.boss-active-time` 兜底
+  - **僵尸岗过滤（opt-in）**：新增 `--filter-inactive`（默认关闭），保守规则仅匹配「周/月/年前活跃」——实测「本周活跃」「2周内活跃」不误杀；命中从导出剔除并在 meta 记 `inactive_filtered`
+- 测试 +8
+
+### 文档
+- README（中英）/ `SKILL.md` 补充新字段与 `--filter-inactive`
+
 ## v2.7.0 (2026-09-22)
 
 ### 新增

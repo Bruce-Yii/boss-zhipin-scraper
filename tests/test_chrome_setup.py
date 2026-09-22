@@ -3258,6 +3258,91 @@ class ChromeSetupTests(unittest.TestCase):
         rec2 = module.build_detail_record(job, {"jd": "JD"})
         self.assertEqual(rec2["page_update_date"], "")
 
+    def test_extract_detail_fields_reads_dom_publish_time_and_hr_active_time(self):
+        """DOM 保底：publish_time（div.info-publis>p）与 hr_active_time（.boss-active-time）。"""
+        module = load_module()
+        description = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        fields = module.extract_detail_fields({
+            "jd": f"职位描述\n{description}",
+            "page_text": description,
+            "publish_time": "3天前发布",
+            "hr_active_time": "半年前活跃",
+        })
+        self.assertEqual(fields["publish_time"], "3天前发布")
+        # recruiter 卡无活跃行时，用 .boss-active-time 兜底
+        self.assertEqual(fields["boss_active_status"], "半年前活跃")
+
+    def test_extract_detail_fields_prefers_recruiter_card_over_hr_selector(self):
+        """recruiter 卡已给出活跃度时，不覆盖 DOM .boss-active-time。"""
+        module = load_module()
+        description = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        page_text = f"职位描述\n{description}张女士\n今日活跃\n示例公司\n·\n招聘专员"
+        fields = module.extract_detail_fields({
+            "jd": page_text, "page_text": page_text, "hr_active_time": "半年前活跃",
+        })
+        self.assertEqual(fields["boss_active_status"], "今日活跃")
+
+    def test_build_detail_record_carries_publish_and_brand_active_time(self):
+        module = load_module()
+        job = {"job_id": "j1", "title": "T", "job_link": "https://www.zhipin.com/job/x.html",
+               "boss_name": "C", "salary": "20-30K", "location": "杭州", "tags": ""}
+        rec = module.build_detail_record(job, {
+            "jd": "JD", "publish_time": "昨日发布", "brand_active_time": "刚刚活跃"})
+        self.assertEqual(rec["publish_time"], "昨日发布")
+        self.assertEqual(rec["brand_active_time"], "刚刚活跃")
+        rec2 = module.build_detail_record(job, {"jd": "JD"})
+        self.assertEqual(rec2["publish_time"], "")
+        self.assertEqual(rec2["brand_active_time"], "")
+
+    def test_parse_detail_api_value_reads_brand_active_time(self):
+        """详情 API 同一次响应内取 brandComInfo.activeTime（零额外请求），publish_time 为空。"""
+        module = load_module()
+        payload = {"code": 0, "jd": "负责 AI 产品规划、需求分析、研发协作和上线复盘。\n" * 8,
+                   "boss_active_status": "刚刚活跃", "brand_active_time": "刚刚活跃"}
+        fields = module._parse_detail_api_value(json.dumps(payload), {"job_id": "j1"})
+        self.assertEqual(fields["brand_active_time"], "刚刚活跃")
+        self.assertEqual(fields["publish_time"], "")
+
+    def test_detail_extractors_expose_time_selectors(self):
+        """EXTRACT_DETAIL_JS/DETAIL_API_JS 含时间与活跃度选择器（防回归）。"""
+        module = load_module()
+        self.assertIn("info-publis", module.EXTRACT_DETAIL_JS)
+        self.assertIn("boss-active-time", module.EXTRACT_DETAIL_JS)
+        self.assertIn("brand.activeTime", module.DETAIL_API_JS)
+
+    def test_is_inactive_activity_conservative(self):
+        """僵尸岗正则保守：周/月/年前活跃 → True；实测近期标签不得误杀。"""
+        module = load_module()
+        for active in ("刚刚活跃", "今日活跃", "3日内活跃", "本周活跃",
+                       "2周内活跃", "在线", ""):
+            self.assertFalse(module.is_inactive_activity(active),
+                             f"不应判为僵尸: {active}")
+        for zombie in ("半年前活跃", "1个月前活跃", "3周前活跃", "2年前活跃"):
+            self.assertTrue(module.is_inactive_activity(zombie),
+                            f"应判为僵尸: {zombie}")
+
+    def test_inactive_job_ids_and_export_filter(self):
+        """详情活跃度优先于列表；命中 job_id 从导出文件剔除并记 meta。"""
+        module = load_module()
+        ids = module.inactive_job_ids(
+            details=[{"job_id": "b", "boss_active_status": "半年前活跃"}],
+            jobs=[{"job_id": "a", "boss_active_status": "刚刚活跃"},
+                  {"job_id": "b", "boss_active_status": "刚刚活跃"}])
+        self.assertEqual(ids, {"b"})
+
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "boss_jobs_x.json")
+            pathlib.Path(path).write_text(json.dumps({
+                "job_id": "x",
+                "jobs": [{"job_id": "a", "title": "A"}, {"job_id": "b", "title": "B"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            kept, dropped = module.filter_inactive_in_export(path, ids)
+            self.assertEqual((kept, dropped), (1, 1))
+            out = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+            self.assertEqual([j["job_id"] for j in out["jobs"]], ["a"])
+            self.assertEqual(out["inactive_filtered"], 1)
+            self.assertEqual(out["job_count"], 1)
+
     def test_extract_job_description_rejects_login_truncation(self):
         module = load_module()
         page_text = (

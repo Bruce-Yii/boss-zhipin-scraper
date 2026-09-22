@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.7 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.8 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.7.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.8.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -164,6 +164,7 @@ python3 scripts/job_summary.py --top 15
 | `--no-detail` | Do not scrape detail pages |
 | `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors). **The API channel reuses a shared tab pool** and paces about 15s per worker (`DETAIL_API_PACE_SECONDS`), i.e. about N/15 requests per second at concurrency N |
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
+| `--filter-inactive` | Drop long-inactive (zombie) jobs by HR activity (matches only "active N weeks/months/years ago"; does not drop this-week/this-month activity); off by default |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--db [PATH]` | Enable the SQLite incremental store (WAL) + cross-run detail resume; without a value it uses the default DB `~/.boss-zhipin-scraper/boss.db` (outside the repo, never committed); JSON/CSV exports are unchanged |
@@ -225,7 +226,7 @@ The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-jo
 - `format_version` increments on contract changes; `warnings` records scrape anomalies (empty API responses / risk blocks)
 - Required fields: `job_id`/`title`/`location`/`job_link`/`company_name`; sensitive fields are stripped before writing (credentials never land in files)
 - Optional (list scraping): `exhausted` (bool — whether this run reached the end of the result set: any page returning <30 items → true; `--pages 1` with <30 items → true; full pages without reaching the end → false. Basis for the spec-side sampling-aware de-listing; formally included in contract v2; missing field treated as false), `anonymous` (anonymous-posting flag 0/1 — recruiter hides the company name), `job_valid_status` (BOSS's official in-recruitment status, can calibrate de-listing inference), `icon_flags`/`icon_word` (platform labels such as "urgent"/"new"), `proxy_job`/`proxy_type` (proxy-hiring markers: headhunter/outsourcing), `job_type` (job type code)
-- Optional (detail scraping): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — DOM path only, unavailable via the API channel), `job_status_desc` (job status description), `brand_introduce` (company intro), `brand_stage_name`/`brand_scale_name`/`brand_industry_name` (company semantic dimensions)
+- Optional (detail scraping): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — DOM path only, unavailable via the API channel), `job_status_desc` (job status description), `brand_introduce` (company intro), `brand_stage_name`/`brand_scale_name`/`brand_industry_name` (company semantic dimensions), `publish_time` (relative publish time, DOM-only via `div.info-publis>p`), `brand_active_time` (company-level activity time from the detail API `brandComInfo.activeTime`, no extra request)
 - **Detail scraping uses the API channel** (2026-08-14): one lightweight request per job (`/wapi/zpgeek/job/detail.json`) instead of full-page rendering — JD returns in ~0s; `securityId` is passed in-process from the list stage (never written to export files, red line preserved); each tab allows ~4-5 requests and the program rotates tabs automatically; `--input` backfill of old files automatically falls back to DOM rendering
 - **Mode 1 (default): jd merged into the export, jobs without JD are dropped** (2026-09-22): every job carries `jd` inline; JD-less jobs are removed (meta records `jd_coverage` and `dropped_no_jd`); `--keep-without-jd` keeps them with a marker
 - **Explicit dual-channel** (2026-09-22): the detail phase records `detail_channel` in meta (`api`/`dom`/`mixed`) — API fast path when `securityId` is available, otherwise the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it falls back to DOM **with an explicit warning**

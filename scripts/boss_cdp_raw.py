@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.7.0"
+__version__ = "2.8.0"
 
 import argparse
 import csv
@@ -917,11 +917,19 @@ EXTRACT_DETAIL_JS = """
             jd = text;
         }
     }
+    var publishTime = '';
+    var pubEl = document.querySelector('div.info-publis > p, .info-publis p');
+    if (pubEl && pubEl.innerText) publishTime = pubEl.innerText.trim();
+    var hrActive = '';
+    var hrEl = document.querySelector('.boss-active-time');
+    if (hrEl && hrEl.innerText) hrActive = hrEl.innerText.trim();
     return JSON.stringify({
         jd: jd,
         page_text: pageText.substring(0, 12000),
         tags: tags,
-        url: location.href
+        url: location.href,
+        publish_time: publishTime,
+        hr_active_time: hrActive
     });
 })()
 """
@@ -961,6 +969,7 @@ DETAIL_API_JS = r"""
         jd: info.postDescription || '',
         job_status_desc: info.jobStatusDesc || '',
         boss_active_status: boss.activeTimeDesc || '',
+        brand_active_time: brand.activeTime || '',
         brand_introduce: brand.introduce || '',
         brand_stage_name: brand.stageName || '',
         brand_scale_name: brand.scaleName || '',
@@ -1063,7 +1072,10 @@ def _parse_detail_api_value(val, job):
     return {
         "jd": jd,
         "boss_active_status": str(payload.get("boss_active_status") or ""),
+        # 公司级活跃时间（详情 API 同一次响应内的 brandComInfo.activeTime；零额外请求）
+        "brand_active_time": str(payload.get("brand_active_time") or ""),
         "page_update_date": "",  # API 通道无详情页"页面更新时间"（可选字段，退化点已记录）
+        "publish_time": "",      # 相对发布时间仅 DOM 路径有（div.info-publis>p）
         "job_status_desc": str(payload.get("job_status_desc") or ""),
         "brand_introduce": str(payload.get("brand_introduce") or ""),
         "brand_stage_name": str(payload.get("brand_stage_name") or ""),
@@ -1111,6 +1123,63 @@ def resolve_boss_active_status(list_status="", detail_status=""):
     if detail:
         return detail
     return str(list_status or "").strip()
+
+
+# 僵尸岗信号：HR「周/月/年前活跃」（实测标签有 半年前活跃 等）。
+# 保守规则——**要求出现"前活跃"**，避免误杀实测的近期标签「本周活跃」「2周内活跃」
+# （2026-09-22 本地详情聚合：本周活跃 8、2周内活跃 5 均属近期活跃；照抄 [周月年] 会误杀）。
+_ZOMBIE_ACTIVITY_RE = re.compile(r"(?:\d+\s*)?(?:个?月|周|年)\s*前活跃")
+
+
+def is_inactive_activity(status):
+    """True 当 HR 活跃度显示为"周/月/年前活跃"（僵尸岗信号）。"""
+    return bool(_ZOMBIE_ACTIVITY_RE.search(str(status or "")))
+
+
+def inactive_job_ids(details=None, jobs=None):
+    """汇总 job_id → HR 活跃度（详情优先、列表兜底），返回僵尸岗 job_id 集合。"""
+    status = {}
+    for rec in jobs or []:
+        if isinstance(rec, dict) and rec.get("job_id"):
+            status[str(rec["job_id"])] = rec.get("boss_active_status", "")
+    for rec in details or []:
+        if isinstance(rec, dict) and rec.get("job_id"):
+            status[str(rec["job_id"])] = rec.get("boss_active_status", "")
+    return {jid for jid, st in status.items() if is_inactive_activity(st)}
+
+
+def filter_inactive_in_export(path, inactive_ids):
+    """从导出的列表文件中剔除给定 job_id（--filter-inactive）；返回 (kept, dropped)。
+
+    在口径一（jd 并入）之后对最终导出生效，保证下游拿到的是过滤后的岗位集；
+    meta 记 `inactive_filtered` 与 warning 便于追溯。
+    """
+    inactive_ids = {str(j) for j in (inactive_ids or set())}
+    if not inactive_ids or not path or not os.path.exists(path):
+        return 0, 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return 0, 0
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        return 0, 0
+    kept, dropped = [], 0
+    for job in data["jobs"]:
+        if isinstance(job, dict) and str(job.get("job_id") or "") in inactive_ids:
+            dropped += 1
+        else:
+            kept.append(job)
+    if dropped:
+        data["jobs"] = kept
+        data["job_count"] = len(kept)
+        data["total"] = len(kept)
+        data["inactive_filtered"] = dropped
+        warnings = list(data.get("warnings") or [])
+        warnings.append(f"--filter-inactive：已剔除 {dropped} 条 HR 长期未活跃岗位")
+        data["warnings"] = warnings
+        _atomic_write_json(path, data)
+    return len(kept), dropped
 
 
 def _recruiter_footer_info(lines):
@@ -1207,8 +1276,15 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
     # 非契约可选字段，缺失留空；用于区分"岗位侧更新时间"与"我方抓取时间"。
     update_m = re.search(r"页面更新时间[：:]\s*(\d{4}-\d{2}-\d{2})", page_text)
     page_update_date = update_m.group(1) if update_m else ""
+    # HR 活跃度 DOM 兜底：recruiter 卡未取到活跃行时，用 .boss-active-time
+    hr_active_time = str(extracted.get("hr_active_time") or "").strip()
+    if not boss_active_status and _is_boss_activity_line(hr_active_time):
+        boss_active_status = hr_active_time
+    # 相对发布时间（div.info-publis>p；仅 DOM 路径，形如"3天前发布"）
+    publish_time = _normalize_detail_whitespace(
+        str(extracted.get("publish_time") or "")).strip()
     return {"jd": jd, "boss_active_status": boss_active_status,
-            "page_update_date": page_update_date}
+            "page_update_date": page_update_date, "publish_time": publish_time}
 
 
 def extract_job_description(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
@@ -2694,12 +2770,14 @@ def build_detail_record(job, extracted):
         "skill_tags": extracted.get("tags", []),
         "jd": extracted.get("jd", ""),
         "page_update_date": extracted.get("page_update_date", ""),
+        "publish_time": extracted.get("publish_time", ""),
         # 详情 API 通道新增可选字段（2026-08-14；用户拍板精简范围；DOM 路径缺省空，兼容）
         "job_status_desc": extracted.get("job_status_desc", ""),
         "brand_introduce": extracted.get("brand_introduce", ""),
         "brand_stage_name": extracted.get("brand_stage_name", ""),
         "brand_scale_name": extracted.get("brand_scale_name", ""),
         "brand_industry_name": extracted.get("brand_industry_name", ""),
+        "brand_active_time": extracted.get("brand_active_time", ""),
     }
 
 
@@ -4913,6 +4991,9 @@ def build_parser():
     g_detail.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
     g_detail.add_argument("--keep-without-jd", action="store_true",
                           help="保留无 JD 岗位（默认口径一：详情抓完后把 jd 并入列表并剔除无 JD 岗位）")
+    g_detail.add_argument("--filter-inactive", action="store_true",
+                          help="按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，"
+                               "不误杀本周/本月活跃）；默认关闭")
     g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                           help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
@@ -5280,6 +5361,12 @@ def run_cli():
                           + f"｜detail_channel={_channel}")
             elif args.input:
                 print("ℹ️  --input 模式未指定 --output，跳过 jd 并入（原列表保持原样）")
+            # --filter-inactive：按 HR 活跃度剔除僵尸岗（对最终导出生效）
+            if args.filter_inactive and export_path:
+                inactive_ids = inactive_job_ids(details, list_data.get("jobs", []))
+                if inactive_ids:
+                    kept, dropped = filter_inactive_in_export(export_path, inactive_ids)
+                    print(f"🧟 --filter-inactive：HR 长期未活跃剔除 {dropped} 条（列表 {kept}）")
             # 本次 run 自建的 sidecar：成功结束即删（TTL 为兜底）
             if sidecar_owned:
                 delete_security_sidecar(list_data.get("output_path"))

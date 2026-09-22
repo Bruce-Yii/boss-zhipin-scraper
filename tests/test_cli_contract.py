@@ -58,6 +58,12 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--db", r.stdout)
         self.assertIn("boss.db", r.stdout)
 
+    def test_help_documents_p4d_filter_flag(self):
+        """--filter-inactive 出现在 --help（P4d 僵尸岗过滤，opt-in）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--filter-inactive", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
