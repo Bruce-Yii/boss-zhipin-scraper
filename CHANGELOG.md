@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.12.0 (2026-09-22)
+
+### 新增
+- **移植上游 #55：列表通道双模式 `--list-mode xhr|passive`**（MIT 同源上游，采用其思路与实现结构）：
+  - `passive`：导航真实搜索页 + 滚动触发无限滚动，用 CDP `Network` 域**旁听页面自身**的 `joblist.json` 响应（零注入 XHR），消除"注入请求特征触发的 `code 37`"
+  - 复用既有 `prefetched_pages` 通道接入串行主循环 → 契约 v2（`observed_jobs`/`exhausted`）、`security_map`、渐进原子写、风控熔断**全部不变**
+  - 与 `--pages-parallel` 互斥（passive 自动回串行）；未捕获/异常自动**回退串行 XHR**（稳健）
+  - 默认 `xhr`（保持既有速度与行为）；`passive` 待端到端验证后再评估是否改默认
+  - 新增原语：`CDPSession.events` 事件缓冲 + `drain_events()`、`NetworkJoblistCapture`、`map_api_job`/`map_api_jobs`（Python 字段映射，与注入 JS 模板 1:1）
+- 测试 +11（`PassiveCaptureTests` + CLI `--list-mode`）
+
 ## v2.11.1 (2026-09-22)
 
 ### 文档 / 工程

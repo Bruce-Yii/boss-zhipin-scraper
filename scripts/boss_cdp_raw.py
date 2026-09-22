@@ -19,9 +19,10 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.11.1"
+__version__ = "2.12.0"
 
 import argparse
+import base64
 import csv
 import glob
 import hashlib
@@ -281,6 +282,9 @@ LOGIN_PROBE_TARGETS = (
 LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
+# 被动捕获（--list-mode passive，上游 #55）等待页面自身首个 joblist 响应的上限：
+# 导航 + SPA 发请求通常 <8s，留足余量
+PROBE_CAPTURE_TIMEOUT = 25
 LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
 
 # BOSS wapi 业务码 → (类别, 人话)。类别统一判定"参数错 / 限流 / 环境风控 / 安全拦截"。
@@ -506,6 +510,9 @@ class CDPSession:
         ws_url = resp.json()["webSocketDebuggerUrl"]
         self.ws = websocket.create_connection(ws_url, timeout=60)
         self.mid = 0
+        # CDP 事件缓冲：send() 等待命令响应期间到达的事件通知都会存这里，
+        # 供 Network 域被动捕获使用（见 NetworkJoblistCapture）。
+        self.events = []
         self._dead = False
         if heartbeat_interval and heartbeat_interval > 0:
             self._start_heartbeat(heartbeat_interval)
@@ -606,13 +613,45 @@ class CDPSession:
             if r.get("id") == self.mid:
                 return r
 
-            # 不匹配的消息：可能是事件通知，记录并跳过
+            # 不匹配的消息：事件通知，存入缓冲供被动捕获，避免丢失
             event_name = r.get("method", "unknown")
-            log.debug(f"跳过不匹配消息 (id={r.get('id')}, event={event_name})")
+            log.debug(f"缓冲事件消息 (id={r.get('id')}, event={event_name})")
+            self.events.append(r)
 
         raise TimeoutError(
             f"CDP send({method}) 在 {max_retries} 条消息内未找到匹配响应"
         )
+
+    def drain_events(self, duration):
+        """在 duration 秒内持续接收并缓冲 CDP 事件，超时或期间无消息则返回。
+
+        用于等待页面自身发起的请求完成（Network 域事件），不发送任何命令。
+        """
+        deadline = time.time() + duration
+        timeout_exc = _ws_timeout_exception()
+        try:
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return
+                self.ws.settimeout(min(0.5, remaining))
+                try:
+                    raw = self.ws.recv()
+                except timeout_exc:
+                    continue
+                except _cdp_exception_types():
+                    # 连接异常：标记死亡并返回（best-effort，不抛）
+                    self._dead = True
+                    return
+                try:
+                    r = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if "method" in r:
+                    self.events.append(r)
+        finally:
+            # 恢复默认超时，避免影响后续 send() 的等待
+            self.ws.settimeout(60)
 
     def eval_js(self, js, sid):
         r = self.send("Runtime.evaluate", {"expression": js, "returnByValue": True}, sid)
@@ -719,6 +758,17 @@ def _cdp_exception_types():
     if isinstance(ws_exc, type) and issubclass(ws_exc, BaseException) and ws_exc not in types:
         types += (ws_exc,)
     return types
+
+
+def _ws_timeout_exception():
+    """websocket 层"接收超时"异常类（websocket-client 的 WebSocketTimeoutException）。
+
+    依赖未加载 / 测试 mock 时回退 ``TimeoutError``，避免 except 元组出现非异常类型。
+    """
+    exc = getattr(websocket, "WebSocketTimeoutException", None) if websocket is not None else None
+    if isinstance(exc, type) and issubclass(exc, BaseException):
+        return exc
+    return TimeoutError
 
 
 def probe_risk_page(cdp, sid):
@@ -836,6 +886,172 @@ FETCH_API_JS_TEMPLATE = """
     return JSON.stringify(results);
 })()
 """
+
+# ============================================================
+# 被动捕获页面自身的列表 API 响应（Network 域旁听，不发额外请求）
+#
+# 背景（上游 #53/#55）：程序注入的同步 XHR 与页面自身请求特征不同，会被 BOSS
+# 风控识别为异常环境（code 37）。改为导航真实搜索页 + 滚动加载，仅旁听页面自己
+# 发出的 /wapi/zpgeek/search/joblist.json 响应，全程零注入请求。
+# ============================================================
+class NetworkJoblistCapture:
+    """监听并捕获页面自身发出的 joblist API 响应。
+
+    依赖 ``CDPSession.events`` 事件缓冲：send() 执行其它命令期间到达的 Network
+    事件已自动入缓冲；wait_next_response() 再补充等待窗口。
+    """
+
+    def __init__(self, cdp, sid):
+        self.cdp = cdp
+        self.sid = sid
+        self._consumed = set()   # 已返回给调用方的 requestId
+
+    def enable(self):
+        self.cdp.send("Network.enable", {}, self.sid)
+
+    @staticmethod
+    def _is_joblist_url(url):
+        return API_JOB_LIST_PATH in str(url or "")
+
+    def _next_completed(self):
+        """扫描事件缓冲，返回下一个已完成且未消费的 joblist 响应 requestId。"""
+        requests = {}
+        finished = set()
+        for ev in self.cdp.events:
+            method = ev.get("method", "")
+            params = ev.get("params", {})
+            if method == "Network.requestWillBeSent":
+                if self._is_joblist_url((params.get("request") or {}).get("url", "")):
+                    requests[params.get("requestId")] = True
+            elif method == "Network.loadingFinished":
+                finished.add(params.get("requestId"))
+        for request_id in requests:
+            if request_id in finished and request_id not in self._consumed:
+                return request_id
+        return None
+
+    def wait_next_response(self, timeout, trigger=None, poll=0.5):
+        """等待下一个未消费的 joblist 响应并解析 JSON。
+
+        Args:
+            timeout: 最长等待秒数
+            trigger: 等待前执行一次的触发动作（导航/滚动），页面将自行发请求
+            poll: 每轮事件等待窗口
+
+        Returns:
+            dict: 解析后的响应 JSON；超时未捕获返回 None
+        """
+        if trigger is not None:
+            trigger()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            request_id = self._next_completed()
+            if request_id is None:
+                self.cdp.drain_events(min(poll, max(deadline - time.time(), 0)))
+                continue
+            self._consumed.add(request_id)
+            body = self._fetch_body(request_id)
+            if body is None:
+                continue
+            try:
+                return json.loads(body)
+            except (json.JSONDecodeError, ValueError) as e:
+                log.warning(f"joblist 响应不是有效 JSON: {e}")
+        return None
+
+    def _fetch_body(self, request_id):
+        try:
+            result = self.cdp.send(
+                "Network.getResponseBody", {"requestId": request_id}, self.sid)
+        except _cdp_exception_types() as e:
+            log.debug(f"读取响应体失败 request={request_id}: {e}")
+            return None
+        payload = result.get("result") or {}
+        body = payload.get("body", "")
+        if payload.get("base64Encoded"):
+            try:
+                body = base64.b64decode(body).decode("utf-8", errors="replace")
+            except (ValueError, TypeError) as e:
+                log.debug(f"响应体 base64 解码失败: {e}")
+                return None
+        return body
+
+
+def map_api_job(raw):
+    """joblist.json 原始条目 → 统一 job dict。
+
+    字段与 ``FETCH_API_JS_TEMPLATE`` 一一对应（注入 JS 模板的 Python 等价版），
+    保证被动捕获与 XHR 两条通道产出**同形状**的 job，下游契约/security_map 不受影响。
+    """
+    if not isinstance(raw, dict):
+        return None
+    encrypt_job_id = str(raw.get("encryptJobId") or "")
+    encrypt_brand_id = str(raw.get("encryptBrandId") or "")
+    salary = raw.get("salaryDesc") or ""
+    location = "\u00b7".join([
+        raw.get("cityName") or "",
+        raw.get("areaDistrict") or "",
+        raw.get("businessDistrict") or "",
+    ])
+    tags = " | ".join(
+        t for t in (raw.get("jobExperience") or "", raw.get("jobDegree") or "")
+        if t and t != "不限"
+    )
+
+    def optional(key):
+        value = raw.get(key)
+        return "" if value is None else value
+
+    return {
+        "title": raw.get("jobName") or "",
+        "salary": salary,
+        "salary_source": "api" if salary else "api_empty",
+        "location": location,
+        "tags": tags,
+        "boss_name": raw.get("brandName") or "",
+        "company_name": raw.get("brandName") or "",
+        "boss_title": raw.get("bossTitle") or "",
+        "boss_active_status": map_list_boss_active_status(raw),
+        "anonymous": optional("anonymous"),
+        "job_valid_status": optional("jobValidStatus"),
+        "icon_flags": "|".join(raw.get("iconFlagList") or []),
+        "icon_word": raw.get("iconWord") or "",
+        "proxy_job": raw.get("proxyJob") or "",
+        "proxy_type": raw.get("proxyType") or "",
+        "job_type": raw.get("jobType") or "",
+        "experience": raw.get("jobExperience") or "",
+        "education": raw.get("jobDegree") or "",
+        "company_scale": raw.get("brandScaleName") or "",
+        "company_stage": raw.get("brandStageName") or "",
+        "company_industry": raw.get("brandIndustry") or "",
+        "job_labels": " | ".join(raw.get("jobLabels") or []),
+        "skills": raw.get("skills") or [],
+        "security_id": raw.get("securityId") or "",
+        "lid": raw.get("lid") or "",
+        "encrypt_job_id": encrypt_job_id,
+        "encrypt_boss_id": str(raw.get("encryptBossId") or ""),
+        "encrypt_brand_id": encrypt_brand_id,
+        "job_link": (
+            f"https://www.zhipin.com/job_detail/{encrypt_job_id}.html"
+            if encrypt_job_id else ""
+        ),
+        "company_link": (
+            f"https://www.zhipin.com/gongsi/{encrypt_brand_id}.html"
+            if encrypt_brand_id else ""
+        ),
+        "welfare": " | ".join(raw.get("welfareList") or []),
+    }
+
+
+def map_api_jobs(data):
+    """从捕获的 joblist 响应 JSON 提取映射后的职位列表。"""
+    if not isinstance(data, dict):
+        return []
+    job_list = (data.get("zpData") or {}).get("jobList")
+    if not isinstance(job_list, list):
+        return []
+    return [j for j in (map_api_job(item) for item in job_list) if j]
+
 
 # ============================================================
 # DEPRECATED: DOM 提取作为 fallback（薪资可能是加密字体）
@@ -2476,9 +2692,65 @@ def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
     return [out[p] for p in range(1, pages + 1)]
 
 
+def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
+    """被动捕获多页列表（上游 #55 思路）：导航真实搜索页 + 滚动触发无限滚动，
+    用 Network 域旁听页面自己发出的 joblist 响应，**零注入 XHR**，从而消除注入
+    请求特征触发的 `code 37`。
+
+    返回：[[page1 jobs], [page2 jobs], ...]（长度 = pages；已 map_api_jobs）。
+    任一页未捕获/登录风控异常 → 返回 None（调用方回退串行 XHR，保证稳健）。
+    """
+    ws = None
+    tid = None
+    try:
+        ws = CDPSession(cdp_port)
+        tid, sid = create_page_session(ws, background=page_background_default())
+        capture = NetworkJoblistCapture(ws, sid)
+        capture.enable()
+
+        def navigate():
+            ws.send("Page.navigate",
+                    {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
+            time.sleep(random.uniform(3, 5))
+
+        first = capture.wait_next_response(timeout=PROBE_CAPTURE_TIMEOUT, trigger=navigate)
+        if not first:
+            log.warning("被动捕获：未捕获到页面自身首个搜索响应")
+            return None
+        login = classify_login_probe_response(first)
+        if login.status is LoginProbeStatus.UNAUTHENTICATED:
+            print("❌ 被动捕获：未检测到 BOSS直聘登录状态。请先在 Chrome 中登录 zhipin.com。")
+            return None
+        if login.status is LoginProbeStatus.RESTRICTED:
+            print(f"❌ 被动捕获：{describe_login_probe_result(login)}，已停止抓取。")
+            return None
+
+        out = [map_api_jobs(first)]
+        for _ in range(2, pages + 1):
+            # 滚到底触发无限滚动加载下一页，继续旁听页面自身请求
+            ws.eval_js("window.scrollTo(0, document.body.scrollHeight); void 0;", sid)
+            page_data = capture.wait_next_response(timeout=PROBE_CAPTURE_TIMEOUT)
+            if not page_data:
+                log.warning("被动捕获：翻页未捕获到响应")
+                return None
+            out.append(map_api_jobs(page_data))
+        return out
+    except _cdp_exception_types():
+        log.warning("被动捕获列表失败，回退串行 XHR", exc_info=True)
+        return None
+    finally:
+        if ws is not None:
+            try:
+                if tid is not None:
+                    ws.send("Target.closeTarget", {"targetId": tid})
+                ws.close()
+            except _cdp_exception_types():
+                log.debug("关闭被动捕获 tab 失败", exc_info=True)
+
+
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                max_jobs=None, max_concurrent=1, pages_parallel=1):
+                max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr"):
     city_name, city_code = resolve_city(city_input)
     # 单进程互斥（规格 §3.6）：默认并发上限 1（现状）；--max-concurrent N 仅指令显式放开
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
@@ -2569,8 +2841,19 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
 
     # 并行抓页（P3 速度）：多 tab 同发搜索 XHR。库层默认关闭（pages_parallel=1，
     # 不影响既有测试/调用方）；CLI 默认开启。任一页失败即回退串行，保证稳健。
+    # 被动捕获模式（--list-mode passive，上游 #55）：改为导航真实搜索页 + 滚动，
+    # 旁听页面自身 joblist 响应（零注入 XHR），与 --pages-parallel 互斥（自动回串行）。
     prefetched_pages = None
-    if pages_parallel > 1 and max_pages > 1 and not allow_dom_fallback:
+    if list_mode == "passive" and not allow_dom_fallback:
+        print("  ⚡ 被动捕获模式：导航真实搜索页 + 滚动，旁听页面自身请求（零注入 XHR）")
+        prefetched_pages = _fetch_pages_passive(
+            cdp_port, keyword, city_code, max_pages, filters)
+        if prefetched_pages is None:
+            print("  ⚠️ 被动捕获未成功，回退串行 XHR")
+        else:
+            print(f"  ⚡ 被动捕获：{max_pages} 页 "
+                  f"{sum(len(b) for b in prefetched_pages)} 条")
+    elif pages_parallel > 1 and max_pages > 1 and not allow_dom_fallback:
         prefetched_pages = _fetch_pages_parallel(
             cdp_port, keyword, city_code, max_pages, filters,
             workers=pages_parallel)
@@ -3135,7 +3418,7 @@ def _list_has_detail_risk(list_path):
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
               detail=True, detail_concurrency=1, keep_without_jd=False,
-              pages_parallel=1):
+              pages_parallel=1, list_mode="xhr"):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -3178,6 +3461,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                 cdp_port=cdp_port, max_jobs=None,
                 max_concurrent=max_concurrent,
                 pages_parallel=pages_parallel,
+                list_mode=list_mode,
             )
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
@@ -5017,6 +5301,10 @@ def build_parser():
                           help="列表/登录探测/详情 DOM 改用前台 Target（默认后台）；"
                                "Chrome 在 Linux/Xvfb 下后台 Target 可能捕获不到搜索响应时使用"
                                "（上游 #67/#68；macOS/Windows 正常环境保持默认即可）")
+    g_search.add_argument("--list-mode", default="xhr", choices=["xhr", "passive"],
+                          help="列表通道：xhr=页面内注入 XHR 拉 wapi（默认，快，配合 --pages-parallel）；"
+                               "passive=Network 域被动捕获页面自身 joblist 响应（零注入请求，"
+                               "消除注入 XHR 触发的 code 37，上游 #55；与 --pages-parallel 互斥，自动回串行）")
 
     # ---- 筛选参数 ----
     g_filter = p.add_argument_group("筛选参数")
@@ -5194,7 +5482,8 @@ def run_cli():
                            max_concurrent=args.max_concurrent,
                            detail=args.detail, detail_concurrency=args.concurrency,
                            keep_without_jd=args.keep_without_jd,
-                           pages_parallel=args.pages_parallel))
+                           pages_parallel=args.pages_parallel,
+                           list_mode=args.list_mode))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
@@ -5302,6 +5591,7 @@ def run_cli():
             max_jobs=args.max_jobs,
             max_concurrent=args.max_concurrent,
             pages_parallel=args.pages_parallel,
+            list_mode=args.list_mode,
         )
         # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
         sidecar_owned = write_security_sidecar(

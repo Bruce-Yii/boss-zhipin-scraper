@@ -1,7 +1,7 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.11.1
+version: 2.12.0
 author: eatmoreduck
 license: MIT
 platforms: [macos, linux, windows]
@@ -10,7 +10,7 @@ metadata:
     tags: [scraper, jobs, career, cdp, chrome, zhipin, boss直聘]
 ---
 
-# BOSS直聘职位抓取工具 v2.11
+# BOSS直聘职位抓取工具 v2.12
 
 通过 Chrome CDP 协议抓取 BOSS直聘 (zhipin.com) 职位数据，输出结构化 JSON/CSV（含明文薪资），并可对已抓取结果生成聚合摘要和求职材料优化提示词。
 
@@ -151,6 +151,7 @@ python3 "$SUMMARY_PATH" \
 | `--pages` | 3 | 抓取页数（上限 10，每页 30 条） |
 | `--pages-parallel N` | 3 | 并行抓页数（多 tab 同发搜索 XHR，列表阶段 ~50s→~6s；0/1=关闭回退串行） |
 | `--foreground-capture` | 关闭 | 列表/登录探测/详情 DOM 改用前台 Target（默认后台；Chrome 在 Linux/Xvfb 下后台捕获不到搜索响应时用，上游 #67/#68） |
+| `--list-mode xhr/passive` | xhr | 列表通道：xhr=注入 XHR（默认，快）；passive=Network 域被动捕获页面自身响应（零注入请求，消除 code 37，上游 #55；与 --pages-parallel 互斥） |
 | `--max-jobs N` | 全部 | 列表条数上限，抓够即停 |
 | `--industry` | - | 行业代码（见下方筛选参数） |
 | `--input FILE` | - | 从已有 JSON 读取（跳过列表抓取；此时无 securityId，详情退化为 DOM 渲染） |
