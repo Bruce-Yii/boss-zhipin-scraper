@@ -2652,7 +2652,7 @@ class ChromeSetupTests(unittest.TestCase):
                               existing_results=None, output_path=None,
                               write_every=5, list_output_path=None,
                               keyword="", city="", security_map=None,
-                              city_code=""):
+                              city_code="", max_seconds=None):
                 # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
                 captured["concurrency"] = concurrency
                 merged = list(existing_results or []) + [fake_detail]

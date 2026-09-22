@@ -3555,7 +3555,7 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
                    concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
-                   security_map=None):
+                   security_map=None, max_seconds=None):
     """抓取详情。
 
     Args:
@@ -3603,7 +3603,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             keyword=list_data.get("keyword", ""),
             security_map=security_map or {},
             city=list_data.get("city", ""),
-            city_code=list_data.get("city_code", ""))
+            city_code=list_data.get("city_code", ""),
+            max_seconds=max_seconds)
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -3634,6 +3635,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
             api_session = None
 
     for idx, job in enumerate(jobs):
+        if max_seconds and time.time() - start_time >= max_seconds:
+            print(f"⏱️ 已达 --max-seconds={max_seconds}s 预算，优雅停止详情"
+                  f"（已抓 {serial_ok} 条）")
+            break
         link = job.get("job_link", "")
         title = job.get("title", "")
         company = job.get("boss_name", "")
@@ -3786,7 +3791,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              existing_results=None, output_path=None,
                              write_every=5, list_output_path=None,
                              keyword="", city="", security_map=None,
-                             city_code=""):
+                             city_code="", max_seconds=None):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -3946,6 +3951,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         def fill_window():
             while len(in_flight) < window:
                 if stop_event.is_set():
+                    return
+                if max_seconds and time.time() - start_time >= max_seconds:
+                    print(f"  ⏱️ 已达 --max-seconds={max_seconds}s 预算，"
+                          f"停止提交新详情（优雅收尾）")
                     return
                 try:
                     job = next(todo_iter)
@@ -4827,6 +4836,8 @@ def build_parser():
     g_search.add_argument("--max-concurrent", type=int, default=1,
                           help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
                                "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
+    g_search.add_argument("--max-seconds", type=int, default=0,
+                          help="详情阶段墙钟预算（秒）；0=不限。超限优雅停并保留已抓（P4c 预算硬帽）")
     g_search.add_argument("--pages-parallel", type=int, default=3,
                           help="并行抓页数（默认 3；多 tab 同发搜索 XHR，迭代列表阶段"
                                "约 50s→约 6s；0/1=关闭回退串行）")
@@ -5156,6 +5167,7 @@ def run_cli():
                 # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
                 # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
                 security_map=list_data.get("security_map"),
+                max_seconds=(args.max_seconds or None),
             )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
