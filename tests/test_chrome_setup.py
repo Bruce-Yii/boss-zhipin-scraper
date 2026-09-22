@@ -3332,18 +3332,15 @@ class ChromeSetupTests(unittest.TestCase):
         rec2 = module.build_detail_record(job, {"jd": "JD"})
         self.assertEqual(rec2["page_update_date"], "")
 
-    def test_extract_detail_fields_reads_dom_publish_time_and_hr_active_time(self):
-        """DOM 保底：publish_time（div.info-publis>p）与 hr_active_time（.boss-active-time）。"""
+    def test_extract_detail_fields_reads_dom_hr_active_time(self):
+        """DOM 保底：hr_active_time（.boss-active-time）在 recruiter 卡无活跃行时兜底。"""
         module = load_module()
         description = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
         fields = module.extract_detail_fields({
             "jd": f"职位描述\n{description}",
             "page_text": description,
-            "publish_time": "3天前发布",
             "hr_active_time": "半年前活跃",
         })
-        self.assertEqual(fields["publish_time"], "3天前发布")
-        # recruiter 卡无活跃行时，用 .boss-active-time 兜底
         self.assertEqual(fields["boss_active_status"], "半年前活跃")
 
     def test_extract_detail_fields_prefers_recruiter_card_over_hr_selector(self):
@@ -3356,31 +3353,29 @@ class ChromeSetupTests(unittest.TestCase):
         })
         self.assertEqual(fields["boss_active_status"], "今日活跃")
 
-    def test_build_detail_record_carries_publish_and_brand_active_time(self):
+    def test_build_detail_record_carries_brand_active_time(self):
         module = load_module()
         job = {"job_id": "j1", "title": "T", "job_link": "https://www.zhipin.com/job/x.html",
                "boss_name": "C", "salary": "20-30K", "location": "杭州", "tags": ""}
         rec = module.build_detail_record(job, {
-            "jd": "JD", "publish_time": "昨日发布", "brand_active_time": "刚刚活跃"})
-        self.assertEqual(rec["publish_time"], "昨日发布")
+            "jd": "JD", "brand_active_time": "刚刚活跃"})
         self.assertEqual(rec["brand_active_time"], "刚刚活跃")
+        self.assertNotIn("publish_time", rec)  # 已失效字段（新 SPA 无 info-publis）应移除
         rec2 = module.build_detail_record(job, {"jd": "JD"})
-        self.assertEqual(rec2["publish_time"], "")
         self.assertEqual(rec2["brand_active_time"], "")
 
     def test_parse_detail_api_value_reads_brand_active_time(self):
-        """详情 API 同一次响应内取 brandComInfo.activeTime（零额外请求），publish_time 为空。"""
+        """详情 API 同一次响应内取 brandComInfo.activeTime（零额外请求）。"""
         module = load_module()
         payload = {"code": 0, "jd": "负责 AI 产品规划、需求分析、研发协作和上线复盘。\n" * 8,
                    "boss_active_status": "刚刚活跃", "brand_active_time": "刚刚活跃"}
         fields = module._parse_detail_api_value(json.dumps(payload), {"job_id": "j1"})
         self.assertEqual(fields["brand_active_time"], "刚刚活跃")
-        self.assertEqual(fields["publish_time"], "")
 
     def test_detail_extractors_expose_time_selectors(self):
-        """EXTRACT_DETAIL_JS/DETAIL_API_JS 含时间与活跃度选择器（防回归）。"""
+        """EXTRACT_DETAIL_JS/DETAIL_API_JS 含活跃度选择器；已失效 info-publis 不得回归。"""
         module = load_module()
-        self.assertIn("info-publis", module.EXTRACT_DETAIL_JS)
+        self.assertNotIn("info-publis", module.EXTRACT_DETAIL_JS)
         self.assertIn("boss-active-time", module.EXTRACT_DETAIL_JS)
         self.assertIn("brand.activeTime", module.DETAIL_API_JS)
 

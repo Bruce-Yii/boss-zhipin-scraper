@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.15.0"
+__version__ = "2.15.1"
 
 import argparse
 import base64
@@ -1181,9 +1181,6 @@ EXTRACT_DETAIL_JS = """
             jd = text;
         }
     }
-    var publishTime = '';
-    var pubEl = document.querySelector('div.info-publis > p, .info-publis p');
-    if (pubEl && pubEl.innerText) publishTime = pubEl.innerText.trim();
     var hrActive = '';
     var hrEl = document.querySelector('.boss-active-time');
     if (hrEl && hrEl.innerText) hrActive = hrEl.innerText.trim();
@@ -1192,7 +1189,6 @@ EXTRACT_DETAIL_JS = """
         page_text: pageText.substring(0, 12000),
         tags: tags,
         url: location.href,
-        publish_time: publishTime,
         hr_active_time: hrActive
     });
 })()
@@ -1408,7 +1404,6 @@ def _parse_detail_api_value(val, job):
         # 公司级活跃时间（详情 API 同一次响应内的 brandComInfo.activeTime；零额外请求）
         "brand_active_time": str(payload.get("brand_active_time") or ""),
         "page_update_date": "",  # API 通道无详情页"页面更新时间"（可选字段，退化点已记录）
-        "publish_time": "",      # 相对发布时间仅 DOM 路径有（div.info-publis>p）
         "job_status_desc": str(payload.get("job_status_desc") or ""),
         "brand_introduce": str(payload.get("brand_introduce") or ""),
         "brand_stage_name": str(payload.get("brand_stage_name") or ""),
@@ -1624,11 +1619,10 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
         act_m = _HR_ACTIVE_RE.search(page_text)
         if act_m:
             boss_active_status = act_m.group(1)
-    # 相对发布时间（div.info-publis>p；仅 DOM 路径，形如"3天前发布"）
-    publish_time = _normalize_detail_whitespace(
-        str(extracted.get("publish_time") or "")).strip()
+    # 注：DOM 的 `div.info-publis>p`（相对发布时间）已实测失效——新 SPA 无此节点
+    # （2026-09-23 实机复核）；故 publish_time 字段已移除，岗位侧日期仅保留 page_update_date。
     return {"jd": jd, "boss_active_status": boss_active_status,
-            "page_update_date": page_update_date, "publish_time": publish_time}
+            "page_update_date": page_update_date}
 
 
 def extract_job_description(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
@@ -3256,7 +3250,6 @@ def build_detail_record(job, extracted):
         "skill_tags": extracted.get("tags", []),
         "jd": extracted.get("jd", ""),
         "page_update_date": extracted.get("page_update_date", ""),
-        "publish_time": extracted.get("publish_time", ""),
         # 详情 API 通道新增可选字段（2026-08-14；用户拍板精简范围；DOM 路径缺省空，兼容）
         "job_status_desc": extracted.get("job_status_desc", ""),
         "brand_introduce": extracted.get("brand_introduce", ""),

@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.15.1 (2026-09-23)
+
+### 修复（实机复核结论）
+- **移除已失效字段 `publish_time`**：实机复核确认新 SPA **已无 `div.info-publis` 节点**（专题 §1.5 结论证实），P4d 加的 `publish_time`（相对发布时间）**恒为空** → 从 `EXTRACT_DETAIL_JS` / `extract_detail_fields` / `build_detail_record` / 导出中移除；README（中英）同步删除该字段。**`page_update_date`（页面更新时间）实机仍在，保留**。
+- 测试：删除 publish_time 断言，新增"`info-publis` 不得回归"守卫。
+
 ## v2.15.0 (2026-09-23)
 
 ### 新增
