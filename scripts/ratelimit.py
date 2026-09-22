@@ -25,22 +25,24 @@ class BurstThrottle:
     - 请求时刻**全局串行**（持锁跨 sleep）：并发 worker 也不再同时发请求
     - 间隔 ~高斯(center, sigma)，裁剪到 [min_delay, max_delay]
     - ~5% 概率叠加一次长暂停（2–5s）
-    - burst 惩罚（**仅真突发兜底**）：近 15s ≥10 次加 1.2–2.8s；近 45s ≥24 次加 4–7s
+    - burst 惩罚（**采集端默认不启用**，见下）：近 15s ≥12 次加 1.2–2.8s；近 45s ≥32 次加 4–7s
     - slow_factor（熔断恢复期=2.0）整体放大间隔
 
     目标全局速率 ≈ 1/center（默认 ~0.44 req/s），落在全行安全区 [0.33, 0.67]。
 
-    阈值修正（2026-09-22 实测）：旧阈值 `short=3 / long=6` 在**稳态 ~0.44 req/s**
-    下也会被反复触发（45s 内约 20 次 ≥6），把有效速率拖到 **实测 ~0.13 req/s**
-    （比设计意图还慢约 3 倍）。抬高到 `short=10 / long=24` 后，稳态不再触发惩罚、
-    有效速率回到中心 ~0.42–0.51 req/s（实测），而惩罚仍作为**真突发**（如短时间
-    密集请求）的兜底保留。`min_delay=1.5` 守住 0.67 req/s 上界不变。
+    阈值修正（2026-09-22 实测 + 同行专题交叉核对）：
+    旧阈值 `short=3 / long=6` 在**稳态 ~0.44 req/s** 下也会被反复触发（45s 内约 20 次 ≥6），
+    把有效速率拖到 **实测 ~0.13 req/s**（比设计意图还慢约 3 倍）。同行专题（30 仓）证实：
+    同行 **boss-agent-cli / BossHunter 的 burst 惩罚只用于"发送端"，采集端不加 burst**。
+    故采集端把阈值设到 `min_delay=1.5s` 的**理论最大频次之上**（15s≤10 次 / 45s≤30 次）：
+    `short=12 / long=32` —— 正常运行**永不触发**（采集端不加 burst），阈值仅作死代码兜底。
+    `min_delay=1.5` 守住 0.67 req/s 上界不变。
     """
 
     def __init__(self, center=2.25, sigma=0.4, min_delay=1.5, max_delay=3.0,
                  long_pause_prob=0.05, long_pause=(2.0, 5.0),
-                 short_window=15.0, short_threshold=10, short_penalty=(1.2, 2.8),
-                 long_window=45.0, long_threshold=24, long_penalty=(4.0, 7.0)):
+                 short_window=15.0, short_threshold=12, short_penalty=(1.2, 2.8),
+                 long_window=45.0, long_threshold=32, long_penalty=(4.0, 7.0)):
         self.center = center
         self.sigma = sigma
         self.min_delay = min_delay

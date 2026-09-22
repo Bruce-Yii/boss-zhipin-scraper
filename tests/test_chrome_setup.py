@@ -4865,8 +4865,8 @@ class RateLimitCenterTests(unittest.TestCase):
         t = module.BurstThrottle()
         self.assertEqual(t.center, 2.25)
         self.assertEqual(t.min_delay, 1.5)          # 0.67 req/s 上界
-        self.assertGreaterEqual(t.short_threshold, 10)
-        self.assertGreaterEqual(t.long_threshold, 24)
+        self.assertGreaterEqual(t.short_threshold, 12)
+        self.assertGreaterEqual(t.long_threshold, 32)
 
 
 class MultiKeywordTests(unittest.TestCase):
