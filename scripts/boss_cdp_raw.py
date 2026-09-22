@@ -21,32 +21,32 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
 
 __version__ = "2.5.0"
 
-import json
-import math
-import time
-import random
-import sys
 import argparse
-import os
-import re
-import hashlib
 import csv
 import glob
+import hashlib
+import json
+import logging
+import math
+import ntpath
+import os
 import platform
-import subprocess
+import queue
+import random
+import re
 import shutil
 import signal
-import logging
-import ntpath
+import subprocess
+import sys
 import threading
-import queue
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
-from collections import Counter
 from enum import Enum
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 websocket = None
 requests = None
@@ -207,7 +207,7 @@ def load_security_sidecar(list_path):
         if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
             os.remove(path)
             return {}
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         smap = data.get("security_map") if isinstance(data, dict) else None
         if not isinstance(smap, dict):
@@ -347,7 +347,7 @@ def load_local_city_map():
     name_to_code = {}
     try:
         path = _city_data_path()
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw, dict):
             for name, code in raw.items():
@@ -506,13 +506,14 @@ class CDPSession:
             try:
                 raw = self.ws.recv()
             except websocket.WebSocketTimeoutException:
-                raise TimeoutError(f"CDP WebSocket recv 超时, method={method}")
+                raise TimeoutError(
+                    f"CDP WebSocket recv 超时, method={method}") from None
             except websocket.WebSocketException:
                 # 连接被对端关闭（NAT 掐断/Chrome 退出）——快速失败，不等到超时
                 self._dead = True
                 raise ConnectionError(
                     f"CDP WebSocket 连接异常断开, method={method}"
-                )
+                ) from None
 
             try:
                 r = json.loads(raw)
@@ -1643,7 +1644,7 @@ def load_alert_config(env_path=None):
             os.path.dirname(os.path.abspath(__file__)), "..", ".env")
     cfg = {"url": "", "token": ""}
     try:
-        with open(env_path, "r", encoding="utf-8") as f:
+        with open(env_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -1724,7 +1725,7 @@ def _pid_is_running(pid):
 def _read_scrape_lock():
     """读取锁文件，返回 (max_concurrent, 持有 pid 列表, risk 标志)；损坏返回 (1, [], False)。"""
     try:
-        with open(SCRAPE_LOCK_PATH, "r", encoding="utf-8") as f:
+        with open(SCRAPE_LOCK_PATH, encoding="utf-8") as f:
             lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
     except (OSError, UnicodeDecodeError, ValueError):
         return 1, [], False
@@ -1826,7 +1827,7 @@ def check_cdp_recovery():
     冷却与恢复期都结束后清理残留标记文件。
     """
     try:
-        with open(_cdp_cooldown_path(), "r", encoding="utf-8") as f:
+        with open(_cdp_cooldown_path(), encoding="utf-8") as f:
             lines = f.read().splitlines()
         deadline = float(lines[0])
         recovery_until = float(lines[1]) if len(lines) > 1 else deadline
@@ -1851,7 +1852,7 @@ def check_cdp_cooldown():
     文件首行为冷却截止（第二行为恢复期截止，冷却判断只看首行）。
     """
     try:
-        with open(_cdp_cooldown_path(), "r", encoding="utf-8") as f:
+        with open(_cdp_cooldown_path(), encoding="utf-8") as f:
             deadline = float(f.read().splitlines()[0])
     except (OSError, UnicodeDecodeError, ValueError, IndexError):
         return None
@@ -1980,7 +1981,7 @@ def merge_jobs(external_path, new_jobs):
         合并后的 jobs 列表
     """
     try:
-        with open(external_path, "r", encoding="utf-8") as f:
+        with open(external_path, encoding="utf-8") as f:
             old_data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError) as e:
         log.warning(f"无法加载合并文件 {external_path}: {e}")
@@ -2009,7 +2010,7 @@ def merge_details(external_path, new_details):
     if not external_path:
         return new_details
     try:
-        with open(external_path, "r", encoding="utf-8") as f:
+        with open(external_path, encoding="utf-8") as f:
             old_data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError) as e:
         log.warning(f"无法加载合并详情文件 {external_path}: {e}")
@@ -2224,7 +2225,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     def human_scroll(cdp, sid):
         """模拟人类滚动: 随机次数、随机距离、随机停顿，偶尔回滚一点"""
         total_scrolls = random.randint(3, 6)
-        for i in range(total_scrolls):
+        for _ in range(total_scrolls):
             # 大部分往下滚，偶尔往上回滚一点（模拟阅读回看）
             if random.random() < 0.15:
                 delta = -random.randint(50, 150)
@@ -2529,7 +2530,7 @@ def load_existing_detail_ids(output_path=None):
     if not output_path or not os.path.exists(output_path):
         return set()
     try:
-        with open(output_path, "r", encoding="utf-8") as f:
+        with open(output_path, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError):
         return set()
@@ -2561,7 +2562,7 @@ def load_pending_ids(output_path, force_ids=None):
     if not os.path.exists(path):
         return {jid: 0 for jid in force}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError):
         return {jid: 0 for jid in force}
@@ -2729,7 +2730,7 @@ def load_batch_config(path):
         (list, list): 合法任务列表与错误信息列表
     """
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError, ValueError) as e:
         return [], [f"配置文件无法读取: {e}"]
@@ -2784,7 +2785,7 @@ def _detail_path_for_list(list_path):
 def _list_has_detail_risk(list_path):
     """列表文件 warnings 是否含详情风控降级标记（detail_risk_blocked）。"""
     try:
-        with open(list_path, "r", encoding="utf-8") as f:
+        with open(list_path, encoding="utf-8") as f:
             meta = json.load(f)
         return any("detail_risk_blocked" in str(w)
                    for w in (meta.get("warnings") or []))
@@ -2960,7 +2961,7 @@ def verify_results(list_path, details_path=None):
         list_data = None
     else:
         try:
-            with open(list_path, "r", encoding="utf-8") as f:
+            with open(list_path, encoding="utf-8") as f:
                 list_data = json.load(f)
         except (json.JSONDecodeError, OSError, ValueError) as e:
             issues.append(f"列表文件无法解析: {e}")
@@ -3001,7 +3002,7 @@ def verify_results(list_path, details_path=None):
         details = None
     else:
         try:
-            with open(details_path, "r", encoding="utf-8") as f:
+            with open(details_path, encoding="utf-8") as f:
                 details = json.load(f)
         except (json.JSONDecodeError, OSError, ValueError) as e:
             issues.append(f"详情文件无法解析: {e}")
@@ -3346,7 +3347,7 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
     if not list_output_path or not os.path.exists(list_output_path):
         return
     try:
-        with open(list_output_path, "r", encoding="utf-8") as f:
+        with open(list_output_path, encoding="utf-8") as f:
             meta = json.load(f)
         warnings = meta.setdefault("warnings", [])
         if not any("detail_risk_blocked" in w for w in warnings):
@@ -3381,7 +3382,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
     results = []
     if os.path.exists(output_path):
         try:
-            with open(output_path, "r", encoding="utf-8") as f:
+            with open(output_path, encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
                 results = data
@@ -3690,7 +3691,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
     api_sessions = []
     if security_map:
         api_pool = queue.Queue()
-        for idx in range(concurrency):
+        for _ in range(concurrency):
             try:
                 sess = _open_api_tab(cdp_port, keyword, city_code)  # 顺序错峰，避免同时打搜索页
                 api_sessions.append(sess)
@@ -4103,7 +4104,7 @@ def run_status(cdp_port=DEFAULT_CDP_PORT, result_dir=DEFAULT_RESULT_DIR):
         latest = jobs[-1]
         print(f"  列表文件        : {len(jobs)} 个｜最新 {os.path.basename(latest)}")
         try:
-            with open(latest, "r", encoding="utf-8") as f:
+            with open(latest, encoding="utf-8") as f:
                 m = json.load(f)
             cov = m.get("jd_coverage") or {}
             extra = (f" jd={cov.get('with_jd')}/{cov.get('total_before')}" if cov else "")

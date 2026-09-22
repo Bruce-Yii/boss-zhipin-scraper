@@ -1,0 +1,4 @@
+# 开发/CI 依赖（运行时依赖见 requirements.txt）
+# 固定 ruff 版本：避免 CI 因 ruff 漂移产生非预期规则变更
+ruff==0.16.4
+coverage>=7.4

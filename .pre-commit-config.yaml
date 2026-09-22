@@ -1,0 +1,15 @@
+# 本地左移：安装 `pre-commit install` 后，提交前自动跑 ruff + 基础文件检查。
+# CI（.github/workflows/ci.yml）独立再跑一遍，二者不冲突。
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-added-large-files
