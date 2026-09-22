@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.14.2"
+__version__ = "2.15.0"
 
 import argparse
 import base64
@@ -1225,6 +1225,25 @@ SCROLL_BOTTOM_JS = """
     window.dispatchEvent(new Event('scroll'));
     document.dispatchEvent(new Event('scroll'));
     return true;
+})()
+"""
+
+# 右面板 JD 通道（专题 §1.4 / 上游 #84）：面板就绪等待上限（秒）
+PANEL_READY_TIMEOUT = 10.0
+# 点击搜索页上指定岗位卡片（优先按 encryptJobId/链接匹配，退化按标题文本）
+CLICK_CARD_JS = r"""
+(function(){
+    var key = __KEY__, title = __TITLE__;
+    var links = document.querySelectorAll('a.job-name, .job-card-box a, a[href*="/job_detail/"]');
+    for (var i = 0; i < links.length; i++) {
+        var h = links[i].getAttribute('href') || links[i].href || '';
+        if (key && h.indexOf(key) !== -1) { links[i].click(); return true; }
+    }
+    var cards = document.querySelectorAll('li.job-card-box, .job-card-wrap');
+    for (var j = 0; j < cards.length; j++) {
+        if (title && (cards[j].innerText || '').indexOf(title) !== -1) { cards[j].click(); return true; }
+    }
+    return false;
 })()
 """
 
@@ -3546,7 +3565,7 @@ def _list_has_detail_risk(list_path):
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
               detail=True, detail_concurrency=1, keep_without_jd=False,
-              pages_parallel=1, list_mode="xhr"):
+              pages_parallel=1, list_mode="xhr", detail_channel="auto"):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -3611,6 +3630,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                     cdp_port=cdp_port, concurrency=detail_concurrency,
                     list_output_path=list_path or None,
                     security_map=list_data.get("security_map"),
+                    detail_channel=detail_channel,
                 )
             except Exception as e:  # 有意宽捕：详情失败不中断批量其余任务
                 failed += 1
@@ -4189,7 +4209,8 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
                    concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
-                   security_map=None, max_seconds=None, preloaded_details=None):
+                   security_map=None, max_seconds=None, preloaded_details=None,
+                   detail_channel="auto"):
     """抓取详情。
 
     Args:
@@ -4248,6 +4269,19 @@ def scrape_details(list_data, max_details=None, output_path=None,
     pending = dict(pending_ids) if pending_ids is not None else load_pending_ids(output_path)
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
+
+    # 详情通道选择（--detail-channel）：dom=强制 DOM；panel=右面板；auto/api=按 securityId
+    if detail_channel == "dom":
+        security_map = None
+
+    # 右面板 JD 通道（专题 §1.4 / 上游 #84）：不跳页，复用停靠的真实搜索页，
+    # 点卡片 → 读右侧面板（零新增请求；逐条串行，忽略并发设置）
+    if detail_channel == "panel":
+        return _scrape_details_via_panel(
+            jobs, list_data, output_path, cdp_port, fmt,
+            existing_ids=existing_ids, pending_ids=pending,
+            existing_results=results, list_output_path=list_output_path,
+            max_seconds=max_seconds)
 
     # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/渐进落盘/pending
     if concurrency > 1:
@@ -4437,6 +4471,130 @@ def scrape_details(list_data, max_details=None, output_path=None,
         print(resume_hint(pending, output_path))
     print(f"\n详情已保存: {output_path}")
 
+    if fmt == "csv":
+        csv_path = output_path.rsplit(".", 1)[0] + ".csv"
+        write_detail_csv(csv_path, results)
+    return results
+
+
+def _scrape_one_detail_via_panel(job, ws, sid):
+    """右面板通道：在当前停靠搜索页点该岗位卡片，读右侧面板 JD（不跳页、零新增请求）。
+
+    Args:
+        job: 列表 job dict（用 encrypt_job_id/job_link/title 定位卡片）
+        ws, sid: 停靠的真实搜索页会话
+    """
+    job_id = job.get("job_id", "")
+    key = str(job.get("encrypt_job_id") or job.get("job_link") or "")
+    title = str(job.get("title") or "")
+    if not key and not title:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "invalid_detail", "message": "缺少定位卡片的关键字"}
+    try:
+        js = (CLICK_CARD_JS.replace("__KEY__", json.dumps(key))
+              .replace("__TITLE__", json.dumps(title)))
+        if not ws.eval_js(js, sid):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": "搜索页未找到该岗位卡片"}
+        if not _wait_for_detail_ready(ws, sid, timeout=PANEL_READY_TIMEOUT):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": "右面板未就绪"}
+        _dismiss_dialogs(ws, sid)
+        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
+        d = json.loads(val) if isinstance(val, str) else {}
+        if not isinstance(d, dict):
+            d = {}
+        try:
+            fields = extract_detail_fields(d)
+        except DetailLoginRequiredError as exc:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "login_required", "message": str(exc)}
+        except DetailExtractionError as exc:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": str(exc)}
+        d.update(fields)
+        return {"ok": True, "detail": build_detail_record(job, d),
+                "job_id": job_id, "reason": "", "message": ""}
+    except _cdp_exception_types() as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "cdp_session", "message": str(exc)}
+
+
+def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
+                              existing_ids=None, pending_ids=None,
+                              existing_results=None, list_output_path=None,
+                              max_seconds=None):
+    """右面板 JD 串行抓取：开一个停靠的真实搜索页，逐岗点卡片读面板（零新增请求）。"""
+    existing_ids = existing_ids if existing_ids is not None else set()
+    pending = dict(pending_ids) if pending_ids is not None else {}
+    results = list(existing_results) if existing_results is not None else []
+    keyword = list_data.get("keyword", "")
+    city_code = list_data.get("city_code", "")
+    session = None
+    try:
+        try:
+            session = _open_api_tab(cdp_port, keyword, city_code)
+        except _cdp_exception_types():
+            log.warning("右面板：搜索页建立失败", exc_info=True)
+            session = None
+        if session is None:
+            print("⚠️  右面板通道无法建立搜索页，跳过详情")
+            return results
+        ws, sid = session[0], session[2]
+        start_time = time.time()
+        done = ok = 0
+        reasons = {}
+        seen_links = set()
+        for idx, job in enumerate(jobs):
+            if max_seconds and time.time() - start_time >= max_seconds:
+                print(f"⏱️ 已达 --max-seconds={max_seconds}s 预算，优雅停止详情（已抓 {ok} 条）")
+                break
+            link = job.get("job_link", "")
+            job_id = job.get("job_id", "")
+            if not link or link in seen_links:
+                continue
+            seen_links.add(link)
+            if job_id and job_id in existing_ids and job_id not in pending:
+                print(f"[{idx + 1}/{len(jobs)}] 跳过已抓详情: {job.get('title', '')}")
+                continue
+            print(f"[{idx + 1}/{len(jobs)}] {job.get('boss_name', '')} - {job.get('title', '')}")
+            incr_request("detail")
+            result = _scrape_one_detail_via_panel(job, ws, sid)
+            done += 1
+            if result["ok"]:
+                results.append(result["detail"])
+                ok += 1
+                if job_id:
+                    pending.pop(job_id, None)
+                print(f"  JD: {len(result['detail'].get('jd', ''))} 字")
+                if output_path:
+                    _atomic_write_json(output_path, results)
+            elif result["reason"] == "risk_timeout":
+                reasons["risk_timeout"] = reasons.get("risk_timeout", 0) + 1
+                print(f"  ⚠️ {result['message']}")
+                _note_detail_risk_blocked(list_output_path,
+                                          city_name=list_data.get("city", ""),
+                                          keyword=keyword)
+                break
+            else:
+                reasons[result["reason"]] = reasons.get(result["reason"], 0) + 1
+                print(f"  ⏭️ {result['message']}")
+                if result["reason"] == "cdp_session" and job_id:
+                    pending[job_id] = pending.get(job_id, 0) + 1
+            # 面板零新增请求（同页内点击），仅轻度节奏间隔
+            if idx + 1 < len(jobs):
+                time.sleep(random.uniform(*DETAIL_DOM_GAP_SECONDS))
+        if done:
+            print(run_summary(time.time() - start_time, done, ok, reasons))
+    finally:
+        if session is not None:
+            _close_api_tab(session)
+    if output_path:
+        _atomic_write_json(output_path, results)
+    save_pending_ids(output_path, pending)
+    if pending:
+        print(resume_hint(pending, output_path))
+    print(f"\n详情已保存: {output_path}")
     if fmt == "csv":
         csv_path = output_path.rsplit(".", 1)[0] + ".csv"
         write_detail_csv(csv_path, results)
@@ -5575,6 +5733,11 @@ def build_parser():
     g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                           help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
+    g_detail.add_argument("--detail-channel", default="auto",
+                          choices=["auto", "api", "dom", "panel"],
+                          help="详情通道：auto=有 securityId 走 API 否则 DOM（默认）；"
+                               "api/dom=强制对应通道；panel=复用停靠搜索页点卡片读右侧面板 JD"
+                               "（零新增请求、串行；上游 #84 思路）")
     g_detail.add_argument("--analysis", action="store_true", help="输出分析报告")
     g_detail.add_argument("--input", default=None,
                           help="从已有 JSON 文件读取（跳过抓取）")
@@ -5719,7 +5882,8 @@ def run_cli():
                            detail=args.detail, detail_concurrency=args.concurrency,
                            keep_without_jd=args.keep_without_jd,
                            pages_parallel=args.pages_parallel,
-                           list_mode=args.list_mode))
+                           list_mode=args.list_mode,
+                           detail_channel=args.detail_channel))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
@@ -5949,6 +6113,7 @@ def run_cli():
                 # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
                 security_map=list_data.get("security_map"),
                 max_seconds=(args.max_seconds or None),
+                detail_channel=args.detail_channel,
             )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:

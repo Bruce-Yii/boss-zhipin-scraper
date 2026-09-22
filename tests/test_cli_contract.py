@@ -83,6 +83,13 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("--debug-screenshots", r.stdout)
 
+    def test_help_documents_detail_channel_flag(self):
+        """--detail-channel 出现在 --help（含 panel 右面板，上游 #84）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--detail-channel", r.stdout)
+        self.assertIn("panel", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
