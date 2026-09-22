@@ -70,5 +70,5 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 
 ## 合规与审计（P4e）
 
-- **红线**：不绕过平台安全机制、不调高默认频率/并发、不采集个人身份信息、不落 cookie/token（详见 `CONTRIBUTING.md`「关于合规 / 拒收的 PR（明文红线）」）。
+- **红线**：不绕过平台安全机制、不调高默认频率/并发、不采集个人身份信息、不落 cookie/token、**不用代理池/换 IP**（代理实测致 `code 7/37`；IP 被封＝该账号全部会话作废、换 IP 无效只能重新登录）。详见 `CONTRIBUTING.md`「关于合规 / 拒收的 PR（明文红线）」。
 - **审计**：`send_alert()` 与 `mark_cdp_cooldown()` 会把风险事件写入 `~/.boss-zhipin-scraper/risk_events.jsonl`（append-only JSONL，仓库外、不含凭据；`BOSS_AUDIT_PATH` 可覆盖，供测试）。新增"风控/登录/熔断"分支时请同步落审计（`record_audit_event`）。

@@ -4954,5 +4954,22 @@ class ProjectScopeTests(unittest.TestCase):
             self.assertNotIn(forbidden, combined)
 
 
+class ComplianceRedlineTests(unittest.TestCase):
+    """合规红线守卫（§1.9）：关键红线必须写在 AGENTS.md/CONTRIBUTING.md，防被无声删除。"""
+
+    def _read(self, name):
+        return (ROOT_PATH / name).read_text(encoding="utf-8")
+
+    def test_no_proxy_redline_documented(self):
+        combined = self._read("AGENTS.md") + "\n" + self._read("CONTRIBUTING.md")
+        self.assertIn("代理", combined, "「不用代理」红线应写入 AGENTS/CONTRIBUTING")
+
+    def test_contributing_lists_rejected_pr_types(self):
+        contributing = self._read("CONTRIBUTING.md")
+        self.assertIn("拒收的 PR", contributing)
+        for token in ("代理", "限速", "验证码", "绕过"):
+            self.assertIn(token, contributing, f"CONTRIBUTING 缺少红线关键词: {token}")
+
+
 if __name__ == "__main__":
     unittest.main()
