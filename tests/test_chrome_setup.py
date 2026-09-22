@@ -3413,6 +3413,34 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(fields["boss_active_status"], "在线")
         self.assertNotIn("在线", fields["jd"])
 
+    def test_strip_jd_noise_removes_ui_chrome_lines(self):
+        """纯 UI 噪声行（举报/扫码分享/去APP）被逐行剥离。"""
+        module = load_module()
+        text = "职位描述\n负责 AI 产品规划。\n微信扫码分享 举报\n举报\n去APP"
+        out = module.strip_jd_noise(text)
+        self.assertIn("负责 AI 产品规划。", out)
+        self.assertNotIn("微信扫码分享", out)
+        self.assertNotIn("举报", out)
+        self.assertNotIn("去APP", out)
+
+    def test_strip_jd_noise_keeps_content_mentioning_noise_word(self):
+        """正文句子含"举报"不应被删（仅整行噪声才删，保守规则）。"""
+        module = load_module()
+        text = "负责处理用户举报流程与风控策略。"
+        self.assertEqual(module.strip_jd_noise(text), text)
+
+    def test_extract_detail_fields_strips_noise_lines(self):
+        """抽取后的 JD 不含噪声行，且正文保留。"""
+        module = load_module()
+        description = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        page_text = (f"职位描述\n{description}"
+                     "微信扫码分享 举报\n举报\n"
+                     "张女士\n今日活跃\n示例公司\n·\n招聘专员")
+        fields = module.extract_detail_fields({"jd": page_text, "page_text": page_text})
+        self.assertNotIn("微信扫码分享", fields["jd"])
+        self.assertNotIn("举报", fields["jd"])
+        self.assertIn("负责 AI 产品规划", fields["jd"])
+
     def test_map_list_boss_active_status_from_representative_responses(self):
         module = load_module()
 

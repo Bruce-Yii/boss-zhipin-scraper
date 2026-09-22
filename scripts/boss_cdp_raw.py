@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.9.0"
+__version__ = "2.10.0"
 
 import argparse
 import csv
@@ -919,6 +919,7 @@ EXTRACT_DETAIL_JS = """
         var t = s.innerText.trim();
         if(t && !isBenefit(t)) tags.push(t);
     });
+    // 刻意用 innerText（而非 textContent）：跳过 <style>/<script> 源码与 display:none 诱饵文本
     var jd = '';
     var sections = document.querySelectorAll('.job-detail-section, .job-sec');
     for (var i = 0; i < sections.length; i++) {
@@ -950,6 +951,26 @@ def _normalize_detail_whitespace(text):
     normalized = "\n".join(lines).strip()
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return re.sub(r"[ \t]{2,}", " ", normalized)
+
+
+# JD 噪声行：详情页 UI 文案混入正文（举报/扫码分享/去APP 等），逐行剥离。
+# 仅当**整行**由噪声 token 组成才删（保守），避免误删正文里出现的同名片段。
+_JD_NOISE_TOKENS = frozenset((
+    "举报", "微信扫码分享", "去APP", "去 APP", "小程序", "分享",
+    "收藏", "立即沟通", "投诉", "下载APP", "下载 APP",
+))
+
+
+def _is_jd_noise_line(line):
+    """整行仅由 UI 噪声 token 组成（空白 / · / | 分隔）→ True。"""
+    parts = [p for p in re.split(r"[\s·|/]+", line.strip()) if p]
+    return bool(parts) and all(p in _JD_NOISE_TOKENS for p in parts)
+
+
+def strip_jd_noise(text):
+    """逐行剥离 JD 噪声行（详情页 UI 文案）；空行交由归一化处理。"""
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    return "\n".join(line for line in lines if not _is_jd_noise_line(line))
 
 
 # ============================================================
@@ -1276,7 +1297,7 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
                 lines = lines[:index]
                 break
 
-    jd = _normalize_detail_whitespace("\n".join(lines))
+    jd = _normalize_detail_whitespace(strip_jd_noise("\n".join(lines)))
     if len(jd) < min_length:
         raise DetailExtractionError(
             f"job description too short after validation: {len(jd)} < {min_length}"
