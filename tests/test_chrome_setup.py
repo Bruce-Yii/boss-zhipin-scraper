@@ -2434,7 +2434,9 @@ class ChromeSetupTests(unittest.TestCase):
     def test_parallel_api_channel_rotates_tab_on_budget(self):
         """预算轮换：同一 tab 达 DETAIL_API_TAB_BUDGET 次后自动换新 tab（支撑批量）。"""
         module = load_module()
-        jobs = self._sample_jobs(9)["jobs"]  # 预算 5 → 5+4 = 2 个 tab
+        jobs = self._sample_jobs(9)["jobs"]
+        budget = module.DETAIL_API_TAB_BUDGET
+        expected_tabs = (9 + budget - 1) // budget  # ceil(9 / 预算)
         tids = iter(f"tid-{i}" for i in range(10))
         created, navigations = [], []
 
@@ -2468,9 +2470,14 @@ class ChromeSetupTests(unittest.TestCase):
                 security_map={j["job_id"]: "sec" for j in jobs},
                 city_code="101010100", keyword="AI产品经理")
         self.assertEqual(len(results), 9)
-        self.assertEqual(len(created), 2,
-                         "9 条 / 预算 5 → 应轮换出 2 个 tab（初始 + 1 次轮换）")
-        self.assertEqual(len(navigations), 2, "每个 tab 只导航一次")
+        self.assertEqual(len(created), expected_tabs,
+                         f"9 条 / 预算 {budget} → 应轮换出 {expected_tabs} 个 tab")
+        self.assertEqual(len(navigations), expected_tabs, "每个 tab 只导航一次")
+
+    def test_detail_api_tab_budget_is_conservative_bottom(self):
+        """tab 预算须 ≤ 实测可用下限 4（2026-09-23 实机：第 5 次即 code 37）。"""
+        module = load_module()
+        self.assertLessEqual(module.DETAIL_API_TAB_BUDGET, 4)
 
     def test_parallel_api_channel_retries_after_risk_by_rotating_tab(self):
         """token_expired（会话过期）：换 tab 刷新后重试一次，成功则继续（不误判全停）。"""

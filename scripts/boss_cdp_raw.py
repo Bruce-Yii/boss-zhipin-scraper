@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.15.1"
+__version__ = "2.15.2"
 
 import argparse
 import base64
@@ -136,8 +136,10 @@ CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重�
 CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 # DETAIL_API_PACE_SECONDS 已抽出到 scripts/ratelimit.py（见顶部导入兼容层）
-DETAIL_API_TAB_BUDGET = 5       # 详情 API 每 tab 预算：实测同一 tab 第 6 次返回 code 37
-                                # （即可用 5 次，2026-09-22 E3 复核），换新 tab 立即重置 → 主动轮换
+DETAIL_API_TAB_BUDGET = 4       # 详情 API 每 tab 预算：**取实测可用下限 4**（第 5 次前主动轮换）
+                                # 2026-09-22 E3 曾复核为 5；2026-09-23 实机复测：配额为 4 时
+                                # **第 5 次即 code 37（且当时未轮换）**→ 预算须 ≤ 可用下限 4。
+                                # 换新 tab 立即重置配额 → 主动轮换。
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 # DOM 详情通道提速（《DOM 与速度控制专题》落地）：原路径固定 sleep（导航后 5-10s + 3-7 次滚动
 # 各 0.8-5s + 页间 10-25s）→ 实测 ~38s/条，比同行独立详情页（~9.5s/条）慢约 4×。
