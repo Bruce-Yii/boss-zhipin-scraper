@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.10（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.11（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.10.2-orange.svg)
+![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -168,6 +168,7 @@ python3 scripts/job_summary.py --top 15
 | `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |
+| `--foreground-capture` | 列表/登录探测/详情 DOM 改用前台 Target；用于 Chrome 在 Linux/Xvfb 下后台 Target 捕获不到搜索响应的环境（默认保持后台） |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--db [PATH]` | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值时用默认库 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |

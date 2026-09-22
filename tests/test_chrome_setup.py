@@ -105,6 +105,20 @@ class ChromeSetupTests(unittest.TestCase):
             ],
         )
 
+    def test_foreground_capture_flag_flips_page_background_default(self):
+        """§1.3：--foreground-capture 逃生口——默认后台，开关打开后前台。"""
+        module = load_module()
+        self.assertTrue(module.page_background_default())
+        with mock.patch.object(module, "FOREGROUND_CAPTURE", True):
+            self.assertFalse(module.page_background_default())
+
+    def test_automation_call_sites_honor_page_background_default(self):
+        """§1.3 防回归：列表/登录探测/详情 DOM 至少 3 个调用点透传 helper。"""
+        source = SCRIPT_PATH.read_text(encoding="utf-8")
+        self.assertGreaterEqual(
+            source.count("background=page_background_default()"), 3,
+            "至少 3 个自动化调用点应透传 background=page_background_default()")
+
     def test_create_page_session_can_open_interactive_foreground_target(self):
         module = load_module()
         cdp = mock.Mock()

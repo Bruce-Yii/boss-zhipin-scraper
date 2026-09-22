@@ -64,6 +64,12 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("--filter-inactive", r.stdout)
 
+    def test_help_documents_foreground_capture_flag(self):
+        """--foreground-capture 出现在 --help（§1.3 逃生口，默认后台）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--foreground-capture", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

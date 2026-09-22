@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.10.2"
+__version__ = "2.11.0"
 
 import argparse
 import csv
@@ -632,6 +632,17 @@ BACKGROUND_VISIBILITY_SCRIPT = (
     "Object.defineProperty(document, 'webkitHidden', {get: () => false});"
     "Object.defineProperty(document, 'webkitVisibilityState', {get: () => 'visible'});"
 )
+
+
+# --foreground-capture（§1.3）：Chrome 151 在 Linux/Xvfb 下后台 Target 可能捕获不到
+# 搜索响应（上游 #67/#68）。默认保持后台（避免抢焦点、避免 document.hidden 触发
+# BOSS visibility 反爬，issue #18）；该开关为问题环境提供逃生口。
+FOREGROUND_CAPTURE = False
+
+
+def page_background_default():
+    """自动化页面默认后台；`--foreground-capture` 打开时改为前台（逃生口）。"""
+    return not FOREGROUND_CAPTURE
 
 
 def create_page_session(cdp, background=True):
@@ -1668,7 +1679,7 @@ def _probe_login_state_uncached(cdp_port=DEFAULT_CDP_PORT):
     tid = None
     try:
         cdp = CDPSession(cdp_port)
-        tid, sid = create_page_session(cdp)
+        tid, sid = create_page_session(cdp, background=page_background_default())
 
         # 先导航到 BOSS直聘，确保 cookie 域名正确
         cdp.send("Page.navigate", {"url": "https://www.zhipin.com/"}, sid)
@@ -2529,7 +2540,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     warnings = []
     empty_pages = 0  # 连续空页计数（风控静默降级信号，>=2 即停）
 
-    tid, sid = create_page_session(cdp)
+    tid, sid = create_page_session(cdp, background=page_background_default())
 
     def human_scroll(cdp, sid):
         """模拟人类滚动: 随机次数、随机距离、随机停顿，偶尔回滚一点"""
@@ -3534,7 +3545,7 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
     tid = None
     try:
         ws = CDPSession(cdp_port)
-        tid, sid = create_page_session(ws)
+        tid, sid = create_page_session(ws, background=page_background_default())
 
         detail_url = build_detail_url(job)
         # 并发模式全局限速：导航（真实请求）前申请配额
@@ -5002,6 +5013,10 @@ def build_parser():
     g_search.add_argument("--pages-parallel", type=int, default=3,
                           help="并行抓页数（默认 3；多 tab 同发搜索 XHR，迭代列表阶段"
                                "约 50s→约 6s；0/1=关闭回退串行）")
+    g_search.add_argument("--foreground-capture", action="store_true",
+                          help="列表/登录探测/详情 DOM 改用前台 Target（默认后台）；"
+                               "Chrome 在 Linux/Xvfb 下后台 Target 可能捕获不到搜索响应时使用"
+                               "（上游 #67/#68；macOS/Windows 正常环境保持默认即可）")
 
     # ---- 筛选参数 ----
     g_filter = p.add_argument_group("筛选参数")
@@ -5125,6 +5140,12 @@ def run_cli():
     _apply_verbosity(args.verbose, args.quiet)
     if args.verbose:
         log.debug("已开启 DEBUG 日志")
+
+    # §1.3：--foreground-capture 逃生口（在 --batch / 抓取派发之前生效）
+    global FOREGROUND_CAPTURE
+    FOREGROUND_CAPTURE = bool(getattr(args, "foreground_capture", False))
+    if FOREGROUND_CAPTURE:
+        print("⚠️  已启用 --foreground-capture：自动化页面改用前台 Target（问题环境逃生口）")
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
