@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.11.0 (2026-09-22)
+
+### 新增
+- **§1.3 `--foreground-capture` 逃生口**：列表 / 登录探测 / 详情 DOM 的自动化页面默认仍后台（避免抢焦点、避免 `document.hidden` 触发 BOSS visibility 反爬，issue #18）；该开关为 Chrome 在 Linux/Xvfb 等环境"后台 Target 捕获不到搜索响应"（上游 #67/#68）提供逃生口。`wait_for_login` 本就前台，不受影响。测试 +3
+
+### 文档
+- README / `SKILL.md` 补充 `--foreground-capture`
+
 ## v2.10.2 (2026-09-22)
 
 ### 修复
