@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 import json
 import math
@@ -4727,6 +4727,7 @@ def run_cli():
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
+    cleanup_security_sidecars()  # 清理过期 securityId sidecar（P1 双通道）
     cleanup_stale_tmp_files(os.path.dirname(SCRAPE_LOCK_PATH))
 
     # --check 模式
@@ -4826,10 +4827,19 @@ def run_cli():
             filters[key] = val
 
     # 加载或抓取列表
+    sidecar_owned = None  # 本次 run 自建的 securityId sidecar（成功结束即删）
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             list_data = json.load(f)
         print(f"从文件加载 {len(list_data.get('jobs',[]))} 条: {args.input}")
+        # 显式双通道：优先从 sidecar 复用 securityId 走 API 通道
+        _sidecar_map = load_security_sidecar(args.input)
+        if _sidecar_map:
+            list_data["security_map"] = _sidecar_map
+            print(f"ℹ️  已从 securityId sidecar 载入 {len(_sidecar_map)} 条（详情走 API 通道）")
+        elif args.detail:
+            print("⚠️  未找到 securityId sidecar，详情将走 DOM 慢通道"
+                  "（如需 API 通道，先重跑一次列表以生成 sidecar）")
     else:
         # 登录状态检测
         print("检测登录状态...")
@@ -4863,6 +4873,9 @@ def run_cli():
             max_jobs=args.max_jobs,
             max_concurrent=args.max_concurrent,
         )
+        # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
+        sidecar_owned = write_security_sidecar(
+            list_data.get("output_path"), list_data.get("security_map"))
 
     # 合并外部文件
     merged_details = None
@@ -4930,16 +4943,32 @@ def run_cli():
             export_path = list_data.get("output_path")
             if not export_path and args.input and args.output:
                 export_path = args.output
+            # 显式双通道：据 security_map 覆盖度标记 detail_channel（api/dom/mixed）
+            _smap = list_data.get("security_map") or {}
+            _detail_jobs = list_data.get("jobs", [])
+            _with_sid = sum(1 for j in _detail_jobs
+                            if isinstance(j, dict) and j.get("job_id") in _smap)
+            if _smap and _with_sid == len(_detail_jobs):
+                _channel = "api"
+            elif _with_sid == 0:
+                _channel = "dom"
+            else:
+                _channel = "mixed"
             if export_path:
                 merged_export = _merge_jd_into_export(
                     export_path, details, base=list_data,
-                    keep_without_jd=args.keep_without_jd)
+                    keep_without_jd=args.keep_without_jd,
+                    extra_meta={"detail_channel": _channel})
                 if merged_export:
                     kept, dropped = merged_export
                     print(f"✅ 口径一：导出 {kept} 条（含 jd）"
-                          + (f"，剔除无 JD {dropped} 条" if dropped else ""))
+                          + (f"，剔除无 JD {dropped} 条" if dropped else "")
+                          + f"｜detail_channel={_channel}")
             elif args.input:
                 print("ℹ️  --input 模式未指定 --output，跳过 jd 并入（原列表保持原样）")
+            # 本次 run 自建的 sidecar：成功结束即删（TTL 为兜底）
+            if sidecar_owned:
+                delete_security_sidecar(list_data.get("output_path"))
 
     # 分析
     if args.analysis:

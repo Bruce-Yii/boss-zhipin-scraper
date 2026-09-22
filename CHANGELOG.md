@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.5.0 (2026-09-22)
+
+### 新增
+- **显式双通道策略 + securityId 受限 sidecar**（2026-09-22，用户拍板 B）：详情抓取在导出 meta 显式标记 `detail_channel`（`api`/`dom`/`mixed`）；`--input` 续抓优先从受限 sidecar 复用 `securityId` 走 API 快通道，未命中则走 DOM 慢通道并**明确告警**。sidecar 严格约束：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、**60 分钟 TTL**、run 正常结束即删、启动清理过期残留；**绝不进导出/日志/git**；**登录 cookie 绝不落盘**（红线不变）。测试 +2
+
+### 重构
+- **抽出两个稳定纯逻辑模块**：`scripts/ratelimit.py`（`TokenBucket`/`AdaptiveRateLimiter`）与 `scripts/export_contract.py`（契约/脱敏/口径一/原子写）；主文件顶部兼容 shim 做 re-export，导入面与既有测试不变。`CONTRIBUTING.md`「单文件原则」改写为「模块边界」（编排/CDP/CLI 仍在主文件）。测试 +2（模块 re-export）
+
+### 版本
+- `2.4.0 → 2.5.0`（四处同步）
+
 ## v2.4.0 (2026-09-22)
 
 ### 修复

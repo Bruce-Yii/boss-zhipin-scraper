@@ -202,7 +202,8 @@ def flush_jobs(path, meta, jobs):
     _atomic_write_json(path, meta)
 
 
-def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False):
+def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
+                          extra_meta=None):
     """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
 
     - 每条 job 追加 `jd` 字段（有详情时）
@@ -269,5 +270,7 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         warnings.append(
             f"口径一：已剔除 {len(dropped_ids)} 条无 JD 岗位（见 meta.dropped_no_jd）")
         data["warnings"] = warnings
+    if extra_meta:
+        data.update(extra_meta)
     _atomic_write_json(target_path, data)
     return len(kept), len(dropped_ids)

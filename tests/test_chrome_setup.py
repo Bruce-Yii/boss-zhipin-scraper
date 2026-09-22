@@ -1837,6 +1837,23 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIs(module.merge_unique, ex.merge_unique)
         self.assertEqual(module.FORMAT_VERSION, 2)
 
+    def test_merge_jd_into_export_honors_extra_meta(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            p = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            module._atomic_write_json(p, {
+                "jobs": [{"job_id": "a", "title": "t", "location": "l",
+                          "job_link": "u", "company_name": "c"}],
+                "total": 1,
+            })
+            module._merge_jd_into_export(
+                p, [{"job_id": "a", "jd": "hello"}],
+                extra_meta={"detail_channel": "api"})
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data.get("detail_channel"), "api")
+            self.assertEqual(data["jobs"][0].get("jd"), "hello")
+
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()
         bucket = module.TokenBucket(rate=2.0, capacity=2)
