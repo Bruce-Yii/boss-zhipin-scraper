@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.14.1 (2026-09-22)
+
+### 健壮性 / 排障（《DOM 与速度控制专题》小项）
+- **失败截图**：新增 `--debug-screenshots`（默认关闭）。DOM 详情在 `risk_timeout` / `login_required` / `invalid_detail` 时用 CDP `Page.captureScreenshot` 存图到 `~/.boss-zhipin-scraper/debug/`（`BOSS_DEBUG_DIR` 可覆盖；仓库外、best-effort）（专题 §3.6 / 清单#4）。
+- **CDP 三级端口探测**：新增 `probe_cdp_port` / `detect_cdp_port`（`9222/9229/19222`）；`--check` 在首选端口不可达时探测候选端口并提示 `--cdp-port N`（专题 §3.2 / 清单#3）。
+- **后台 tab 滚动派发事件**：被动捕获翻页改用 `SCROLL_BOTTOM_JS`（滚到底后 `dispatchEvent(new Event('scroll'))`）——后台/hidden tab 的原生滚动会被 defer，不派发事件则不触发无限滚动加载（专题 §1.6/§1.7）。
+- 测试 +6（`TopicSmallItemsTests` + CLI `--debug-screenshots`）。
+
 ## v2.14.0 (2026-09-22)
 
 ### 性能（DOM 详情降级通道提速 · 《DOM 与速度控制专题》落地）
