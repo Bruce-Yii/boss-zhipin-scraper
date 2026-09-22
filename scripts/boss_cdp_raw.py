@@ -256,6 +256,54 @@ LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
 LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
+
+# BOSS wapi 业务码 → (类别, 人话)。类别统一判定"参数错 / 限流 / 环境风控 / 安全拦截"。
+# 依据：同行研究（boss-cli exceptions.py、boss-agent-cli zhipin_errors.py，2026-09-22）
+# + 我方实测。code 37 单独二分（见 classify_boss_code）。
+BOSS_CODE_TABLE = {
+    9: ("rate_limited", "限流（冷却后重试）"),
+    17: ("invalid_params", "参数错误（缺少必填参数），应报错退出"),
+    19: ("invalid_params", "参数错误（参数非法），应报错退出"),
+    31: ("env_risk", "环境风控（停手冷却）"),
+    35: ("env_risk", "环境风控（停手冷却）"),
+    36: ("account_risk", "账号风险（停手）"),
+    38: ("env_risk", "环境风控（停手冷却）"),
+    121: ("security_block", "安全拦截（直接停，提示走网页端人工处理）"),
+    122: ("security_block", "安全拦截（直接停，提示走网页端人工处理）"),
+}
+
+# 处置类别 → 是否"可直接重试"（仅 token_expired 值得刷新会话后重试一次）
+RETRYABLE_CATEGORIES = {"token_expired"}
+
+
+def classify_boss_code(code, msg=""):
+    """把 BOSS 业务码归为处置类别并给出人话说明。
+
+    返回 (category, detail)。category ∈
+      ok / invalid_params / rate_limited / env_risk / account_risk /
+      security_block / token_expired / unknown
+
+    code 37 二分（2026-09-22 同行研究关键结论）：
+      msg 含 token/session/会话/登录/过期 → token_expired（刷新会话后重试一次）
+      否则（含"环境/异常/风控"等）→ env_risk（**换 tab 无用，必须停手冷却**）
+    """
+    try:
+        code = int(code or 0)
+    except (TypeError, ValueError):
+        return "unknown", "业务码非整数（保守停手）"
+    if code == 0:
+        return "ok", "正常"
+    if code == 37:
+        text = str(msg or "")
+        low = text.lower()
+        if (any(k in low for k in ("token", "session", "expired"))
+                or any(k in text for k in ("会话", "登录", "过期", "令牌"))):
+            return "token_expired", "会话/令牌过期（刷新会话后重试一次）"
+        return "env_risk", "环境风控（换 tab 无用，停手冷却）"
+    entry = BOSS_CODE_TABLE.get(code)
+    if entry:
+        return entry
+    return "unknown", "未知业务码（保守停手）"
 # 未知非零 code 一律按受限（降速）处理，见 probe_login_state 的 code != 0 分支
 DEFAULT_LOGIN_TIMEOUT = 300
 
@@ -810,7 +858,15 @@ class DetailLoginRequiredError(DetailExtractionError):
 
 
 class DetailRiskError(DetailExtractionError):
-    """详情 API 返回风控码（code!=0）：退避重试，连续命中走熔断全停。"""
+    """详情 API 返回风控码（code!=0）。
+
+    category 用于**二分处置**（2026-09-22 同行研究）：
+      token_expired  → 会话/令牌过期：刷新会话（轮换 tab）后重试一次
+      env_risk / account_risk / security_block → 换 tab 无用：停手 + 冷却
+    """
+    def __init__(self, message, category="env_risk"):
+        super().__init__(message)
+        self.category = category
 
 
 EXTRACT_DETAIL_JS = """
@@ -976,7 +1032,11 @@ def _parse_detail_api_value(val, job):
     if payload.get("error"):
         raise DetailExtractionError(f"详情 API 请求失败: {payload['error']}")
     if payload.get("code", 0) != 0:
-        raise DetailRiskError(f"详情 API 风控码: code={payload.get('code')} {payload.get('msg', '')}")
+        _code = payload.get("code")
+        _msg = str(payload.get("msg", ""))
+        _cat, _detail = classify_boss_code(_code, _msg)
+        raise DetailRiskError(
+            f"详情 API 风控码: code={_code} {_msg}（{_detail}）", category=_cat)
     jd = str(payload.get("jd") or "")
     jd = jd.replace("\u3000", " ")  # 全角空格清理（探测实证 postDescription 含全角空格）
     jd = _normalize_detail_whitespace(jd)
@@ -3443,9 +3503,10 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
         try:
             fields = _parse_detail_api_value(val, job)
         except DetailRiskError as exc:
-            # 风控码：与列表阶段同构——退避重试由上层 pending/全停逻辑接管
+            # 风控码：退避/全停由上层按 category 二分处置（仅 token_expired 才重试）
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "risk_timeout", "message": str(exc)}
+                    "reason": "risk_timeout", "message": str(exc),
+                    "category": getattr(exc, "category", "env_risk")}
         except DetailExtractionError as exc:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail", "message": str(exc)}
@@ -3606,9 +3667,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
                                     api_session=api_session,
                                     city_code=detail_city_code,
                                     search_keyword=detail_keyword)
-        # 风控码可能是"本 tab 配额耗尽"：换 tab 重试一次；仍失败才判定真风控（全停）
+        # 风控码二分：仅 token_expired（会话/令牌过期）值得换 tab 刷新后重试一次；
+        # env_risk/account_risk/security_block 换 tab 无用 → 不重试，直接全停冷却
         if (result["reason"] == "risk_timeout" and job_security
-                and api_session is not None):
+                and api_session is not None
+                and result.get("category") in RETRYABLE_CATEGORIES):
             incr_request("detail")
             if _rotate_api_tab(api_session, cdp_port, detail_keyword, detail_city_code):
                 print("  ♻️ 命中风控码，换 tab 重试该岗位一次...")
@@ -3664,6 +3727,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
             print(f"  ⚠️ {result['message']}")
+            if result.get("category") not in RETRYABLE_CATEGORIES:
+                # 环境/账号/安全风控：进入冷却，防"停手后立即重开→再触"
+                mark_cdp_cooldown()
             _note_detail_risk_blocked(list_output_path,
                                       city_name=list_data.get("city", ""),
                                       keyword=list_data.get("keyword", ""))
@@ -3801,6 +3867,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             # message 含实际风控形态（如 code=37），必须打印（可观测性）
             print(f"  ⚠️ {result['message']}")
             stop_event.set()
+            if result.get("category") not in RETRYABLE_CATEGORIES:
+                # 环境/账号/安全风控：进入冷却，防"停手后立即重开→再触"
+                mark_cdp_cooldown()
             _note_detail_risk_blocked(list_output_path, city_name=city, keyword=keyword)
         elif reason == "cdp_session":
             consecutive_cdp_errors += 1
@@ -3854,9 +3923,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     job, cdp_port, stop_event, limiter,
                     security_id=job_security, api_session=session,
                     city_code=city_code, search_keyword=keyword)
-                # 风控码疑似"配额耗尽"：换 tab 重试一次；仍失败才判定真风控
+                # 风控码二分：仅 token_expired 才换 tab 刷新后重试一次（其余换 tab 无用）
                 if (result["reason"] == "risk_timeout" and job_security
-                        and session is not None):
+                        and session is not None
+                        and result.get("category") in RETRYABLE_CATEGORIES):
                     if _rotate_api_tab(session, cdp_port, keyword, city_code):
                         result = _scrape_one_detail(
                             job, cdp_port, stop_event, limiter,

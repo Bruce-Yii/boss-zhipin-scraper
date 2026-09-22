@@ -10,6 +10,12 @@
 - **实测记录**：E5 并行 3 页 0.4s；E1/E2 详情 API 不带 `securityId` 返回 `code 17`（确认必须带，列表↔详情耦合不可去）
 - 端到端实测（南京 × 3 页 + 详情并发 3）：整格 **~80 秒**（原约 5.6 分钟）；测试 +2
 
+### 风控（P4a · 同行研究落地）
+- **code 全表 + `code 37` 二分**（`classify_boss_code`）：`token_expired`（会话/令牌过期）才刷新会话后重试一次；`env_risk / account_risk / security_block` **换 tab 无用 → 停手 + 冷却**。新增 9/17/19/31/35/36/38/121/122 归类，终结"换 tab 清不掉"的无效重试
+- 环境风控命中即进入冷却（复用 `mark_cdp_cooldown`），防"停手后立即重开再触"
+- 新增风控处置 runbook（`docs/projects/boss-zhipin-scraper/boss-zhipin-scraper-风控处置-runbook.md`）
+- 测试 +3
+
 ### 变更
 - **收窄 Python 支持到 3.12**（个人自用）：`requires-python >=3.12`；CI 矩阵去除 3.10；`coverage[toml]` extra 不再需要（3.12 自带 `tomllib`）；ruff `target-version → py312`；文档/徽章同步 3.12+
 

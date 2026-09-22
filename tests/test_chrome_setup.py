@@ -1855,6 +1855,24 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         self.assertIn(module.TargetCrashedError, module._cdp_exception_types())
 
+    def test_classify_boss_code(self):
+        """code 全表 + code37 二分（token_expired vs env_risk）——同行研究关键结论。"""
+        module = load_module()
+        self.assertEqual(module.classify_boss_code(0)[0], "ok")
+        self.assertEqual(
+            module.classify_boss_code(37, "您的环境存在异常")[0], "env_risk")
+        self.assertEqual(
+            module.classify_boss_code(37, "会话过期，请重新登录")[0], "token_expired")
+        self.assertEqual(
+            module.classify_boss_code(37, "session expired")[0], "token_expired")
+        self.assertEqual(module.classify_boss_code(121)[0], "security_block")
+        self.assertEqual(module.classify_boss_code(122)[0], "security_block")
+        self.assertEqual(module.classify_boss_code(17)[0], "invalid_params")
+        self.assertEqual(module.classify_boss_code(9)[0], "rate_limited")
+        self.assertEqual(module.classify_boss_code(999)[0], "unknown")
+        self.assertIn("token_expired", module.RETRYABLE_CATEGORIES)
+        self.assertNotIn("env_risk", module.RETRYABLE_CATEGORIES)
+
     def test_export_contract_module_is_reexported(self):
         module = load_module()
         from scripts import export_contract as ex
@@ -2379,7 +2397,7 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(len(navigations), 2, "每个 tab 只导航一次")
 
     def test_parallel_api_channel_retries_after_risk_by_rotating_tab(self):
-        """风控码疑似配额耗尽：换 tab 重试一次，成功则继续（不误判全停）。"""
+        """token_expired（会话过期）：换 tab 刷新后重试一次，成功则继续（不误判全停）。"""
         module = load_module()
         jobs = self._sample_jobs(2)["jobs"]
         tids = iter(f"tid-{i}" for i in range(6))
@@ -2396,7 +2414,8 @@ class ChromeSetupTests(unittest.TestCase):
             calls["n"] += 1
             if calls["n"] == 1:
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
-                        "reason": "risk_timeout", "message": "详情 API 风控码: code=37"}
+                        "reason": "risk_timeout", "message": "code=37 会话过期",
+                        "category": "token_expired"}
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": ""}
 
@@ -2417,6 +2436,41 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(len(results), 2, "换 tab 重试后两条都应成功（不应全停）")
         self.assertGreaterEqual(len(created), 2, "应发生一次 tab 轮换")
         risk_note.assert_not_called()
+
+    def test_parallel_env_risk_does_not_retry_and_cools_down(self):
+        """env_risk（环境风控）：换 tab 无用 → 不重试、直接全停并进入冷却。"""
+        module = load_module()
+        jobs = self._sample_jobs(3)["jobs"]
+        tids = iter(f"tid-{i}" for i in range(6))
+
+        def fake_cdp(port=None):
+            return mock.Mock()
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "risk_timeout", "message": "code=37 您的环境存在异常",
+                    "category": "env_risk"}
+
+        with mock.patch.object(module, "CDPSession", side_effect=fake_cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  side_effect=lambda ws: (next(tids), "s")), \
+                mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "_note_detail_risk_blocked"), \
+                mock.patch.object(module, "mark_cdp_cooldown") as cool, \
+                mock.patch.object(module, "_rotate_api_tab") as rot, \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=1,
+                limiter=limiter_cls.return_value,
+                security_map={j["job_id"]: "sec" for j in jobs},
+                city_code="101010100", keyword="AI产品经理")
+        rot.assert_not_called()  # env_risk 不换 tab（换了也没用）
+        cool.assert_called()     # 进入冷却
 
     def test_parallel_records_failed_jobs_to_pending(self):
         module = load_module()
