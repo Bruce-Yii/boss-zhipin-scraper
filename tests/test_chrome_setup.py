@@ -1821,35 +1821,144 @@ class ChromeSetupTests(unittest.TestCase):
 
     # ----- 并发详情抓取：全局限速令牌桶 -----
 
+    def test_ratelimit_module_is_reexported(self):
+        module = load_module()
+        from scripts import ratelimit as rl
+        self.assertIs(module.TokenBucket, rl.TokenBucket)
+        self.assertIs(module.AdaptiveRateLimiter, rl.AdaptiveRateLimiter)
+        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 15.0)
+
+    def test_export_contract_module_is_reexported(self):
+        module = load_module()
+        from scripts import export_contract as ex
+        self.assertIs(module._sanitize_job, ex._sanitize_job)
+        self.assertIs(module.flush_jobs, ex.flush_jobs)
+        self.assertIs(module._merge_jd_into_export, ex._merge_jd_into_export)
+        self.assertIs(module.merge_unique, ex.merge_unique)
+        self.assertEqual(module.FORMAT_VERSION, 2)
+
+    def test_merge_jd_into_export_honors_extra_meta(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            p = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            module._atomic_write_json(p, {
+                "jobs": [{"job_id": "a", "title": "t", "location": "l",
+                          "job_link": "u", "company_name": "c"}],
+                "total": 1,
+            })
+            module._merge_jd_into_export(
+                p, [{"job_id": "a", "jd": "hello"}],
+                extra_meta={"detail_channel": "api"})
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            self.assertEqual(data.get("detail_channel"), "api")
+            self.assertEqual(data["jobs"][0].get("jd"), "hello")
+
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()
         bucket = module.TokenBucket(rate=2.0, capacity=2)
-        with mock.patch.object(module.time, "sleep") as sleep_mock, \
-                mock.patch.object(module.time, "time", side_effect=[0.0, 0.1, 0.2]):
+        with mock.patch.object(module.time, "sleep") as sleep_mock:
             bucket.acquire()
             bucket.acquire()
         sleep_mock.assert_not_called(), "容量内不应阻塞"
 
     def test_token_bucket_blocks_when_depleted(self):
         module = load_module()
-        bucket = module.TokenBucket(rate=1.0, capacity=1)
-        with mock.patch.object(module.time, "sleep") as sleep_mock, \
-                mock.patch.object(module.time, "time", side_effect=[0.0, 0.1, 1.1]):
-            bucket.acquire()   # 消耗唯一令牌
-            bucket.acquire()   # 需要等 1 秒补充
+        clock = [0.0]
+
+        def _sleep(d):
+            clock[0] += d
+
+        with mock.patch.object(module.time, "monotonic",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(module.time, "sleep", side_effect=_sleep) as sleep_mock:
+            bucket = module.TokenBucket(rate=1.0, capacity=1)  # 假时钟构造（_last_refill=0）
+            bucket.acquire()   # t=0 消耗唯一令牌
+            bucket.acquire()   # 需等约 1 秒补充后重新复核
         sleep_mock.assert_called_once()
         self.assertGreaterEqual(sleep_mock.call_args[0][0], 0.9,
                                 "等待时长应覆盖令牌补充间隔")
 
     def test_token_bucket_accumulates_tokens_over_time(self):
         module = load_module()
-        bucket = module.TokenBucket(rate=2.0, capacity=10)
-        with mock.patch.object(module.time, "sleep"), \
-                mock.patch.object(module.time, "time", side_effect=[0.0, 5.0]):
-            # 5 秒空闲后应有 10 个令牌（受容量上限）
+        clock = [0.0]
+        with mock.patch.object(module.time, "monotonic",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(module.time, "sleep") as sleep_mock:
+            bucket = module.TokenBucket(rate=2.0, capacity=10)  # 假时钟构造
+            for _ in range(10):
+                bucket.acquire()   # 耗尽 10 个令牌
+            clock[0] += 0.5        # 空闲 0.5s → 按速率补充 1 个令牌
+            bucket.acquire()       # 应无阻塞
+        sleep_mock.assert_not_called()
+
+    def test_token_bucket_serializes_concurrent_acquires(self):
+        # 回归（2026-09-22）：容量 1、rate=10/s、4 线程并发取令牌时，
+        # 授予应串行化（≈3 个间隔 0.3s），而非旧实现"同睡同醒"突发放行。
+        module = load_module()
+        bucket = module.TokenBucket(rate=10.0, capacity=1)
+        grants = []
+        lock = threading.Lock()
+        start = time.monotonic()
+
+        def worker():
             bucket.acquire()
-        # 无阻塞即说明令牌已按速率累计
-        self.assertTrue(True)
+            with lock:
+                grants.append(time.monotonic() - start)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(grants), 4)
+        self.assertGreaterEqual(max(grants), 0.2,
+                                "并发取令牌应串行化，不应突发放行（锁外 sleep 回归）")
+
+    def test_security_sidecar_roundtrip_expiry_cleanup(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            sidecar_dir = str(paths["cdp_profile"] / ".session")
+            with mock.patch.object(module, "SECURITY_SIDECAR_DIR", sidecar_dir):
+                self.assertIsNone(module.write_security_sidecar(list_path, {}),
+                                  "空 security_map 不应写 sidecar")
+                module.write_security_sidecar(list_path, {"j1": "sid-1"})
+                self.assertEqual(module.load_security_sidecar(list_path), {"j1": "sid-1"})
+                self.assertEqual(module.cleanup_security_sidecars(), 0, "未过期不应删除")
+                module.delete_security_sidecar(list_path)
+                self.assertEqual(module.load_security_sidecar(list_path), {},
+                                 "删除后应为空")
+                # 过期：读时删除
+                module.write_security_sidecar(list_path, {"j1": "sid-1"})
+                p = module.security_sidecar_path(list_path)
+                old = time.time() - module.SECURITY_SIDECAR_TTL_SECONDS - 5
+                os.utime(p, (old, old))
+                self.assertEqual(module.load_security_sidecar(list_path), {})
+                self.assertFalse(os.path.exists(p), "过期 sidecar 应被删除")
+                # 过期残留：cleanup 清理
+                module.write_security_sidecar(list_path, {"j1": "sid-1"})
+                os.utime(p, (old, old))
+                self.assertEqual(module.cleanup_security_sidecars(), 1)
+                self.assertFalse(os.path.exists(p))
+
+    def test_incr_request_is_thread_safe(self):
+        module = load_module()
+        original = module._request_counter
+        module._request_counter = 0
+        try:
+            def worker():
+                for _ in range(80):
+                    module.incr_request("detail")
+            ts = [threading.Thread(target=worker) for _ in range(5)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(module._request_counter, 400,
+                             "并发 incr_request 计数应精确（加锁）")
+        finally:
+            module._request_counter = original
 
     def test_adaptive_limiter_halves_rate_on_high_failure_window(self):
         module = load_module()

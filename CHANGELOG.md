@@ -1,5 +1,36 @@
 # Changelog
 
+## v2.5.0 (2026-09-22)
+
+### 新增
+- **显式双通道策略 + securityId 受限 sidecar**（2026-09-22，用户拍板 B）：详情抓取在导出 meta 显式标记 `detail_channel`（`api`/`dom`/`mixed`）；`--input` 续抓优先从受限 sidecar 复用 `securityId` 走 API 快通道，未命中则走 DOM 慢通道并**明确告警**。sidecar 严格约束：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、**60 分钟 TTL**、run 正常结束即删、启动清理过期残留；**绝不进导出/日志/git**；**登录 cookie 绝不落盘**（红线不变）。测试 +2
+
+### 重构
+- **抽出两个稳定纯逻辑模块**：`scripts/ratelimit.py`（`TokenBucket`/`AdaptiveRateLimiter`）与 `scripts/export_contract.py`（契约/脱敏/口径一/原子写）；主文件顶部兼容 shim 做 re-export，导入面与既有测试不变。`CONTRIBUTING.md`「单文件原则」改写为「模块边界」（编排/CDP/CLI 仍在主文件）。测试 +2（模块 re-export）
+
+### 修复
+- **`incr_request` 加锁**：并发详情路径下每任务调用，加锁避免计数漏加/超发（2026-09-22 审计）。测试 +1
+- **收窄 Chrome `--remote-allow-origins`**：由 `*` 收窄到本机 `localhost/127.0.0.1:<port>`（安全）
+- **复核结论**：`record_counts.duplicate` 的"逐次写盘重复重发量"语义为**刻意设计**（由 `test_flush_jobs_accumulates_record_counts_across_writes` 锁定），审计曾疑其失真，**经复核维持不变**
+
+### 版本
+- `2.4.0 → 2.5.0`（四处同步）
+
+## v2.4.0 (2026-09-22)
+
+### 修复
+- **限速器并发正确性（高，风控结构性根因）**：`TokenBucket.acquire` 原在锁外 `sleep` 后不再复核令牌——并发下 N 个 worker 同睡同醒、各自扣减 → **突发超速**（本轮实测约 1.75× 名义速率）。改为锁内判定/扣减、锁外等待后**循环复核**；`AdaptiveRateLimiter` 的"连续坏窗口暂停"改为单飞（新增 `_pause_lock`），消除"N 线程同时长睡"的暂停风暴。新增**并发回归测试**（容量 1 / rate=10 / 4 线程，断言授予时刻串行化、无突发放行）。测试 +1，290 全绿 + ruff 全绿
+- **串行详情 API 通道间隔达标**：默认 `--concurrency 1` 的 API 通道间隔改为 `≥ DETAIL_API_PACE_SECONDS(15s)`（原 `10-25s` 随机可能低于硬线）；DOM 通道维持 `10-25s`。同批修正既有的 3 个 TokenBucket 单测（原先误把时钟 mock 成 `time.time`，实现用的是 `monotonic`，属"靠真实时间碰巧通过"）。
+- **并发详情城市码透传（一致性）**：调用 `_scrape_details_parallel` 时补齐 `city_code`（此前仅传城市名 → 并行详情 API 的 `city` 参数为空；实测未致失败，但属潜在隐患）。
+- **`--input` 只读（数据安全）**：修复 `--input` 模式下详情风控回调 `_note_detail_risk_blocked` 会把**用户输入文件**当输出追加 `warnings` 写坏的问题。
+- **脱敏补全**：`_scrub_secrets` 覆盖 `securityId`/`security_id`（纵深防御；该值本就仅内存传递、不落导出）。
+
+### 文档 / 依赖
+- **依赖自洽**：`pyproject.toml` `dependencies` 补 `pandas`/`matplotlib`（`job_summary.py` 顶层导入、`boss-summary` 入口依赖；此前缺失会导致安装后 `ModuleNotFoundError`），与 `requirements.txt` / `uv.lock` 对齐。
+- **README 中英双语**：导出契约标题与示例 `format_version` 由 `1` 更正为 `2`。
+- **SKILL.md 重写**：默认端口 `9222 → 45222`（9222 在 BOSS 安全 JS 扫描名单内，照旧跑会踩坑）；补齐 `--batch/--status/--verify/--list-results/--archive/--max-jobs/--concurrency/--max-concurrent/--retry-job/--keep-without-jd/--input/--industry/--list-cities` 等参数；JSON 示例对齐契约 v2；工作原理补"详情 API 通道"；依赖说明补 pandas/matplotlib；platforms 补 windows。
+- **版本**：`2.3.0 → 2.4.0`（脚本/pyproject/SKILL/README 四处同步）。
+
 ## v2.3.0 (2026-08-11)
 
 ### 新增

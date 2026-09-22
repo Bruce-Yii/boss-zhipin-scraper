@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.3.0"
+__version__ = "2.5.0"
 
 import json
 import math
@@ -52,6 +52,36 @@ websocket = None
 requests = None
 
 # ============================================================
+# 抽出模块的导入兼容层（P1 架构重构 2026-09-22）
+# 主文件对 scripts/*.py 子模块做 re-export，保持 scripts.boss_cdp_raw.X 导入面；
+# 按路径加载（测试 spec_from_file_location / 直接运行脚本）时 scripts 非包 →
+# 回退同目录 import。
+# ============================================================
+try:
+    from scripts import ratelimit as _ratelimit
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import ratelimit as _ratelimit
+
+TokenBucket = _ratelimit.TokenBucket
+AdaptiveRateLimiter = _ratelimit.AdaptiveRateLimiter
+DETAIL_API_PACE_SECONDS = _ratelimit.DETAIL_API_PACE_SECONDS
+
+try:
+    from scripts import export_contract as _export_contract
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import export_contract as _export_contract
+
+FORMAT_VERSION = _export_contract.FORMAT_VERSION
+_scrub_secrets = _export_contract._scrub_secrets
+_sanitize_job = _export_contract._sanitize_job
+_missing_required_fields = _export_contract._missing_required_fields
+merge_unique = _export_contract.merge_unique
+_atomic_write_json = _export_contract._atomic_write_json
+cleanup_stale_tmp_files = _export_contract.cleanup_stale_tmp_files
+flush_jobs = _export_contract.flush_jobs
+_merge_jd_into_export = _export_contract._merge_jd_into_export
+
+# ============================================================
 # 全局常量
 # ============================================================
 
@@ -72,14 +102,12 @@ MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览�
 CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重开（防"熔断→重启→再熔断"循环）
 CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
-DETAIL_API_PACE_SECONDS = 15.0  # 详情 API 通道每 worker 最小间隔（秒）：API 单次约 1s，
-                                # 无渲染等待，限速器是唯一刹车 → 并发 N 时全局基线 N/15 次/秒
-                                # （避免旧公式 concurrency*0.5/秒 对详情接口过快触发风控）
+# DETAIL_API_PACE_SECONDS 已抽出到 scripts/ratelimit.py（见顶部导入兼容层）
 DETAIL_API_TAB_BUDGET = 4       # 详情 API 每 tab 预算：实测同一 tab 连续约 4-5 次后返回
                                 # code 37，换新 tab 立即重置（2026-09-22 实证）→ 主动轮换支撑批量
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
-FORMAT_VERSION = 2              # 导出文件契约版本（ai-pm-job-intel 规格 §3.2；v2 = B 增量扩展 mode/observed_jobs/exhausted，docs/25 §3，规格侧 T2 落档 5278260355）
+# FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
 SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
 
 def get_default_chrome_path():
@@ -129,6 +157,93 @@ DEFAULT_PROFILE_DIR = get_default_profile_dir()
 
 DEFAULT_CDP_DATA_DIR = os.path.expanduser("~/.boss-zhipin-scraper/chrome-profile")
 DEFAULT_RESULT_DIR = os.path.expanduser("~/.boss-zhipin-scraper/job-result")
+
+# ============================================================
+# securityId 受限 sidecar（P1 双通道策略；红线例外，严格约束）
+# 仅 securityId（每岗短期接口令牌，**非登录凭据**）允许落盘，且：仓库外 +
+# 600 权限 + 短 TTL + run 结束即删 + 绝不进导出/日志/git。登录 cookie 绝不落盘。
+# ============================================================
+SECURITY_SIDECAR_DIR = os.path.expanduser("~/.boss-zhipin-scraper/.session")
+SECURITY_SIDECAR_TTL_SECONDS = 3600
+
+
+def security_sidecar_path(list_path):
+    """sidecar 路径：<SECURITY_SIDECAR_DIR>/<列表文件名>.security.json。"""
+    base = os.path.basename(list_path or "list.json")
+    return os.path.join(SECURITY_SIDECAR_DIR, base + ".security.json")
+
+
+def write_security_sidecar(list_path, security_map):
+    """把 securityId 映射落到受限 sidecar（仓库外/600/短 TTL）。
+
+    security_map 为空时不写（避免空文件）。返回 sidecar 路径或 None。
+    """
+    if not list_path or not security_map:
+        return None
+    path = security_sidecar_path(list_path)
+    try:
+        os.makedirs(SECURITY_SIDECAR_DIR, exist_ok=True)
+        _atomic_write_json(path, {
+            "security_map": {str(k): str(v) for k, v in security_map.items()},
+        })
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+    except OSError:
+        log.warning("securityId sidecar 写入失败", exc_info=True)
+        return None
+
+
+def load_security_sidecar(list_path):
+    """读取 securityId sidecar；缺失/过期返回 {}（过期会顺手删除）。"""
+    if not list_path:
+        return {}
+    path = security_sidecar_path(list_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
+            os.remove(path)
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        smap = data.get("security_map") if isinstance(data, dict) else None
+        if not isinstance(smap, dict):
+            return {}
+        return {str(k): str(v) for k, v in smap.items()}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def delete_security_sidecar(list_path):
+    """删除指定列表对应的 sidecar（run 正常结束时调用）。"""
+    if not list_path:
+        return
+    path = security_sidecar_path(list_path)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def cleanup_security_sidecars():
+    """删除过期 sidecar（启动时调用）；返回删除数。"""
+    removed = 0
+    try:
+        for name in os.listdir(SECURITY_SIDECAR_DIR):
+            path = os.path.join(SECURITY_SIDECAR_DIR, name)
+            try:
+                if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        return removed
+    return removed
 DEFAULT_CITY_INPUT = "上海"
 LOGIN_PROBE_QUERY = "Java"
 LOGIN_PROBE_CITY = "101020100"
@@ -146,6 +261,7 @@ DEFAULT_LOGIN_TIMEOUT = 300
 
 # 全局请求计数器
 _request_counter = 0
+_request_counter_lock = threading.Lock()  # 并发下保护 _request_counter（2026-09-22 审计修复）
 _live_city_maps_cache = None
 
 # logging 配置移入 main()（if __name__ 守卫内）——模块顶层 basicConfig 会被任何
@@ -289,12 +405,15 @@ def incr_request(kind="list"):
     总量上限语义不变；分账计数供血缘统计与漂移诊断。
     """
     global _request_counter
-    _request_counter += 1
-    _request_budget[kind] = _request_budget.get(kind, 0) + 1
-    if _request_counter > MAX_API_REQUESTS:
+    # 加锁：并发详情路径每任务都会调用，避免计数漏加/超发（2026-09-22 审计修复）
+    with _request_counter_lock:
+        _request_counter += 1
+        _request_budget[kind] = _request_budget.get(kind, 0) + 1
+        n = _request_counter
+    if n > MAX_API_REQUESTS:
         raise RuntimeError(f"已达到单次最大请求数 {MAX_API_REQUESTS}，停止抓取")
-    if _request_counter >= MAX_API_REQUESTS * 0.8:
-        log.warning(f"⚠️ 请求次数接近上限: {_request_counter}/{MAX_API_REQUESTS}")
+    if n >= MAX_API_REQUESTS * 0.8:
+        log.warning(f"⚠️ 请求次数接近上限: {n}/{MAX_API_REQUESTS}")
 
 
 # ============================================================
@@ -1505,91 +1624,8 @@ def write_detail_csv(csv_path, details):
 # ============================================================
 # 增量写入 JSON
 # ============================================================
-def merge_unique(existing, incoming, key="job_id", new_overrides=False):
-    """按 key 合并去重。
-
-    Args:
-        existing: 已有记录列表
-        incoming: 新记录列表
-        key: 去重字段
-        new_overrides: True 时新记录覆盖旧记录（同 key 保留新的）；False 时旧记录优先
-
-    Returns:
-        合并后的列表
-    """
-    if new_overrides:
-        by_key = {}
-        for item in existing:
-            if isinstance(item, dict) and item.get(key):
-                by_key[item.get(key)] = item
-        for item in incoming:
-            if isinstance(item, dict) and item.get(key):
-                by_key[item.get(key)] = item
-        return list(by_key.values())
-
-    seen = {item.get(key, "") for item in existing if isinstance(item, dict)}
-    merged = list(existing)
-    for item in incoming:
-        if isinstance(item, dict) and item.get(key, "") not in seen:
-            seen.add(item.get(key, ""))
-            merged.append(item)
-    return merged
-
-
-def _atomic_write_json(path, payload):
-    """先写临时文件再原子替换，避免进程中断留下半截 JSON 覆盖旧数据。
-    写盘前 flush+fsync（断电不丢数据），再 os.replace 原子替换。"""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp_path = f"{path}.tmp{os.getpid()}"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def cleanup_stale_tmp_files(result_dir, max_age_seconds=300):
-    """启动时清扫残留 .tmp 文件（崩溃/断电遗留）。
-
-    只删修改时间超过 max_age_seconds 的 tmp，避免误删并发进程中
-    正在写入的 tmp（其文件名也是 *.tmp* 形态）。
-    """
-    try:
-        for name in os.listdir(result_dir):
-            if ".tmp" not in name:
-                continue
-            path = os.path.join(result_dir, name)
-            try:
-                if time.time() - os.path.getmtime(path) > max_age_seconds:
-                    os.remove(path)
-            except OSError:
-                pass
-    except OSError:
-        pass
-
-
-_SENSITIVE_KEYS = ("cookie", "token", "wt2", "zp_stoken", "zp_token",
-                   "password", "account", "auth", "secret")
-# 日志/错误输出脱敏：key=value 形态的凭据值替换为 ***（凭证不进日志/异常/stderr）
-_SECRET_KEY_PATTERN = re.compile(
-    r"(__zp_stoken__|wt2|zp_token|zp_stoken|cookie|token|password|secret)"
-    r"=([^&\s\"'<>]+)",
-    re.IGNORECASE,
-)
-
-
-def _scrub_secrets(text):
-    """日志/错误输出脱敏：cookie/token/__zp_stoken__ 等凭据值替换为 ***。"""
-    if not isinstance(text, str):
-        return text
-    return _SECRET_KEY_PATTERN.sub(lambda m: f"{m.group(1)}=***", text)
+# merge_unique / _atomic_write_json / cleanup_stale_tmp_files / _scrub_secrets
+# 已抽出到 scripts/export_contract.py（见顶部导入兼容层；P1 架构重构 2026-09-22）。
 
 
 # ============================================================
@@ -1646,104 +1682,8 @@ def send_alert(title, text, timeout=10):
         # requests.RequestException 继承 IOError(=OSError)；网络层失败不阻塞主流程
         log.warning("告警发送失败", exc_info=True)
         return False
-# BOSS 内部标识字段（规格侧建议剔除：下游误读风险，非契约字段；
-# 详情抓取用 job_link 即可导航，不依赖这些参数）
-_INTERNAL_KEYS = ("security_id", "lid", "encrypt_job_id",
-                  "encrypt_boss_id", "encrypt_brand_id")
-
-
-def _sanitize_job(job):
-    """导出前过滤敏感字段与 BOSS 内部标识（规格 NFR-6 + 联调建议）。
-
-    外部数据（--merge/--input）可能夹带凭据字段；列表 API 字段均为公开
-    职位信息，不受影响。
-    """
-    if not isinstance(job, dict):
-        return job
-    return {k: v for k, v in job.items()
-            if not any(s in k.lower() for s in _SENSITIVE_KEYS)
-            and k not in _INTERNAL_KEYS}
-
-
-# 契约必填字段（与消费端校验器 CONTRACT_FIELDS 一致）：写盘前 schema 校验，
-# 缺失即 quarantine 剔除并记录原因——防页面结构漂移产出脏数据进下游
-_CONTRACT_REQUIRED_FIELDS = ("job_id", "title", "location", "job_link", "company_name")
-
-
-def _missing_required_fields(job):
-    """返回 job 缺失的契约必填字段列表（非 dict / 空值都算缺失）。"""
-    if not isinstance(job, dict):
-        return list(_CONTRACT_REQUIRED_FIELDS)
-    return [f for f in _CONTRACT_REQUIRED_FIELDS
-            if not str(job.get(f) or "").strip()]
-
-
-def flush_jobs(path, meta, jobs):
-    """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留。
-
-    血缘字段（record_counts）跨次累积：渐进写盘时每次 flush 只算当次
-    new/duplicate/quarantine 增量，与旧值相加。
-    """
-    existing_jobs = []
-    old_counts = {"new": 0, "duplicate": 0, "quarantine": 0}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                old = json.load(f)
-            existing_jobs = old.get("jobs", [])
-            old_counts = old.get("record_counts") or old_counts
-        except (json.JSONDecodeError, OSError, ValueError):
-            pass
-    existing_ids = {j.get("job_id") for j in existing_jobs
-                    if isinstance(j, dict) and j.get("job_id")}
-    existing_payloads = {j.get("job_id"): j for j in existing_jobs
-                         if isinstance(j, dict) and j.get("job_id")}
-    sanitized_incoming = [_sanitize_job(j) for j in jobs]
-
-    # 键冲突检测：incoming 与已有同 job_id 但 payload 不同 → quarantine 记录
-    # （merge_unique 本身旧版本优先，这里把"静默覆盖"变成显式信号；
-    #  比较在 sanitize 后进行，跨 run 续抓不因敏感键差异误报）
-    incoming_ids = [j.get("job_id") for j in sanitized_incoming
-                    if j.get("job_id")]
-    new_count = sum(1 for jid in incoming_ids if jid not in existing_ids)
-    dup_count = len(incoming_ids) - new_count
-
-    merged = merge_unique(existing_jobs, jobs)
-    sanitized = [_sanitize_job(j) for j in merged]
-    quarantine = []
-    valid = []
-    for j in sanitized:
-        missing = _missing_required_fields(j)
-        if missing:
-            quarantine.append({
-                "job_id": j.get("job_id"),
-                "reason": "missing_required_fields=" + ",".join(missing),
-            })
-        else:
-            valid.append(j)
-    key_conflicts = [jid for jid in existing_payloads
-                     if jid in incoming_ids
-                     and existing_payloads[jid] != next(
-                         (x for x in sanitized_incoming
-                          if x.get("job_id") == jid), {})]
-    if key_conflicts:
-        log.warning("job_id 键冲突（同 ID 不同 payload，保留旧版本）: %s",
-                    key_conflicts[:5])
-        quarantine.extend({"job_id": jid, "reason": "key_conflict"}
-                           for jid in key_conflicts)
-
-    counts = dict(old_counts)
-    counts["new"] += new_count
-    counts["duplicate"] += dup_count
-    counts["quarantine"] = counts.get("quarantine", 0) + len(quarantine)
-    meta["record_counts"] = counts
-    meta["format_version"] = FORMAT_VERSION
-    meta["total"] = len(valid)
-    meta["job_count"] = len(valid)
-    if quarantine:
-        meta["quarantine"] = quarantine
-    meta["jobs"] = valid
-    _atomic_write_json(path, meta)
+# _INTERNAL_KEYS / _sanitize_job / _missing_required_fields / flush_jobs
+# 已抽出到 scripts/export_contract.py（见顶部导入兼容层；P1 架构重构 2026-09-22）。
 
 
 # ============================================================
@@ -2710,75 +2650,8 @@ def list_results(result_dir=DEFAULT_RESULT_DIR):
     return entries
 
 
-def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False):
-    """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
-
-    - 每条 job 追加 `jd` 字段（有详情时）
-    - `keep_without_jd=False`（默认）：**剔除无 JD 的岗位**——用户口径"没 JD 的
-      岗位毫无意义"，避免下游再筛
-    - meta 记录 `jd_coverage`（with_jd/total_before/dropped_no_jd）与 `dropped_no_jd`
-      （被剔除 job_id 列表，可追溯）；`job_count`/`total` 同步为保留数
-
-    Args:
-        target_path: 列表文件路径（存在则以其为准，否则用 base）
-        details: 详情记录列表（每条含 job_id/jd）
-        base: target 不存在时的基础列表 dict（如 --input 模式）
-        keep_without_jd: True 时保留无 JD 岗位（仅标注）
-
-    Returns:
-        (kept, dropped) 或 None（无法处理时）
-    """
-    data = None
-    if target_path and os.path.exists(target_path):
-        try:
-            with open(target_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError, ValueError):
-            data = None
-    if not isinstance(data, dict):
-        data = base
-    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-        return None
-
-    jd_map = {}
-    for d in details or []:
-        if isinstance(d, dict) and d.get("job_id") and str(d.get("jd") or "").strip():
-            jd_map[str(d["job_id"])] = d["jd"]
-
-    jobs = data["jobs"]
-    kept, dropped_ids = [], []
-    with_jd = 0
-    for job in jobs:
-        if not isinstance(job, dict):
-            continue
-        jid = str(job.get("job_id") or "")
-        jd = jd_map.get(jid)
-        if jd:
-            job = {**job, "jd": jd}
-            kept.append(job)
-            with_jd += 1
-        elif keep_without_jd:
-            kept.append(job)
-        else:
-            dropped_ids.append(jid)
-
-    total_before = len(jobs)
-    data["jobs"] = kept
-    data["job_count"] = len(kept)
-    data["total"] = len(kept)
-    data["jd_coverage"] = {
-        "with_jd": with_jd,
-        "total_before": total_before,
-        "dropped_no_jd": len(dropped_ids),
-    }
-    if dropped_ids:
-        data["dropped_no_jd"] = dropped_ids
-        warnings = list(data.get("warnings") or [])
-        warnings.append(
-            f"口径一：已剔除 {len(dropped_ids)} 条无 JD 岗位（见 meta.dropped_no_jd）")
-        data["warnings"] = warnings
-    _atomic_write_json(target_path, data)
-    return len(kept), len(dropped_ids)
+# _merge_jd_into_export 已抽出到 scripts/export_contract.py
+# （见顶部导入兼容层；P1 架构重构 2026-09-22）。
 
 
 def archive_results(result_dir=DEFAULT_RESULT_DIR, keep_latest=1, archive_dir=None):
@@ -3284,102 +3157,8 @@ def progress_line(completed, total, ok_count):
     return f"  [进度 {completed}/{total} {pct:.0f}%] 成功 {ok_count}，失败 {completed - ok_count}"
 
 
-class TokenBucket:
-    """线程安全的全局速率限制令牌桶。
-
-    容量 capacity 内可突发；令牌按 rate（个/秒）持续补充，
-    耗尽时 acquire 阻塞直到令牌补充（并发详情抓取的全局限速用）。
-    """
-    def __init__(self, rate, capacity):
-        self.rate = rate
-        self.capacity = capacity
-        self._tokens = float(capacity)
-        self._last_refill = time.monotonic()  # monotonic：NTP 回拨不导致桶爆满/负数
-        self._lock = threading.Lock()
-
-    def _refill(self, now):
-        elapsed = now - self._last_refill
-        if elapsed > 0:
-            self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
-            self._last_refill = now
-
-    def acquire(self):
-        with self._lock:
-            self._refill(time.monotonic())
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return
-            deficit = (1.0 - self._tokens) / self.rate
-        time.sleep(deficit)
-        with self._lock:
-            self._last_refill = time.monotonic()
-            self._tokens = max(0.0, self._tokens - 1.0)
-
-
-class AdaptiveRateLimiter:
-    """全局限速 + 错误率自适应（Scrapy AutoThrottle 思想）。
-
-    - 滑动窗口（默认 60s）内失败率 > failure_threshold → 速率降半
-    - 连续 2 个坏窗口 → acquire 暂停 pause_seconds（等风控窗口过去）
-    - 健康窗口 → 速率恢复基线
-    """
-    def __init__(self, base_rate, capacity=None, window=60.0,
-                 failure_threshold=0.3, pause_seconds=60.0):
-        self.base_rate = base_rate
-        self.capacity = capacity or max(int(base_rate), 1)
-        self.window = window
-        self.failure_threshold = failure_threshold
-        self.pause_seconds = pause_seconds
-        self._halved = False
-        self._consecutive_bad = 0
-        self._window_start = time.monotonic()  # monotonic：窗口判断不受时钟回拨影响
-        self._window_total = 0
-        self._window_failures = 0
-        self._bucket = TokenBucket(base_rate, self.capacity)
-        self._lock = threading.Lock()
-
-    def current_rate(self):
-        """当前生效速率（降半后的值）。"""
-        return self.base_rate / 2.0 if self._halved else self.base_rate
-
-    def record_success(self):
-        """记录一次成功请求。"""
-        self._record(failed=False)
-
-    def record_failure(self):
-        """记录一次失败请求。"""
-        self._record(failed=True)
-
-    def _record(self, failed):
-        with self._lock:
-            now = time.monotonic()
-            if now - self._window_start >= self.window:
-                self._roll_window()
-            self._window_total += 1
-            if failed:
-                self._window_failures += 1
-
-    def _roll_window(self):
-        """窗口推进：按失败率调整速率与连续坏窗口计数。"""
-        if self._window_total > 0:
-            failure_rate = self._window_failures / self._window_total
-            if failure_rate > self.failure_threshold:
-                self._halved = True
-                self._consecutive_bad += 1
-            else:
-                self._halved = False
-                self._consecutive_bad = 0
-        self._window_start = time.monotonic()
-        self._window_total = 0
-        self._window_failures = 0
-
-    def acquire(self):
-        """申请一个请求配额；连续坏窗口时先暂停，再走令牌桶。"""
-        if self._consecutive_bad >= 2:
-            time.sleep(self.pause_seconds)
-            self._consecutive_bad = 0
-        self._bucket.rate = self.current_rate()
-        self._bucket.acquire()
+# TokenBucket / AdaptiveRateLimiter 已抽出到 scripts/ratelimit.py，
+# 由文件顶部导入兼容层 re-export（见 P1 架构重构 2026-09-22）。
 
 
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
@@ -3628,7 +3407,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             list_output_path=list_output_path,
             keyword=list_data.get("keyword", ""),
             security_map=security_map or {},
-            city=list_data.get("city", ""))
+            city=list_data.get("city", ""),
+            city_code=list_data.get("city_code", ""))
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -3767,8 +3547,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
                     pending[job_id] = pending.get(job_id, 0) + 1
                     save_pending_ids(output_path, pending)
 
-        # 详情页间隔加大，随机 10-25 秒
-        gap = random.uniform(10, 25)
+        # 详情页间隔：API 通道每 worker ≥ DETAIL_API_PACE_SECONDS（规格硬线，
+        # API 无渲染等待、限速器/间隔是唯一刹车）；DOM 通道沿用 10-25s。
+        if security_map:
+            gap = random.uniform(DETAIL_API_PACE_SECONDS, DETAIL_API_PACE_SECONDS * 1.6)
+        else:
+            gap = random.uniform(10, 25)
         print(f"  等待 {gap:.0f}s 后抓下一个...\n")
         progress = progress_line(idx + 1, len(jobs), serial_ok)
         if progress:
@@ -4693,7 +4477,7 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
         f"--user-data-dir={cdp_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--remote-allow-origins=*",
+        f"--remote-allow-origins=http://localhost:{cdp_port},http://127.0.0.1:{cdp_port}",
     ]
     launch_chrome(cmd)
 
@@ -4947,6 +4731,7 @@ def run_cli():
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
+    cleanup_security_sidecars()  # 清理过期 securityId sidecar（P1 双通道）
     cleanup_stale_tmp_files(os.path.dirname(SCRAPE_LOCK_PATH))
 
     # --check 模式
@@ -5046,10 +4831,19 @@ def run_cli():
             filters[key] = val
 
     # 加载或抓取列表
+    sidecar_owned = None  # 本次 run 自建的 securityId sidecar（成功结束即删）
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             list_data = json.load(f)
         print(f"从文件加载 {len(list_data.get('jobs',[]))} 条: {args.input}")
+        # 显式双通道：优先从 sidecar 复用 securityId 走 API 通道
+        _sidecar_map = load_security_sidecar(args.input)
+        if _sidecar_map:
+            list_data["security_map"] = _sidecar_map
+            print(f"ℹ️  已从 securityId sidecar 载入 {len(_sidecar_map)} 条（详情走 API 通道）")
+        elif args.detail:
+            print("⚠️  未找到 securityId sidecar，详情将走 DOM 慢通道"
+                  "（如需 API 通道，先重跑一次列表以生成 sidecar）")
     else:
         # 登录状态检测
         print("检测登录状态...")
@@ -5083,6 +4877,9 @@ def run_cli():
             max_jobs=args.max_jobs,
             max_concurrent=args.max_concurrent,
         )
+        # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
+        sidecar_owned = write_security_sidecar(
+            list_data.get("output_path"), list_data.get("security_map"))
 
     # 合并外部文件
     merged_details = None
@@ -5128,9 +4925,10 @@ def run_cli():
                 cdp_port=args.cdp_port, fmt=args.format,
                 concurrency=args.concurrency,
                 pending_ids=pending_ids,
-                # E 降级：验证码命中全停时，列表文件 warnings 追加降级原因
-                # （--input 模式列表文件为输入文件；抓取模式为实际落盘路径）
-                list_output_path=list_data.get("output_path") or args.input,
+                # E 降级：验证码命中全停时，往实际落盘的列表文件追加降级原因。
+                # 修复（2026-09-22 审计）：--input 模式为只读，绝不把输入文件当输出
+                # 改写（否则风控回调会把用户文件追加 warnings 写坏）。
+                list_output_path=None if args.input else list_data.get("output_path"),
                 # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
                 # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
                 security_map=list_data.get("security_map"),
@@ -5149,16 +4947,32 @@ def run_cli():
             export_path = list_data.get("output_path")
             if not export_path and args.input and args.output:
                 export_path = args.output
+            # 显式双通道：据 security_map 覆盖度标记 detail_channel（api/dom/mixed）
+            _smap = list_data.get("security_map") or {}
+            _detail_jobs = list_data.get("jobs", [])
+            _with_sid = sum(1 for j in _detail_jobs
+                            if isinstance(j, dict) and j.get("job_id") in _smap)
+            if _smap and _with_sid == len(_detail_jobs):
+                _channel = "api"
+            elif _with_sid == 0:
+                _channel = "dom"
+            else:
+                _channel = "mixed"
             if export_path:
                 merged_export = _merge_jd_into_export(
                     export_path, details, base=list_data,
-                    keep_without_jd=args.keep_without_jd)
+                    keep_without_jd=args.keep_without_jd,
+                    extra_meta={"detail_channel": _channel})
                 if merged_export:
                     kept, dropped = merged_export
                     print(f"✅ 口径一：导出 {kept} 条（含 jd）"
-                          + (f"，剔除无 JD {dropped} 条" if dropped else ""))
+                          + (f"，剔除无 JD {dropped} 条" if dropped else "")
+                          + f"｜detail_channel={_channel}")
             elif args.input:
                 print("ℹ️  --input 模式未指定 --output，跳过 jd 并入（原列表保持原样）")
+            # 本次 run 自建的 sidecar：成功结束即删（TTL 为兜底）
+            if sidecar_owned:
+                delete_security_sidecar(list_data.get("output_path"))
 
     # 分析
     if args.analysis:

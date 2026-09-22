@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.3 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.5 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.3.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.5.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -204,13 +204,13 @@ On anomalies, alerts are pushed via a Worker endpoint (downstream channels such 
 - Configure in the project root `.env` (gitignored, not committed): `ALERT_WEBHOOK_URL=<endpoint URL>`, `ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - Silent skip if unconfigured or on network failure (logged only); never blocks the scrape flow
 
-## Export Contract v1
+## Export Contract v2
 
 The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-job-intel):
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "keyword": "AI产品经理", "city": "上海",
   "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
   "jobs": [
@@ -227,6 +227,8 @@ The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-jo
 - Optional (detail scraping): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — DOM path only, unavailable via the API channel), `job_status_desc` (job status description), `brand_introduce` (company intro), `brand_stage_name`/`brand_scale_name`/`brand_industry_name` (company semantic dimensions)
 - **Detail scraping uses the API channel** (2026-08-14): one lightweight request per job (`/wapi/zpgeek/job/detail.json`) instead of full-page rendering — JD returns in ~0s; `securityId` is passed in-process from the list stage (never written to export files, red line preserved); each tab allows ~4-5 requests and the program rotates tabs automatically; `--input` backfill of old files automatically falls back to DOM rendering
 - **Mode 1 (default): jd merged into the export, jobs without JD are dropped** (2026-09-22): every job carries `jd` inline; JD-less jobs are removed (meta records `jd_coverage` and `dropped_no_jd`); `--keep-without-jd` keeps them with a marker
+- **Explicit dual-channel** (2026-09-22): the detail phase records `detail_channel` in meta (`api`/`dom`/`mixed`) — API fast path when `securityId` is available, otherwise the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it falls back to DOM **with an explicit warning**
+- **securityId restricted sidecar** (2026-09-22, red-line exception): stored under `~/.boss-zhipin-scraper/.session/` (outside the repo), `chmod 600`, 60-min TTL, deleted on normal finish; **never enters exports/logs/git**; the login cookie is never persisted. See `AGENTS.md`/`CONTRIBUTING.md`
 - On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)
 
 ## Post-Scrape Summary & Prompt

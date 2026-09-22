@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.3（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.5（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.3.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.5.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -207,13 +207,13 @@ python3 scripts/job_summary.py --top 15
 - 配置：项目根目录 `.env`（gitignore 排除，不入仓库）——`ALERT_WEBHOOK_URL=<端点地址>`、`ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - 未配置或网络失败时静默跳过，不影响抓取主流程（失败仅记日志）
 
-## 导出契约 v1
+## 导出契约 v2
 
 列表 JSON 为下游程序提供稳定契约（供 ai-pm-job-intel 等系统消费）：
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "keyword": "AI产品经理", "city": "上海",
   "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
   "jobs": [
@@ -230,6 +230,8 @@ python3 scripts/job_summary.py --top 15
 - 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）
 - **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；每 tab 约 4-5 次配额，程序自动轮换 tab；`--input` 补抓老文件时自动回退 DOM 渲染
 - **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
+- **显式双通道**（2026-09-22）：详情抓取在 meta 记 `detail_channel`（`api`/`dom`/`mixed`）——有 `securityId` 走 API 快通道、否则 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则 DOM 并**明确告警**
+- **securityId 受限 sidecar**（2026-09-22，红线例外）：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、60 分钟 TTL、run 结束即删；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词
