@@ -923,6 +923,9 @@ def _open_api_tab(cdp_port, keyword, city_code):
     tid, sid = create_page_session(ws)
     ws.send("Page.navigate",
             {"url": build_search_url(keyword or "", city_code or "", 1, {})}, sid)
+    # dock 等待：实测（2026-09-22）——E6 单次零等待下 XHR 虽 OK，但**放到真实高频
+    # 轮换场景**（等待 0.5-1.5s + pace 1s + 并发 3）会触发 `code 37 您的环境存在异常`
+    # 真风控（换 tab 清不掉）。故保留 4-8s 缓冲，控制"每 tab 一次搜索页加载"的速率。
     time.sleep(random.uniform(4, 8))
     return [ws, tid, sid, 0]
 
