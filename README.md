@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.15（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.16（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.15.3-orange.svg)
+![Version](https://img.shields.io/badge/version-2.16.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -174,7 +174,7 @@ python3 scripts/job_summary.py --top 15
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
 | `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
-| `--detail-channel` | 详情通道：`auto`（默认，有 securityId 走 API 否则 DOM）/ `api` / `dom` / `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路） |
+| `--detail-channel` | 详情通道：`auto`（默认，有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`（严格 securityId）/ `dom` / `encrypt`（强制 encryptJobId API，不依赖 securityId 有效期，串行）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路） |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |
 | `--foreground-capture` | 列表/登录探测/详情 DOM 改用前台 Target；用于 Chrome 在 Linux/Xvfb 下后台 Target 捕获不到搜索响应的环境（默认保持后台） |
@@ -246,7 +246,7 @@ python3 scripts/job_summary.py --top 15
 - 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）、`brand_active_time`（公司级活跃时间，详情 API `brandComInfo.activeTime`，零额外请求）
 - **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；每 tab 约 4-5 次配额，程序自动轮换 tab；`--input` 补抓老文件时自动回退 DOM 渲染
 - **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
-- **显式双通道**（2026-09-22）：详情抓取在 meta 记 `detail_channel`（`api`/`dom`/`mixed`）——有 `securityId` 走 API 快通道、否则 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则 DOM 并**明确告警**
+- **显式多通道**（2026-09-22；2026-09-23 增 encrypt）：详情抓取在 meta 记 `detail_channel`（`api`/`encrypt`/`dom`/`mixed`）——有 `securityId` 走 API 快通道；缺凭证先试 **encryptJobId API**（仅带 jobId 的轻量 XHR，`encryptJobId` 长期有效、不依赖一次性 securityId；接口拒绝/解析类失败回退 DOM，真风控照旧全停不硬闯），失败才 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则按上述兜底链路并**明确提示**
 - **securityId 受限 sidecar**（2026-09-22，红线例外）：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、60 分钟 TTL、run 结束即删；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
 - **SQLite 增量存储（可选，P4c-2）**：`--db [PATH]` 启用（默认 `~/.boss-zhipin-scraper/boss.db`，**仓库外、不进 git**；零新依赖——stdlib `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 不变、`updated_at` 覆盖），与 JSON/CSV **并存不替换**；库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓）。入库前统一脱敏（cookie/token/securityId/内部标识不落库）
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）

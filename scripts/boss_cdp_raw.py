@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.15.3"
+__version__ = "2.16.0"
 
 import argparse
 import base64
@@ -1312,19 +1312,33 @@ DETAIL_API_JS = r"""
 DETAIL_API_PATH = "/wapi/zpgeek/job/detail.json"
 
 
-def build_detail_api_url(job, security_id, city_code=""):
-    """构造详情 API URL（jobId+securityId 为必需参数，city 探测实证需带）。"""
+def _detail_encrypt_job_id(job):
+    """详情 API 的 jobId 参数：encrypt_job_id 优先，缺省从 job_link 提取
+    （列表 job_link 自带 encryptJobId，与详情 DOM 导航同源）。"""
     job_id = str(job.get("encrypt_job_id") or "")
     if not job_id:
-        # 列表 job_link 自带 encryptJobId（详情 DOM 导航同源）
         m = re.search(r"/job_detail/([^./]+)\.html", str(job.get("job_link") or ""))
         if m:
             job_id = m.group(1)
-    params = {
-        "jobId": job_id,
-        "securityId": str(security_id or ""),
-        "city": str(city_code or ""),
-    }
+    return job_id
+
+
+def build_detail_api_url(job, security_id, city_code="", id_mode="security"):
+    """构造详情 API URL。
+
+    id_mode="security"：jobId+securityId+city（我方实证需带）；
+    id_mode="encrypt"：仅 jobId——encryptJobId 长期有效，boss-agent-cli 低风险
+    通道，不依赖 securityId 一次性有效期（--input 老文件无 sidecar 也可走 API）。
+    """
+    job_id = _detail_encrypt_job_id(job)
+    if id_mode == "encrypt":
+        params = {"jobId": job_id}
+    else:
+        params = {
+            "jobId": job_id,
+            "securityId": str(security_id or ""),
+            "city": str(city_code or ""),
+        }
     return f"{DETAIL_API_PATH}?{urlencode(params)}"
 
 
@@ -3991,7 +4005,8 @@ def capture_debug_screenshot(ws, sid, tag):
 
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                        limiter=None, verbose=False, security_id=None,
-                       api_session=None, city_code="", search_keyword=""):
+                       api_session=None, city_code="", search_keyword="",
+                       id_mode="security"):
     """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
 
     Args:
@@ -4006,6 +4021,9 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             详情 API 通道复用一个停靠在 zhipin 域的 tab，避免每岗导航
         city_code: 城市码（详情 API 参数）
         search_keyword: 本次抓取关键词（详情 API 通道自建 tab 时的停靠页参数）
+        id_mode: "security"=jobId+securityId+city；"encrypt"=仅 jobId
+            （securityId 缺失时的兜底通道；invalid_params/解析类/会话类
+            失败回退 DOM，真风控 fail-closed 上抛）
 
     Returns:
         dict: {"ok": bool, "detail": dict|None, "job_id": str,
@@ -4025,6 +4043,25 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             verbose=verbose, security_id=security_id,
             api_session=api_session, city_code=city_code,
             search_keyword=search_keyword)
+
+    # encryptJobId 兜底通道（--detail-channel encrypt / auto 缺 securityId 时）：
+    # 仅带 jobId 的轻量 XHR（boss-agent-cli 低风险通道，不依赖 securityId 有效期）。
+    # 失败语义 fail-closed：真风控（risk_timeout 且非 invalid_params）原样上抛，
+    # 由上层全停/冷却；invalid_params（接口不收 jobId-only）/解析类/会话类
+    # 失败才回退下方 DOM 渲染路径。
+    if id_mode == "encrypt" and _detail_encrypt_job_id(job):
+        result = _scrape_one_detail_via_api(
+            job, cdp_port, stop_event=stop_event, limiter=limiter,
+            verbose=verbose, security_id="",
+            api_session=api_session, city_code=city_code,
+            search_keyword=search_keyword, id_mode="encrypt")
+        if result["ok"]:
+            return result
+        if (result["reason"] == "risk_timeout"
+                and result.get("category") != "invalid_params"):
+            return result
+        print(f"  ↩️  encryptJobId 通道未命中"
+              f"（{result['reason']}:{result.get('category', '')}），回退 DOM 渲染")
 
     ws = None
     tid = None
@@ -4105,13 +4142,14 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
 
 def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
                                verbose=False, security_id="", api_session=None,
-                               city_code="", search_keyword=""):
+                               city_code="", search_keyword="", id_mode="security"):
     """详情 API 通道：1 次轻量 XHR 取完整 JD（替代详情页整页渲染）。
 
     复用 api_session（共享停靠 tab，避免每岗导航）；无 api_session 时自建
     tab 并导航搜索页（一次，用真实关键词而非岗位标题——避免误导性额外搜索）。
     失败分类：风控码 → risk_timeout（上层全停）、内容过短/结构异常 →
     invalid_detail（不进 pending）、网络 → cdp_session。
+    id_mode="encrypt" 时 URL 仅带 jobId（encryptJobId 兜底通道）。
     """
     job_id = job.get("job_id", "")
     shared = api_session is not None
@@ -4131,7 +4169,8 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
                 search_keyword or "", city_code or "", 1, {})}, sid)
             time.sleep(random.uniform(4, 8))
 
-        api_url = build_detail_api_url(job, security_id, city_code=city_code)
+        api_url = build_detail_api_url(job, security_id, city_code=city_code,
+                                       id_mode=id_mode)
         js = DETAIL_API_JS.replace("__API_URL__", api_url)
         # code9 限流：指数退避重试（10→20→40→60s），耗尽才交上层按 category 处置
         for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
@@ -4265,7 +4304,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
 
-    # 详情通道选择（--detail-channel）：dom=强制 DOM；panel=右面板；auto/api=按 securityId
+    # 详情通道选择（--detail-channel）：dom=强制 DOM；panel=右面板；
+    # encrypt=强制 encryptJobId API（串行）；auto/api=按 securityId
+    # （auto 缺凭证的岗位先试 encryptJobId API 再落 DOM；api 严格 securityId）
     if detail_channel == "dom":
         security_map = None
 
@@ -4277,6 +4318,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
             existing_ids=existing_ids, pending_ids=pending,
             existing_results=results, list_output_path=list_output_path,
             max_seconds=max_seconds)
+
+    # encrypt 通道目前仅串行实现（同 panel 策略）：并发请求降为串行
+    if detail_channel == "encrypt" and concurrency > 1:
+        print("⚠️  encrypt 通道暂只支持串行，已忽略 --concurrency")
+        concurrency = 1
 
     # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/渐进落盘/pending
     if concurrency > 1:
@@ -4311,14 +4357,22 @@ def scrape_details(list_data, max_details=None, output_path=None,
     api_session = None
     detail_keyword = list_data.get("keyword", "") or ""
     detail_city_code = list_data.get("city_code", "") or ""
-    # API 通道 burst-aware 串行节律（全局 ~0.44 req/s）；DOM 通道不用
-    detail_throttle = BurstThrottle() if security_map else None
-    if security_map:
+    # encryptJobId 兜底通道：encrypt=强制（急开共享 tab）；auto=缺凭证岗位
+    # 按需兜底（共享 tab 懒开——首个需要 encrypt 的岗位时才停靠，避免空跑/
+    # 纯 DOM 场景白开 tab）
+    force_encrypt = detail_channel == "encrypt"
+    use_encrypt_fallback = detail_channel == "auto"
+    # API 通道 burst-aware 串行节律（全局 ~0.44 req/s）；纯 DOM 通道不用
+    detail_throttle = BurstThrottle() if (security_map or force_encrypt
+                                           or use_encrypt_fallback) else None
+    api_tab_failed = False
+    if security_map or force_encrypt:
         try:
             api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
         except _cdp_exception_types():
             log.warning("详情 API 共享会话建立失败，回退逐岗自建会话", exc_info=True)
             api_session = None
+            api_tab_failed = True
 
     for idx, job in enumerate(jobs):
         if max_seconds and time.time() - start_time >= max_seconds:
@@ -4356,11 +4410,34 @@ def scrape_details(list_data, max_details=None, output_path=None,
             else:
                 api_session = None
 
+        # 逐岗通道：强制 encrypt 全走 encryptJobId；auto 缺凭证岗位走 encryptJobId
+        # 兜底；其余（有 securityId / 严格 api / dom）走 securityId 语义
+        if detail_channel == "encrypt":
+            job_id_mode = "encrypt"
+        elif detail_channel == "auto" and not job_security:
+            job_id_mode = "encrypt"
+        else:
+            job_id_mode = "security"
+
+        # auto 兜底懒开共享 tab：首个需要 encrypt 的岗位时停靠（此前开 tab 失败
+        # 则不再重试，encrypt 请求回退逐岗自建会话）
+        if (job_id_mode == "encrypt" and api_session is None
+                and not api_tab_failed):
+            try:
+                api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
+                print("  🧷 encryptJobId 通道启用（停靠 API tab）")
+            except _cdp_exception_types():
+                log.warning("encryptJobId 通道停靠失败，回退逐岗自建会话",
+                            exc_info=True)
+                api_tab_failed = True
+                api_session = None
+
         result = _scrape_one_detail(job, cdp_port, verbose=True,
                                     security_id=job_security,
                                     api_session=api_session,
                                     city_code=detail_city_code,
-                                    search_keyword=detail_keyword)
+                                    search_keyword=detail_keyword,
+                                    id_mode=job_id_mode)
         # 风控码二分：仅 token_expired（会话/令牌过期）值得换 tab 刷新后重试一次；
         # env_risk/account_risk/security_block 换 tab 无用 → 不重试，直接全停冷却
         if (result["reason"] == "risk_timeout" and job_security
@@ -4373,7 +4450,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
                                             security_id=job_security,
                                             api_session=api_session,
                                             city_code=detail_city_code,
-                                            search_keyword=detail_keyword)
+                                            search_keyword=detail_keyword,
+                                            id_mode=job_id_mode)
         if result["ok"] and api_session is not None:
             api_session[3] += 1
         reason = result["reason"]
@@ -5729,10 +5807,12 @@ def build_parser():
                           help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
     g_detail.add_argument("--detail-channel", default="auto",
-                          choices=["auto", "api", "dom", "panel"],
-                          help="详情通道：auto=有 securityId 走 API 否则 DOM（默认）；"
-                               "api/dom=强制对应通道；panel=复用停靠搜索页点卡片读右侧面板 JD"
-                               "（零新增请求、串行；上游 #84 思路）")
+                          choices=["auto", "api", "dom", "panel", "encrypt"],
+                          help="详情通道：auto=有 securityId 走 API，缺凭证先试 "
+                               "encryptJobId API 再落 DOM（默认）；api/dom=强制对应"
+                               "通道（api 严格 securityId）；encrypt=强制 encryptJobId "
+                               "API（不依赖 securityId 有效期，串行）；panel=复用停靠"
+                               "搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
     g_detail.add_argument("--analysis", action="store_true", help="输出分析报告")
     g_detail.add_argument("--input", default=None,
                           help="从已有 JSON 文件读取（跳过抓取）")
@@ -5947,8 +6027,12 @@ def run_cli():
             list_data["security_map"] = _sidecar_map
             print(f"ℹ️  已从 securityId sidecar 载入 {len(_sidecar_map)} 条（详情走 API 通道）")
         elif args.detail:
-            print("⚠️  未找到 securityId sidecar，详情将走 DOM 慢通道"
-                  "（如需 API 通道，先重跑一次列表以生成 sidecar）")
+            if args.detail_channel == "api":
+                print("⚠️  未找到 securityId sidecar 且 --detail-channel api 严格模式，"
+                      "详情将走 DOM 慢通道（如需 API 通道，先重跑一次列表以生成 sidecar）")
+            else:
+                print("ℹ️  未找到 securityId sidecar，详情将先试 encryptJobId API 通道，"
+                      "未命中再走 DOM 慢通道")
     else:
         # 登录状态检测
         print("检测登录状态...")
@@ -6129,15 +6213,19 @@ def run_cli():
             export_path = list_data.get("output_path")
             if not export_path and args.input and args.output:
                 export_path = args.output
-            # 显式双通道：据 security_map 覆盖度标记 detail_channel（api/dom/mixed）
+            # 显式多通道：据 security_map 覆盖度与 --detail-channel 标记
+            # detail_channel（api/encrypt/dom/mixed）
             _smap = list_data.get("security_map") or {}
             _detail_jobs = list_data.get("jobs", [])
             _with_sid = sum(1 for j in _detail_jobs
                             if isinstance(j, dict) and j.get("job_id") in _smap)
-            if _smap and _with_sid == len(_detail_jobs):
+            if args.detail_channel == "encrypt":
+                _channel = "encrypt"
+            elif _smap and _with_sid == len(_detail_jobs):
                 _channel = "api"
             elif _with_sid == 0:
-                _channel = "dom"
+                # auto 下缺凭证岗位实际先试 encryptJobId API（失败才落 DOM）
+                _channel = "encrypt" if args.detail_channel == "auto" else "dom"
             else:
                 _channel = "mixed"
             if export_path:
