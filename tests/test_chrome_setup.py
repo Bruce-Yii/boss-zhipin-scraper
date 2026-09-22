@@ -4857,6 +4857,18 @@ def _normalize_version(raw):
     return f"{major}.{minor}"
 
 
+class RateLimitCenterTests(unittest.TestCase):
+    """P4b 节律回调：BurstThrottle 默认落在安全区中心（稳态不触发 burst 惩罚）。"""
+
+    def test_defaults_are_safe_center(self):
+        module = load_module()
+        t = module.BurstThrottle()
+        self.assertEqual(t.center, 2.25)
+        self.assertEqual(t.min_delay, 1.5)          # 0.67 req/s 上界
+        self.assertGreaterEqual(t.short_threshold, 12)
+        self.assertGreaterEqual(t.long_threshold, 32)
+
+
 class MultiKeywordTests(unittest.TestCase):
     """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
 
