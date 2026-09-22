@@ -25,6 +25,7 @@ import argparse
 import csv
 import glob
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -5004,6 +5005,10 @@ def log_runner_trace(tag="start", extra=None):
             "cwd": os.getcwd(),
             "argv": sys.argv[:12],
             "parents": _parent_chain(),
+            # 调用栈：若本次 run_cli 是被测试/脚本**进程内**调用，这里会直接
+            # 暴露调用者（如 tests\test_chrome_setup.py:NNNN:test_xxx）
+            "stack": [f"{fr.filename}:{fr.lineno}:{fr.function}"
+                      for fr in inspect.stack()[:14]],
         }
         if extra:
             rec.update(extra)
