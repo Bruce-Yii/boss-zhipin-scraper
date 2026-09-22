@@ -1850,6 +1850,11 @@ class ChromeSetupTests(unittest.TestCase):
             out = module._fetch_pages_parallel(9222, "k", "101", 3, {})
         self.assertIsNone(out, "任一页无数据应返回 None（调用方回退串行）")
 
+    def test_target_crashed_error_is_expected_cdp_exception(self):
+        """TargetCrashedError 必须被当作可预期 CDP 异常捕获（否则逃逸导致 tab 泄漏）。"""
+        module = load_module()
+        self.assertIn(module.TargetCrashedError, module._cdp_exception_types())
+
     def test_export_contract_module_is_reexported(self):
         module = load_module()
         from scripts import export_contract as ex

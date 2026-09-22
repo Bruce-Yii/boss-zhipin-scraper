@@ -626,7 +626,10 @@ def _cdp_exception_types():
     Mock（其属性不是异常类）。这里动态解析真实异常类，避免 except 元组里出现
     非异常类型导致 TypeError。
     """
-    types = (RuntimeError, TimeoutError, KeyError, OSError)
+    # TargetCrashedError（渲染进程崩溃 OOM 等）必须在内：它虽是 Exception 子类、
+    # 不在 RuntimeError 族，若漏掉则异常会逃逸 → 清理被跳过、停靠 tab 泄漏
+    # （2026-09-22 实测：`Render process gone` 逃逸到 run_cli 兜底并遗留 ~18 个 tab）。
+    types = (RuntimeError, TimeoutError, KeyError, OSError, TargetCrashedError)
     ws_exc = getattr(websocket, "WebSocketException", None) if websocket is not None else None
     if isinstance(ws_exc, type) and issubclass(ws_exc, BaseException) and ws_exc not in types:
         types += (ws_exc,)
@@ -2159,6 +2162,37 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 # 抓取列表
 # ============================================================
+def close_orphan_dock_tabs(cdp_port=DEFAULT_CDP_PORT, keep=2, threshold=8):
+    """清扫残留的"停靠搜索页"tab（崩溃/异常退出遗留），防越积越多。
+
+    只在**明显泄漏**（同页 target 数 > threshold）时才动手，并保留最新 keep 个，
+    避免误关用户正常使用的页；只关 URL 匹配本工具搜索页
+    （``/web/geek/jobs?query=``）的 page target。CDP 不可达/失败静默返回 0。
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{cdp_port}/json/list", timeout=5) as resp:
+            targets = json.load(resp)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+    docks = [t for t in targets
+             if t.get("type") == "page"
+             and "/web/geek/jobs?query=" in (t.get("url") or "")]
+    if len(docks) <= threshold:
+        return 0
+    closed = 0
+    for t in docks[keep:]:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{cdp_port}/json/close/{t.get('id')}",
+                timeout=5).read()
+            closed += 1
+        except (OSError, ValueError):
+            pass
+    return closed
+
+
 def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
                           workers=3):
     """并发抓取多页列表：并发开 `workers` 个停靠 tab，再跨 tab 同发搜索 XHR。
@@ -3798,7 +3832,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             except _cdp_exception_types():
                 log.warning("详情 API 共享会话建立失败（该槽位将按需自建）", exc_info=True)
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    try:
         # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
         # 每完成一个补提交一个；停止信号（熔断/登录墙）后不再补提交。
         # 相比一次性提交全部：内存有界、停止即时生效（千级任务也安全）。
@@ -3877,11 +3912,13 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         if completed:
             print(run_summary(time.time() - start_time,
                               completed, parallel_ok, parallel_reasons))
-    # 关闭详情 API 共享会话池（复用 tab 释放）
-    for sess in api_sessions:
-        _close_api_tab(sess)
-    if output_path:
-        persist()
+    finally:
+        pool.shutdown(wait=True)
+        # 关闭详情 API 共享会话池（**异常/崩溃也保证关闭**，防 tab 泄漏）
+        for sess in api_sessions:
+            _close_api_tab(sess)
+        if output_path:
+            persist()
     return results, pending
 
 
@@ -4647,6 +4684,11 @@ def main():
         # 退出码固化：0=成功 / 1=运行期错误（含未预期异常，干净消息无 traceback）/
         # 2=CLI 误用（argparse 默认）
         print(f"❌ 未预期错误: {_scrub_secrets(str(e))}", file=sys.stderr)
+        # 崩溃兜底：清扫本次异常退出遗留的停靠 tab（防越积越多）
+        try:
+            close_orphan_dock_tabs()
+        except Exception:
+            pass
         sys.exit(1)
 
 
@@ -4973,6 +5015,10 @@ def run_cli():
         else:
             print("✅ 已登录\n")
 
+        # 启动清扫：关闭此前崩溃/异常退出遗留的停靠 tab（防 tab 越积越多）
+        swept = close_orphan_dock_tabs(args.cdp_port)
+        if swept:
+            print(f"🧹 已清扫 {swept} 个残留停靠 tab")
         list_data = scrape_list(
             args.keyword, args.city, args.pages, filters, args.output,
             cdp_port=args.cdp_port, fmt=args.format,
