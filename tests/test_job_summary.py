@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-
 # 同 tests/test_chrome_setup.py：Windows GBK 控制台无法编码 emoji，统一重配 UTF-8。
 for _stream in (sys.stdout, sys.stderr):
     if _stream is not None and hasattr(_stream, "reconfigure"):

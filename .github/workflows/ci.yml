@@ -28,16 +28,35 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt ruff
+          pip install -r requirements.txt -r requirements-dev.txt
 
-      - name: Lint (ruff)
+      - name: Lint (ruff, 版本固定于 requirements-dev.txt)
         run: ruff check scripts tests
 
-      - name: Unit tests
-        run: python -m unittest discover -s tests
+      - name: Unit tests + coverage gate
+        run: |
+          coverage run --source=scripts -m unittest discover -s tests
+          coverage report --fail-under=70
 
       - name: Syntax check
         run: python -m py_compile scripts/boss_cdp_raw.py scripts/job_summary.py
+
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel & smoke-test entry points
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          pip install dist/*.whl
+          boss-scraper --version
+          boss-summary --help
 
   contract-check:
     runs-on: ubuntu-latest

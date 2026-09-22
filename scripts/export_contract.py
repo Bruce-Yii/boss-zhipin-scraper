@@ -144,7 +144,7 @@ def flush_jobs(path, meta, jobs):
     old_counts = {"new": 0, "duplicate": 0, "quarantine": 0}
     if os.path.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 old = json.load(f)
             existing_jobs = old.get("jobs", [])
             old_counts = old.get("record_counts") or old_counts
@@ -227,7 +227,7 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
     data = None
     if target_path and os.path.exists(target_path):
         try:
-            with open(target_path, "r", encoding="utf-8") as f:
+            with open(target_path, encoding="utf-8") as f:
                 data = json.load(f)
         except (OSError, json.JSONDecodeError, ValueError):
             data = None

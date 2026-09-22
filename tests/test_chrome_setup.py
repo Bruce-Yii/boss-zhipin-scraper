@@ -1,6 +1,6 @@
-import importlib.util
 import contextlib
 import csv
+import importlib.util
 import io
 import json
 import logging
@@ -16,7 +16,6 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
-
 
 # Windows 控制台默认 GBK，测试断言/回溯含 emoji 会 UnicodeEncodeError；
 # 统一重配为 UTF-8，保证测试不依赖外部 PYTHONIOENCODING 环境变量。
@@ -2530,7 +2529,7 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(len(results), 6, "返回应包含已有 + 本次新增")
             self.assertGreaterEqual(atomic.call_count, 3,
                                     "write_every=2、5 个任务应至少 3 次渐进写盘")
-            with open(out, "r", encoding="utf-8") as f:
+            with open(out, encoding="utf-8") as f:
                 saved = json.load(f)
             self.assertEqual(len(saved), 6, "落盘文件应含已有 + 本次新增")
 
@@ -2588,7 +2587,7 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(len(results), 1, "并发路径应返回新抓详情（与已有合并）")
             self.assertEqual(captured["concurrency"], 3, "并发度应透传")
             # 并发结果应已落盘
-            with open(out, "r", encoding="utf-8") as f:
+            with open(out, encoding="utf-8") as f:
                 saved = json.load(f)
             self.assertEqual(len(saved), 1)
 
@@ -3082,7 +3081,7 @@ class ChromeSetupTests(unittest.TestCase):
 
             module._atomic_write_json(target, payload)
 
-            with open(target, "r", encoding="utf-8") as f:
+            with open(target, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), payload)
             leftovers = [
                 name for name in os.listdir(paths["cdp_profile"])
@@ -3104,7 +3103,7 @@ class ChromeSetupTests(unittest.TestCase):
                 with self.assertRaises(TypeError):
                     module._atomic_write_json(target, {"bad": object()})
 
-            with open(target, "r", encoding="utf-8") as f:
+            with open(target, encoding="utf-8") as f:
                 self.assertEqual(json.load(f), {"keep": True}, "失败时不应破坏原文件")
 
     def test_flush_jobs_deduplicates_across_incremental_writes(self):
@@ -3121,7 +3120,7 @@ class ChromeSetupTests(unittest.TestCase):
             module.flush_jobs(target, dict(meta), [full("a"), full("b")])
             module.flush_jobs(target, dict(meta), [full("b"), full("c")])
 
-            with open(target, "r", encoding="utf-8") as f:
+            with open(target, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertEqual([j["job_id"] for j in data["jobs"]], ["a", "b", "c"])
             self.assertEqual(data["total"], 3)
@@ -4658,12 +4657,20 @@ class VersionConsistencyTests(unittest.TestCase):
         self.assertIsNotNone(m, "README.md 未找到版本号")
         readme_ver = _normalize_version(m.group(1))
 
+        # README.en.md 标题: # ... v2.0
+        readme_en = self._read_text("README.en.md")
+        m = re.search(r"v(\d+\.\d+(?:\.\d+)?)", readme_en)
+        self.assertIsNotNone(m, "README.en.md 未找到版本号")
+        readme_en_ver = _normalize_version(m.group(1))
+
         self.assertEqual(script_ver, pyproject_ver,
                          f"脚本({script_ver}) 与 pyproject.toml({pyproject_ver}) 版本不一致")
         self.assertEqual(script_ver, skill_ver,
                          f"脚本({script_ver}) 与 SKILL.md({skill_ver}) 版本不一致")
         self.assertEqual(script_ver, readme_ver,
                          f"脚本({script_ver}) 与 README.md({readme_ver}) 版本不一致")
+        self.assertEqual(script_ver, readme_en_ver,
+                         f"脚本({script_ver}) 与 README.en.md({readme_en_ver}) 版本不一致")
 
 
 class ProjectScopeTests(unittest.TestCase):

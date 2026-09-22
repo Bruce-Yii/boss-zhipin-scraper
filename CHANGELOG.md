@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### 工程 / CI
+- **CI 固定 ruff 版本**（`requirements-dev.txt` 钉 `ruff==0.16.4`），避免规则漂移
+- **CI 覆盖率门禁**：`coverage report --fail-under=70`（当前约 74%）
+- **CI 打包冒烟 job**：`python -m build` → 装 wheel → `boss-scraper --version` / `boss-summary --help`（锁住 hatchling 入口与依赖自洽）
+- **ruff 规则扩展**：`E,F → E,F,I,B,UP`（+isort/bugbear/pyupgrade），并修复报告项（B904 `raise ... from None`、B007 未用循环变量）
+- 新增 `.pre-commit-config.yaml`（ruff + 基础文件检查）；`pyproject` 增 `[tool.coverage]` 与 `dev` extra
+- **版本一致性测试扩展到 README.en.md**（原仅四处）
+
 ## v2.5.0 (2026-09-22)
 
 ### 新增
