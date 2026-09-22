@@ -1825,7 +1825,54 @@ class ChromeSetupTests(unittest.TestCase):
         from scripts import ratelimit as rl
         self.assertIs(module.TokenBucket, rl.TokenBucket)
         self.assertIs(module.AdaptiveRateLimiter, rl.AdaptiveRateLimiter)
-        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 15.0)
+        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 2.25)
+        self.assertIs(module.BurstThrottle, rl.BurstThrottle)
+
+    def test_fetch_pages_parallel_returns_all_pages(self):
+        module = load_module()
+        sess = [mock.Mock(), "t", "s", 0]
+        sess[0].eval_js.return_value = "{}"
+        with mock.patch.object(module, "_open_api_tab", return_value=sess), \
+                mock.patch.object(module, "_close_api_tab"), \
+                mock.patch.object(module, "parse_api_jobs_eval_value",
+                                  side_effect=lambda v: [{"job_id": "x"}]):
+            out = module._fetch_pages_parallel(9222, "k", "101", 3, {})
+        self.assertIsNotNone(out)
+        self.assertEqual([len(b) for b in out], [1, 1, 1])
+
+    def test_fetch_pages_parallel_falls_back_on_empty_page(self):
+        module = load_module()
+        sess = [mock.Mock(), "t", "s", 0]
+        sess[0].eval_js.return_value = "{}"
+        with mock.patch.object(module, "_open_api_tab", return_value=sess), \
+                mock.patch.object(module, "_close_api_tab"), \
+                mock.patch.object(module, "parse_api_jobs_eval_value",
+                                  return_value=[]):
+            out = module._fetch_pages_parallel(9222, "k", "101", 3, {})
+        self.assertIsNone(out, "任一页无数据应返回 None（调用方回退串行）")
+
+    def test_target_crashed_error_is_expected_cdp_exception(self):
+        """TargetCrashedError 必须被当作可预期 CDP 异常捕获（否则逃逸导致 tab 泄漏）。"""
+        module = load_module()
+        self.assertIn(module.TargetCrashedError, module._cdp_exception_types())
+
+    def test_classify_boss_code(self):
+        """code 全表 + code37 二分（token_expired vs env_risk）——同行研究关键结论。"""
+        module = load_module()
+        self.assertEqual(module.classify_boss_code(0)[0], "ok")
+        self.assertEqual(
+            module.classify_boss_code(37, "您的环境存在异常")[0], "env_risk")
+        self.assertEqual(
+            module.classify_boss_code(37, "会话过期，请重新登录")[0], "token_expired")
+        self.assertEqual(
+            module.classify_boss_code(37, "session expired")[0], "token_expired")
+        self.assertEqual(module.classify_boss_code(121)[0], "security_block")
+        self.assertEqual(module.classify_boss_code(122)[0], "security_block")
+        self.assertEqual(module.classify_boss_code(17)[0], "invalid_params")
+        self.assertEqual(module.classify_boss_code(9)[0], "rate_limited")
+        self.assertEqual(module.classify_boss_code(999)[0], "unknown")
+        self.assertIn("token_expired", module.RETRYABLE_CATEGORIES)
+        self.assertNotIn("env_risk", module.RETRYABLE_CATEGORIES)
 
     def test_export_contract_module_is_reexported(self):
         module = load_module()
@@ -2256,9 +2303,10 @@ class ChromeSetupTests(unittest.TestCase):
         used = {id(s[0]) for s in seen_sessions}
         self.assertEqual(used, {id(w) for w in created}, "使用的会话应全部来自池")
 
-    def test_parallel_api_channel_paces_detail_requests(self):
-        """并发 API 通道：自建限速器基线应为 concurrency/PACE（每 worker 至少
-        PACE 秒），而非 DOM 路径的 concurrency*0.5/秒——防止详情接口被过快请求。"""
+    def test_parallel_api_channel_uses_burst_throttle(self):
+        """并发 API 通道：用 BurstThrottle（请求时刻串行 + 高斯 1.5-3.0s + burst
+        惩罚，全局 ~0.44 req/s），不再是旧式 concurrency/PACE 令牌桶（会踩线触
+        code 37）——2026-09-22 同行研究落地。"""
         module = load_module()
         jobs = self._sample_jobs(2)["jobs"]
 
@@ -2273,7 +2321,8 @@ class ChromeSetupTests(unittest.TestCase):
                                   return_value=("t", "s")), \
                 mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
                 mock.patch.object(module, "check_cdp_recovery", return_value=0), \
-                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "BurstThrottle") as bt_cls, \
+                mock.patch.object(module, "AdaptiveRateLimiter") as arl_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
@@ -2281,10 +2330,9 @@ class ChromeSetupTests(unittest.TestCase):
                 jobs, cdp_port=9222, concurrency=2,
                 security_map={j["job_id"]: "sec" for j in jobs},
                 city_code="101010100", keyword="AI产品经理")
-        api_base = limiter_cls.call_args.kwargs.get("base_rate")
-        self.assertAlmostEqual(
-            api_base, 2 / module.DETAIL_API_PACE_SECONDS,
-            msg="API 通道基线应为 concurrency/PACE（每 worker 至少 PACE 秒）")
+        self.assertTrue(bt_cls.called,
+                        "API 通道应使用 BurstThrottle（串行+burst-aware 安全节律）")
+        arl_cls.assert_not_called()
 
     def test_parallel_dom_path_keeps_permissive_baseline(self):
         """DOM 路径（无 security_map）：保持旧基线 concurrency*0.5/秒
@@ -2312,7 +2360,7 @@ class ChromeSetupTests(unittest.TestCase):
     def test_parallel_api_channel_rotates_tab_on_budget(self):
         """预算轮换：同一 tab 达 DETAIL_API_TAB_BUDGET 次后自动换新 tab（支撑批量）。"""
         module = load_module()
-        jobs = self._sample_jobs(9)["jobs"]  # 预算 4 → 4+4+1 = 3 个 tab
+        jobs = self._sample_jobs(9)["jobs"]  # 预算 5 → 5+4 = 2 个 tab
         tids = iter(f"tid-{i}" for i in range(10))
         created, navigations = [], []
 
@@ -2346,12 +2394,12 @@ class ChromeSetupTests(unittest.TestCase):
                 security_map={j["job_id"]: "sec" for j in jobs},
                 city_code="101010100", keyword="AI产品经理")
         self.assertEqual(len(results), 9)
-        self.assertEqual(len(created), 3,
-                         "9 条 / 预算 4 → 应轮换出 3 个 tab（初始 + 2 次轮换）")
-        self.assertEqual(len(navigations), 3, "每个 tab 只导航一次")
+        self.assertEqual(len(created), 2,
+                         "9 条 / 预算 5 → 应轮换出 2 个 tab（初始 + 1 次轮换）")
+        self.assertEqual(len(navigations), 2, "每个 tab 只导航一次")
 
     def test_parallel_api_channel_retries_after_risk_by_rotating_tab(self):
-        """风控码疑似配额耗尽：换 tab 重试一次，成功则继续（不误判全停）。"""
+        """token_expired（会话过期）：换 tab 刷新后重试一次，成功则继续（不误判全停）。"""
         module = load_module()
         jobs = self._sample_jobs(2)["jobs"]
         tids = iter(f"tid-{i}" for i in range(6))
@@ -2368,7 +2416,8 @@ class ChromeSetupTests(unittest.TestCase):
             calls["n"] += 1
             if calls["n"] == 1:
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
-                        "reason": "risk_timeout", "message": "详情 API 风控码: code=37"}
+                        "reason": "risk_timeout", "message": "code=37 会话过期",
+                        "category": "token_expired"}
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": ""}
 
@@ -2389,6 +2438,41 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(len(results), 2, "换 tab 重试后两条都应成功（不应全停）")
         self.assertGreaterEqual(len(created), 2, "应发生一次 tab 轮换")
         risk_note.assert_not_called()
+
+    def test_parallel_env_risk_does_not_retry_and_cools_down(self):
+        """env_risk（环境风控）：换 tab 无用 → 不重试、直接全停并进入冷却。"""
+        module = load_module()
+        jobs = self._sample_jobs(3)["jobs"]
+        tids = iter(f"tid-{i}" for i in range(6))
+
+        def fake_cdp(port=None):
+            return mock.Mock()
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword=""):
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "risk_timeout", "message": "code=37 您的环境存在异常",
+                    "category": "env_risk"}
+
+        with mock.patch.object(module, "CDPSession", side_effect=fake_cdp), \
+                mock.patch.object(module, "create_page_session",
+                                  side_effect=lambda ws: (next(tids), "s")), \
+                mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "_note_detail_risk_blocked"), \
+                mock.patch.object(module, "mark_cdp_cooldown") as cool, \
+                mock.patch.object(module, "_rotate_api_tab") as rot, \
+                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+                mock.patch.object(module, "load_pending_ids", return_value=set()), \
+                mock.patch.object(module.time, "sleep"):
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=1,
+                limiter=limiter_cls.return_value,
+                security_map={j["job_id"]: "sec" for j in jobs},
+                city_code="101010100", keyword="AI产品经理")
+        rot.assert_not_called()  # env_risk 不换 tab（换了也没用）
+        cool.assert_called()     # 进入冷却
 
     def test_parallel_records_failed_jobs_to_pending(self):
         module = load_module()

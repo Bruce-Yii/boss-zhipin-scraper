@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import argparse
 import csv
@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
 
 TokenBucket = _ratelimit.TokenBucket
 AdaptiveRateLimiter = _ratelimit.AdaptiveRateLimiter
+BurstThrottle = _ratelimit.BurstThrottle
 DETAIL_API_PACE_SECONDS = _ratelimit.DETAIL_API_PACE_SECONDS
 
 try:
@@ -103,8 +104,8 @@ CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重�
 CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 # DETAIL_API_PACE_SECONDS 已抽出到 scripts/ratelimit.py（见顶部导入兼容层）
-DETAIL_API_TAB_BUDGET = 4       # 详情 API 每 tab 预算：实测同一 tab 连续约 4-5 次后返回
-                                # code 37，换新 tab 立即重置（2026-09-22 实证）→ 主动轮换支撑批量
+DETAIL_API_TAB_BUDGET = 5       # 详情 API 每 tab 预算：实测同一 tab 第 6 次返回 code 37
+                                # （即可用 5 次，2026-09-22 E3 复核），换新 tab 立即重置 → 主动轮换
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 # FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
@@ -256,6 +257,54 @@ LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
 LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
+
+# BOSS wapi 业务码 → (类别, 人话)。类别统一判定"参数错 / 限流 / 环境风控 / 安全拦截"。
+# 依据：同行研究（boss-cli exceptions.py、boss-agent-cli zhipin_errors.py，2026-09-22）
+# + 我方实测。code 37 单独二分（见 classify_boss_code）。
+BOSS_CODE_TABLE = {
+    9: ("rate_limited", "限流（冷却后重试）"),
+    17: ("invalid_params", "参数错误（缺少必填参数），应报错退出"),
+    19: ("invalid_params", "参数错误（参数非法），应报错退出"),
+    31: ("env_risk", "环境风控（停手冷却）"),
+    35: ("env_risk", "环境风控（停手冷却）"),
+    36: ("account_risk", "账号风险（停手）"),
+    38: ("env_risk", "环境风控（停手冷却）"),
+    121: ("security_block", "安全拦截（直接停，提示走网页端人工处理）"),
+    122: ("security_block", "安全拦截（直接停，提示走网页端人工处理）"),
+}
+
+# 处置类别 → 是否"可直接重试"（仅 token_expired 值得刷新会话后重试一次）
+RETRYABLE_CATEGORIES = {"token_expired"}
+
+
+def classify_boss_code(code, msg=""):
+    """把 BOSS 业务码归为处置类别并给出人话说明。
+
+    返回 (category, detail)。category ∈
+      ok / invalid_params / rate_limited / env_risk / account_risk /
+      security_block / token_expired / unknown
+
+    code 37 二分（2026-09-22 同行研究关键结论）：
+      msg 含 token/session/会话/登录/过期 → token_expired（刷新会话后重试一次）
+      否则（含"环境/异常/风控"等）→ env_risk（**换 tab 无用，必须停手冷却**）
+    """
+    try:
+        code = int(code or 0)
+    except (TypeError, ValueError):
+        return "unknown", "业务码非整数（保守停手）"
+    if code == 0:
+        return "ok", "正常"
+    if code == 37:
+        text = str(msg or "")
+        low = text.lower()
+        if (any(k in low for k in ("token", "session", "expired"))
+                or any(k in text for k in ("会话", "登录", "过期", "令牌"))):
+            return "token_expired", "会话/令牌过期（刷新会话后重试一次）"
+        return "env_risk", "环境风控（换 tab 无用，停手冷却）"
+    entry = BOSS_CODE_TABLE.get(code)
+    if entry:
+        return entry
+    return "unknown", "未知业务码（保守停手）"
 # 未知非零 code 一律按受限（降速）处理，见 probe_login_state 的 code != 0 分支
 DEFAULT_LOGIN_TIMEOUT = 300
 
@@ -626,7 +675,10 @@ def _cdp_exception_types():
     Mock（其属性不是异常类）。这里动态解析真实异常类，避免 except 元组里出现
     非异常类型导致 TypeError。
     """
-    types = (RuntimeError, TimeoutError, KeyError, OSError)
+    # TargetCrashedError（渲染进程崩溃 OOM 等）必须在内：它虽是 Exception 子类、
+    # 不在 RuntimeError 族，若漏掉则异常会逃逸 → 清理被跳过、停靠 tab 泄漏
+    # （2026-09-22 实测：`Render process gone` 逃逸到 run_cli 兜底并遗留 ~18 个 tab）。
+    types = (RuntimeError, TimeoutError, KeyError, OSError, TargetCrashedError)
     ws_exc = getattr(websocket, "WebSocketException", None) if websocket is not None else None
     if isinstance(ws_exc, type) and issubclass(ws_exc, BaseException) and ws_exc not in types:
         types += (ws_exc,)
@@ -807,7 +859,15 @@ class DetailLoginRequiredError(DetailExtractionError):
 
 
 class DetailRiskError(DetailExtractionError):
-    """详情 API 返回风控码（code!=0）：退避重试，连续命中走熔断全停。"""
+    """详情 API 返回风控码（code!=0）。
+
+    category 用于**二分处置**（2026-09-22 同行研究）：
+      token_expired  → 会话/令牌过期：刷新会话（轮换 tab）后重试一次
+      env_risk / account_risk / security_block → 换 tab 无用：停手 + 冷却
+    """
+    def __init__(self, message, category="env_risk"):
+        super().__init__(message)
+        self.category = category
 
 
 EXTRACT_DETAIL_JS = """
@@ -923,6 +983,9 @@ def _open_api_tab(cdp_port, keyword, city_code):
     tid, sid = create_page_session(ws)
     ws.send("Page.navigate",
             {"url": build_search_url(keyword or "", city_code or "", 1, {})}, sid)
+    # dock 等待：实测（2026-09-22）——E6 单次零等待下 XHR 虽 OK，但**放到真实高频
+    # 轮换场景**（等待 0.5-1.5s + pace 1s + 并发 3）会触发 `code 37 您的环境存在异常`
+    # 真风控（换 tab 清不掉）。故保留 4-8s 缓冲，控制"每 tab 一次搜索页加载"的速率。
     time.sleep(random.uniform(4, 8))
     return [ws, tid, sid, 0]
 
@@ -970,7 +1033,11 @@ def _parse_detail_api_value(val, job):
     if payload.get("error"):
         raise DetailExtractionError(f"详情 API 请求失败: {payload['error']}")
     if payload.get("code", 0) != 0:
-        raise DetailRiskError(f"详情 API 风控码: code={payload.get('code')} {payload.get('msg', '')}")
+        _code = payload.get("code")
+        _msg = str(payload.get("msg", ""))
+        _cat, _detail = classify_boss_code(_code, _msg)
+        raise DetailRiskError(
+            f"详情 API 风控码: code={_code} {_msg}（{_detail}）", category=_cat)
     jd = str(payload.get("jd") or "")
     jd = jd.replace("\u3000", " ")  # 全角空格清理（探测实证 postDescription 含全角空格）
     jd = _normalize_detail_whitespace(jd)
@@ -2156,9 +2223,115 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 # 抓取列表
 # ============================================================
+def close_orphan_dock_tabs(cdp_port=DEFAULT_CDP_PORT, keep=2, threshold=8):
+    """清扫残留的"停靠搜索页"tab（崩溃/异常退出遗留），防越积越多。
+
+    只在**明显泄漏**（同页 target 数 > threshold）时才动手，并保留最新 keep 个，
+    避免误关用户正常使用的页；只关 URL 匹配本工具搜索页
+    （``/web/geek/jobs?query=``）的 page target。CDP 不可达/失败静默返回 0。
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{cdp_port}/json/list", timeout=5) as resp:
+            targets = json.load(resp)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+    docks = [t for t in targets
+             if t.get("type") == "page"
+             and "/web/geek/jobs?query=" in (t.get("url") or "")]
+    if len(docks) <= threshold:
+        return 0
+    closed = 0
+    for t in docks[keep:]:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{cdp_port}/json/close/{t.get('id')}",
+                timeout=5).read()
+            closed += 1
+        except (OSError, ValueError):
+            pass
+    return closed
+
+
+def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
+                          workers=3):
+    """并发抓取多页列表：并发开 `workers` 个停靠 tab，再跨 tab 同发搜索 XHR。
+
+    实测（2026-09-22 E5）：3 页同发一次取全（无风控）；配合并发开 tab，
+    列表阶段从"串行 ~50s（含 12-22s 页间等待）"降到约 6-7s。
+    任一页无数据/异常 → 返回 None（调用方回退串行，保证稳健）。
+    返回：[[page1 jobs], [page2 jobs], ...]（长度 = pages）。
+    """
+    workers = max(1, min(int(workers), pages))
+    sessions = [None] * workers
+    open_errs = []
+
+    def _open(i):
+        try:
+            sessions[i] = _open_api_tab(cdp_port, keyword, city_code)
+        except _cdp_exception_types():
+            open_errs.append(i)
+
+    ots = [threading.Thread(target=_open, args=(i,)) for i in range(workers)]
+    for t in ots:
+        t.start()
+    for t in ots:
+        t.join()
+    if open_errs or any(s is None for s in sessions):
+        for s in sessions:
+            _close_api_tab(s)
+        return None
+
+    page_q = queue.Queue()
+    for p in range(1, pages + 1):
+        page_q.put(p)
+    out = {}
+    failed = []
+    lock = threading.Lock()
+
+    def _run(sess):
+        while True:
+            try:
+                pg = page_q.get_nowait()
+            except queue.Empty:
+                return
+            params = {"scene": "1", "query": keyword, "city": city_code,
+                      "page": pg, "pageSize": PAGE_SIZE}
+            for k, v in (filters or {}).items():
+                if v:
+                    params[k] = v
+            api_url = f"{API_JOB_LIST_PATH}?{urlencode(params)}"
+            js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
+            try:
+                val = sess[0].eval_js(js, sess[2])
+                jobs = parse_api_jobs_eval_value(val)
+            except _cdp_exception_types():
+                with lock:
+                    failed.append(pg)
+                return
+            if not jobs:
+                with lock:
+                    failed.append(pg)
+                return
+            with lock:
+                out[pg] = jobs
+
+    ts = [threading.Thread(target=_run, args=(s,)) for s in sessions]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    for s in sessions:
+        _close_api_tab(s)
+    if failed or len(out) != pages:
+        return None
+    return [out[p] for p in range(1, pages + 1)]
+
+
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                max_jobs=None, max_concurrent=1):
+                max_jobs=None, max_concurrent=1, pages_parallel=1):
     city_name, city_code = resolve_city(city_input)
     # 单进程互斥（规格 §3.6）：默认并发上限 1（现状）；--max-concurrent N 仅指令显式放开
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
@@ -2247,6 +2420,19 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 "type": "mouseMoved", "x": x, "y": y
             }, sid)
 
+    # 并行抓页（P3 速度）：多 tab 同发搜索 XHR。库层默认关闭（pages_parallel=1，
+    # 不影响既有测试/调用方）；CLI 默认开启。任一页失败即回退串行，保证稳健。
+    prefetched_pages = None
+    if pages_parallel > 1 and max_pages > 1 and not allow_dom_fallback:
+        prefetched_pages = _fetch_pages_parallel(
+            cdp_port, keyword, city_code, max_pages, filters,
+            workers=pages_parallel)
+        if prefetched_pages is None:
+            print("  ⚠️ 并行抓页未全部成功，回退串行模式")
+        else:
+            print(f"  ⚡ 并行抓页：{max_pages} 页 "
+                  f"{sum(len(b) for b in prefetched_pages)} 条")
+
     try:
         exhausted = False  # 本 run 是否翻到底（规格侧抽样感知下架判定依据：契约 v2 顶层字段）
         for pg in range(1, max_pages + 1):
@@ -2262,8 +2448,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
             incr_request("list")
 
-            # 第一页：导航到搜索页建立 cookie/session
-            if pg == 1:
+            # 第一页：导航到搜索页建立 cookie/session（并行预取时已由预取 tab 建立）
+            if pg == 1 and prefetched_pages is None:
                 url = build_search_url(keyword, city_code, pg, filters)
                 cdp.send("Page.navigate", {"url": url}, sid)
                 time.sleep(random.uniform(6, 10))
@@ -2297,28 +2483,32 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             api_url = f"{API_JOB_LIST_PATH}?{urlencode(api_params)}"
 
             jobs = []
-            for attempt in range(API_ATTEMPT_LIMIT):
-                api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
-                val = cdp.eval_js(api_js, sid)
-                jobs = parse_api_jobs_eval_value(val)
-                if jobs:
-                    break
-                if attempt < API_ATTEMPT_LIMIT - 1:
-                    print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
-                    warnings.append(f"第{pg}页API未返回数据，已刷新重试")
-                    cdp.send("Page.navigate",
-                             {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
-                    # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
-                    # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
-                    time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
-                    is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
-                    if is_risk:
-                        print(f"⚠️ 刷新后 {reason}，等待人工处理...")
-                        if not wait_for_risk_clear(cdp, sid):
-                            print("风控未解除，停止抓取（保留已抓数据）。")
-                            warnings.append(f"刷新后风控未解除: {reason}")
-                            jobs = []
-                            break
+            if prefetched_pages is not None:
+                # 并行预取命中：直接用该页结果，跳过导航/重试/风控探测
+                jobs = prefetched_pages[pg - 1]
+            else:
+                for attempt in range(API_ATTEMPT_LIMIT):
+                    api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
+                    val = cdp.eval_js(api_js, sid)
+                    jobs = parse_api_jobs_eval_value(val)
+                    if jobs:
+                        break
+                    if attempt < API_ATTEMPT_LIMIT - 1:
+                        print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
+                        warnings.append(f"第{pg}页API未返回数据，已刷新重试")
+                        cdp.send("Page.navigate",
+                                 {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
+                        # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
+                        # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
+                        time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
+                        is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                        if is_risk:
+                            print(f"⚠️ 刷新后 {reason}，等待人工处理...")
+                            if not wait_for_risk_clear(cdp, sid):
+                                print("风控未解除，停止抓取（保留已抓数据）。")
+                                warnings.append(f"刷新后风控未解除: {reason}")
+                                jobs = []
+                                break
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
             if should_use_dom_fallback(jobs, allow_dom_fallback):
@@ -2402,8 +2592,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print(f"  已抓 {len(all_jobs)} 条 ≥ 目标 {max_jobs}，停止翻页")
                 break
 
-            if pg < max_pages:
+            if pg < max_pages and prefetched_pages is None:
                 # 并发 >1 时页间隔自动拉长（规格 §3.6 修订：12-22s → 20-30s）
+                # 注：并行预取时页已一次性取回，无需页间等待
                 if max_concurrent > 1:
                     d = random.uniform(20, 30)
                 else:
@@ -2794,7 +2985,8 @@ def _list_has_detail_risk(list_path):
 
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
-              detail=True, detail_concurrency=1, keep_without_jd=False):
+              detail=True, detail_concurrency=1, keep_without_jd=False,
+              pages_parallel=1):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -2836,6 +3028,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                 task["keyword"], task["city"], task["pages"], filters, None,
                 cdp_port=cdp_port, max_jobs=None,
                 max_concurrent=max_concurrent,
+                pages_parallel=pages_parallel,
             )
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
@@ -3311,9 +3504,10 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
         try:
             fields = _parse_detail_api_value(val, job)
         except DetailRiskError as exc:
-            # 风控码：与列表阶段同构——退避重试由上层 pending/全停逻辑接管
+            # 风控码：退避/全停由上层按 category 二分处置（仅 token_expired 才重试）
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "risk_timeout", "message": str(exc)}
+                    "reason": "risk_timeout", "message": str(exc),
+                    "category": getattr(exc, "category", "env_risk")}
         except DetailExtractionError as exc:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail", "message": str(exc)}
@@ -3430,6 +3624,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
     api_session = None
     detail_keyword = list_data.get("keyword", "") or ""
     detail_city_code = list_data.get("city_code", "") or ""
+    # API 通道 burst-aware 串行节律（全局 ~0.44 req/s）；DOM 通道不用
+    detail_throttle = BurstThrottle() if security_map else None
     if security_map:
         try:
             api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
@@ -3474,9 +3670,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
                                     api_session=api_session,
                                     city_code=detail_city_code,
                                     search_keyword=detail_keyword)
-        # 风控码可能是"本 tab 配额耗尽"：换 tab 重试一次；仍失败才判定真风控（全停）
+        # 风控码二分：仅 token_expired（会话/令牌过期）值得换 tab 刷新后重试一次；
+        # env_risk/account_risk/security_block 换 tab 无用 → 不重试，直接全停冷却
         if (result["reason"] == "risk_timeout" and job_security
-                and api_session is not None):
+                and api_session is not None
+                and result.get("category") in RETRYABLE_CATEGORIES):
             incr_request("detail")
             if _rotate_api_tab(api_session, cdp_port, detail_keyword, detail_city_code):
                 print("  ♻️ 命中风控码，换 tab 重试该岗位一次...")
@@ -3532,6 +3730,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
             print(f"  ⚠️ {result['message']}")
+            if result.get("category") not in RETRYABLE_CATEGORIES:
+                # 环境/账号/安全风控：进入冷却，防"停手后立即重开→再触"
+                mark_cdp_cooldown()
             _note_detail_risk_blocked(list_output_path,
                                       city_name=list_data.get("city", ""),
                                       keyword=list_data.get("keyword", ""))
@@ -3548,17 +3749,18 @@ def scrape_details(list_data, max_details=None, output_path=None,
                     pending[job_id] = pending.get(job_id, 0) + 1
                     save_pending_ids(output_path, pending)
 
-        # 详情页间隔：API 通道每 worker ≥ DETAIL_API_PACE_SECONDS（规格硬线，
-        # API 无渲染等待、限速器/间隔是唯一刹车）；DOM 通道沿用 10-25s。
-        if security_map:
-            gap = random.uniform(DETAIL_API_PACE_SECONDS, DETAIL_API_PACE_SECONDS * 1.6)
+        # 详情页间隔：API 通道用 burst-aware 串行节律（全局 ~0.44 req/s，全行
+        # 安全区）；DOM 通道沿用 10-25s。
+        if detail_throttle is not None:
+            print("  API 通道节律等待中...\n")
+            detail_throttle.acquire()
         else:
             gap = random.uniform(10, 25)
-        print(f"  等待 {gap:.0f}s 后抓下一个...\n")
+            print(f"  等待 {gap:.0f}s 后抓下一个...\n")
+            time.sleep(gap)
         progress = progress_line(idx + 1, len(jobs), serial_ok)
         if progress:
             print(progress)
-        time.sleep(gap)
 
     # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
     _close_api_tab(api_session)
@@ -3609,22 +3811,22 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
     pending = dict(pending_ids) if pending_ids is not None else {}
     if limiter is None:
         if security_map:
-            # 详情 API 通道：单次请求约 1s（无整页渲染等待），限速器是唯一刹车。
-            # 按"每 worker 至少 DETAIL_API_PACE_SECONDS 间隔"设基线
-            # （并发 N → 全局约 N/PACE 次/秒），与串行 10-25s 间隔同量级；
-            # 旧公式 concurrency*0.5/秒 是为 DOM 渲染路径设计的（其加载/滚动
-            # 20-30s 天然限速），对 API 通道过快（2026-09-22 审计修复）。
-            base_rate = max(concurrency / DETAIL_API_PACE_SECONDS, 0.07)
+            # 详情 API 通道：burst-aware **串行**节律（请求时刻全局串行 + 高斯
+            # 1.5-3.0s + 5% 长暂停 + burst 惩罚），全局 ~0.44 req/s，落在全行安全区。
+            # 2026-09-22 同行研究：旧式 `concurrency/PACE`（并发 3 ≈ 3 req/s）
+            # 踩线 → 反复触 code 37 → 全停，产出反而更少。
+            limiter = BurstThrottle()
         else:
             # DOM 路径：单条加载/滚动 20-30s 天然限速，令牌桶仅提供弱错峰
-            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时由
-            # AdaptiveRateLimiter 降半/暂停兜底。
-            base_rate = max(concurrency * 0.5, 0.5)
-        limiter = AdaptiveRateLimiter(base_rate=base_rate)
+            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时降半/暂停兜底。
+            limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
         # 熔断恢复期：冷却结束后渐变恢复，恢复期内限速减半（不跳回全速）
         recovery = check_cdp_recovery()
         if recovery > 0:
-            limiter.base_rate /= 2.0
+            if isinstance(limiter, BurstThrottle):
+                limiter.slow_factor = 2.0
+            else:
+                limiter.base_rate /= 2.0
             print(f"⚠️ 熔断恢复期（剩余约 {recovery:.0f}s），详情限速减半")
 
     # 过滤已抓/重复（与串行路径同一套去重逻辑）
@@ -3669,6 +3871,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             # message 含实际风控形态（如 code=37），必须打印（可观测性）
             print(f"  ⚠️ {result['message']}")
             stop_event.set()
+            if result.get("category") not in RETRYABLE_CATEGORIES:
+                # 环境/账号/安全风控：进入冷却，防"停手后立即重开→再触"
+                mark_cdp_cooldown()
             _note_detail_risk_blocked(list_output_path, city_name=city, keyword=keyword)
         elif reason == "cdp_session":
             consecutive_cdp_errors += 1
@@ -3700,7 +3905,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             except _cdp_exception_types():
                 log.warning("详情 API 共享会话建立失败（该槽位将按需自建）", exc_info=True)
 
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    try:
         # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
         # 每完成一个补提交一个；停止信号（熔断/登录墙）后不再补提交。
         # 相比一次性提交全部：内存有界、停止即时生效（千级任务也安全）。
@@ -3721,9 +3927,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     job, cdp_port, stop_event, limiter,
                     security_id=job_security, api_session=session,
                     city_code=city_code, search_keyword=keyword)
-                # 风控码疑似"配额耗尽"：换 tab 重试一次；仍失败才判定真风控
+                # 风控码二分：仅 token_expired 才换 tab 刷新后重试一次（其余换 tab 无用）
                 if (result["reason"] == "risk_timeout" and job_security
-                        and session is not None):
+                        and session is not None
+                        and result.get("category") in RETRYABLE_CATEGORIES):
                     if _rotate_api_tab(session, cdp_port, keyword, city_code):
                         result = _scrape_one_detail(
                             job, cdp_port, stop_event, limiter,
@@ -3779,11 +3986,13 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         if completed:
             print(run_summary(time.time() - start_time,
                               completed, parallel_ok, parallel_reasons))
-    # 关闭详情 API 共享会话池（复用 tab 释放）
-    for sess in api_sessions:
-        _close_api_tab(sess)
-    if output_path:
-        persist()
+    finally:
+        pool.shutdown(wait=True)
+        # 关闭详情 API 共享会话池（**异常/崩溃也保证关闭**，防 tab 泄漏）
+        for sess in api_sessions:
+            _close_api_tab(sess)
+        if output_path:
+            persist()
     return results, pending
 
 
@@ -4549,6 +4758,11 @@ def main():
         # 退出码固化：0=成功 / 1=运行期错误（含未预期异常，干净消息无 traceback）/
         # 2=CLI 误用（argparse 默认）
         print(f"❌ 未预期错误: {_scrub_secrets(str(e))}", file=sys.stderr)
+        # 崩溃兜底：清扫本次异常退出遗留的停靠 tab（防越积越多）
+        try:
+            close_orphan_dock_tabs()
+        except Exception:
+            pass
         sys.exit(1)
 
 
@@ -4613,6 +4827,9 @@ def build_parser():
     g_search.add_argument("--max-concurrent", type=int, default=1,
                           help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
                                "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
+    g_search.add_argument("--pages-parallel", type=int, default=3,
+                          help="并行抓页数（默认 3；多 tab 同发搜索 XHR，迭代列表阶段"
+                               "约 50s→约 6s；0/1=关闭回退串行）")
 
     # ---- 筛选参数 ----
     g_filter = p.add_argument_group("筛选参数")
@@ -4774,7 +4991,8 @@ def run_cli():
         sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
                            max_concurrent=args.max_concurrent,
                            detail=args.detail, detail_concurrency=args.concurrency,
-                           keep_without_jd=args.keep_without_jd))
+                           keep_without_jd=args.keep_without_jd,
+                           pages_parallel=args.pages_parallel))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
@@ -4871,12 +5089,17 @@ def run_cli():
         else:
             print("✅ 已登录\n")
 
+        # 启动清扫：关闭此前崩溃/异常退出遗留的停靠 tab（防 tab 越积越多）
+        swept = close_orphan_dock_tabs(args.cdp_port)
+        if swept:
+            print(f"🧹 已清扫 {swept} 个残留停靠 tab")
         list_data = scrape_list(
             args.keyword, args.city, args.pages, filters, args.output,
             cdp_port=args.cdp_port, fmt=args.format,
             allow_dom_fallback=args.allow_dom_fallback,
             max_jobs=args.max_jobs,
             max_concurrent=args.max_concurrent,
+            pages_parallel=args.pages_parallel,
         )
         # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
         sidecar_owned = write_security_sidecar(

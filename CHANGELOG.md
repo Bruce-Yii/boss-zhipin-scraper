@@ -1,6 +1,21 @@
 # Changelog
 
-## [Unreleased]
+## v2.6.0 (2026-09-22)
+
+### 性能（实测定界）
+- **列表并行抓页**（新增 `--pages-parallel N`，默认 3；库层默认 1 不改调用方）：多 tab 并发开、同发搜索 XHR，列表阶段从串行 ~55s（含 12-22s 页间等待）降到约 6s；任一页失败自动回退串行
+- **详情 pace 15s → 1s/worker**：实测 E3/E4——多 tab 轮换下间隔 **0.5s 连续 40 次仍 code 0、无验证码**，取 1.0s 保守值（2× 余量）；旧值 15s 无实测依据、过保守约 15×
+- **每 tab 详情预算 4 → 5**：E3 复核同一 tab 第 6 次才 `code 37`（即可用 5 次）
+- **dock tab 等待保留 4-8s（实测否决下调）**：E6 单次零等待下 XHR 虽 OK，但**真实高频轮换**（等待 0.5-1.5s + pace 1s + 并发 3）会触发 `code 37 您的环境存在异常` 真风控（换 tab 清不掉）→ 保持 4-8s，控制"每 tab 一次搜索页加载"速率
+- **实测记录**：E5 并行 3 页 0.4s；E1/E2 详情 API 不带 `securityId` 返回 `code 17`（确认必须带，列表↔详情耦合不可去）
+- 端到端实测（南京 × 3 页 + 详情并发 3）：整格 **~80 秒**（原约 5.6 分钟）；测试 +2
+
+### 风控（P4a · 同行研究落地）
+- **code 全表 + `code 37` 二分**（`classify_boss_code`）：`token_expired`（会话/令牌过期）才刷新会话后重试一次；`env_risk / account_risk / security_block` **换 tab 无用 → 停手 + 冷却**。新增 9/17/19/31/35/36/38/121/122 归类，终结"换 tab 清不掉"的无效重试
+- 环境风控命中即进入冷却（复用 `mark_cdp_cooldown`），防"停手后立即重开再触"
+- **API 通道改 burst-aware 串行节律**（`BurstThrottle`）：请求时刻**全局串行** + 高斯 1.5–3.0s + 5% 长暂停 2–5s + burst 惩罚（15s≥3 / 45s≥6），全局约 **0.44 req/s**（全行安全区）；`DETAIL_API_PACE_SECONDS` 1.0→2.25。替换旧式 `concurrency/PACE`（并发 3 ≈ 3 req/s，踩线触 `code 37`）。**取舍：慢一点换稳、产出完整**
+- 新增风控处置 runbook（`docs/projects/boss-zhipin-scraper/boss-zhipin-scraper-风控处置-runbook.md`）
+- 测试 +3
 
 ### 变更
 - **收窄 Python 支持到 3.12**（个人自用）：`requires-python >=3.12`；CI 矩阵去除 3.10；`coverage[toml]` extra 不再需要（3.12 自带 `tomllib`）；ruff `target-version → py312`；文档/徽章同步 3.12+
