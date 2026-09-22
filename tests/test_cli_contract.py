@@ -83,6 +83,12 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("--debug-screenshots", r.stdout)
 
+    def test_help_documents_dom_block_assets_flag(self):
+        """--dom-block-assets 出现在 --help（#53 资源拦截，默认关闭）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--dom-block-assets", r.stdout)
+
     def test_help_documents_detail_channel_flag(self):
         """--detail-channel 出现在 --help（含 panel 右面板，上游 #84）。"""
         r = self._run("--help")
