@@ -792,7 +792,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                     security_id=None, api_session=None, city_code="",
-                     search_keyword="", id_mode="security"):
+                     search_keyword="", id_mode="security", dom_session=None):
             return {"ok": True, "detail": {"job_id": job["job_id"],
                                            "title": job["title"],
                                            "jd": "x" * 200},
@@ -3766,6 +3766,124 @@ class ChromeSetupTests(unittest.TestCase):
                 self._detail_job(), cdp_port=9222, id_mode="security")
         self.assertTrue(result["ok"])
 
+    def test_scrape_one_detail_dom_session_reuses_shared_tab(self):
+        """共享 DOM tab（#51）：复用会话导航，单岗结束不得关闭共享 WS/tab。"""
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (ws, _url):
+            shared = [ws, "tid-shared", "sid-shared", 0]
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222, dom_session=shared)
+        self.assertTrue(result["ok"])
+        for c in ws.send.call_args_list:
+            self.assertNotEqual(c[0][0], "Target.closeTarget",
+                                "共享 DOM tab 不应被单岗关闭")
+        ws.close.assert_not_called()
+
+    def test_scrape_one_detail_dom_self_build_closes_session(self):
+        """逐岗自建（无 dom_session）：finally 必须关 tab+WS（旧行为保持）。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.side_effect = TimeoutError("cdp died")
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module.time, "sleep"):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "cdp_session")
+        sent = [c[0][0] for c in ws.send.call_args_list]
+        self.assertIn("Target.closeTarget", sent, "自建会话应关 tab")
+        ws.close.assert_called_once()
+
+    def test_scrape_details_dom_channel_shares_one_tab(self):
+        """dom 通道（串行，#51）：全程一个共享 DOM tab 逐岗复用，结束统一关闭。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job_detail/x{i}.html",
+                 "boss_name": "C"} for i in range(3)]
+        seen_sessions = []
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            seen_sessions.append(dom_session)
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": ""}
+
+        tab = [mock.Mock(), "t", "s", 0]
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_dom_tab",
+                                      return_value=tab) as open_mock, \
+                    mock.patch.object(module, "_close_api_tab") as close_mock, \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module.scrape_details({"jobs": jobs}, output_path=out,
+                                      cdp_port=9222, concurrency=1,
+                                      detail_channel="dom")
+        open_mock.assert_called_once()
+        self.assertEqual(len(seen_sessions), 3)
+        self.assertTrue(all(s is tab for s in seen_sessions),
+                        "三岗应共用同一 DOM tab")
+        closed = [c[0][0] for c in close_mock.call_args_list
+                  if c[0] and c[0][0] is not None]
+        self.assertEqual(closed, [tab], "结束应统一关闭共享 DOM tab（且仅它）")
+
+    def test_scrape_details_dom_channel_reopens_shared_tab_after_cdp_failure(self):
+        """dom 通道（串行，#51）：cdp_session 坏档 → 关旧重建，后续岗位继续。"""
+        module = load_module()
+        jobs = [{"job_id": "j0", "title": "T0",
+                 "job_link": "https://www.zhipin.com/job_detail/x0.html",
+                 "boss_name": "C"},
+                {"job_id": "j1", "title": "T1",
+                 "job_link": "https://www.zhipin.com/job_detail/x1.html",
+                 "boss_name": "C"}]
+        results_seq = [
+            {"ok": False, "detail": None, "job_id": "j0",
+             "reason": "cdp_session", "message": "ws died"},
+            {"ok": True, "detail": {"job_id": "j1", "title": "T1",
+                                    "jd": "x" * 200},
+             "job_id": "j1", "reason": "", "message": ""},
+        ]
+        calls = []
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            calls.append(dom_session)
+            return results_seq[len(calls) - 1]
+
+        tab1 = [mock.Mock(), "t1", "s1", 0]
+        tab2 = [mock.Mock(), "t2", "s2", 0]
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_dom_tab",
+                                      side_effect=[tab1, tab2]) as open_mock, \
+                    mock.patch.object(module, "_close_api_tab") as close_mock, \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module.scrape_details({"jobs": jobs}, output_path=out,
+                                      cdp_port=9222, concurrency=1,
+                                      detail_channel="dom")
+        self.assertEqual(open_mock.call_count, 2, "坏档后应重建一次")
+        self.assertIs(calls[0], tab1)
+        self.assertIs(calls[1], tab2, "第二岗应使用重建的 tab")
+        close_mock.assert_any_call(tab1)
+        close_mock.assert_any_call(tab2)
+
     def test_parse_detail_api_value_ok(self):
         """详情 API 解析：正常返回 → jd 规范化 + 精简字段集；全角空格清理。"""
         module = load_module()
@@ -4617,7 +4735,7 @@ class BestPracticesBatch3Tests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                     security_id=None, api_session=None, city_code="",
-                     search_keyword="", id_mode="security"):
+                     search_keyword="", id_mode="security", dom_session=None):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}
