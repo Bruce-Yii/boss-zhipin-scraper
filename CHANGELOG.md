@@ -8,6 +8,11 @@
 ### 重构
 - **抽出两个稳定纯逻辑模块**：`scripts/ratelimit.py`（`TokenBucket`/`AdaptiveRateLimiter`）与 `scripts/export_contract.py`（契约/脱敏/口径一/原子写）；主文件顶部兼容 shim 做 re-export，导入面与既有测试不变。`CONTRIBUTING.md`「单文件原则」改写为「模块边界」（编排/CDP/CLI 仍在主文件）。测试 +2（模块 re-export）
 
+### 修复
+- **`incr_request` 加锁**：并发详情路径下每任务调用，加锁避免计数漏加/超发（2026-09-22 审计）。测试 +1
+- **收窄 Chrome `--remote-allow-origins`**：由 `*` 收窄到本机 `localhost/127.0.0.1:<port>`（安全）
+- **复核结论**：`record_counts.duplicate` 的"逐次写盘重复重发量"语义为**刻意设计**（由 `test_flush_jobs_accumulates_record_counts_across_writes` 锁定），审计曾疑其失真，**经复核维持不变**
+
 ### 版本
 - `2.4.0 → 2.5.0`（四处同步）
 

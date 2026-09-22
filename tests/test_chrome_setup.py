@@ -1942,6 +1942,24 @@ class ChromeSetupTests(unittest.TestCase):
                 self.assertEqual(module.cleanup_security_sidecars(), 1)
                 self.assertFalse(os.path.exists(p))
 
+    def test_incr_request_is_thread_safe(self):
+        module = load_module()
+        original = module._request_counter
+        module._request_counter = 0
+        try:
+            def worker():
+                for _ in range(80):
+                    module.incr_request("detail")
+            ts = [threading.Thread(target=worker) for _ in range(5)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            self.assertEqual(module._request_counter, 400,
+                             "并发 incr_request 计数应精确（加锁）")
+        finally:
+            module._request_counter = original
+
     def test_adaptive_limiter_halves_rate_on_high_failure_window(self):
         module = load_module()
         limiter = module.AdaptiveRateLimiter(base_rate=4.0, window=60.0,

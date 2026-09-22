@@ -261,6 +261,7 @@ DEFAULT_LOGIN_TIMEOUT = 300
 
 # 全局请求计数器
 _request_counter = 0
+_request_counter_lock = threading.Lock()  # 并发下保护 _request_counter（2026-09-22 审计修复）
 _live_city_maps_cache = None
 
 # logging 配置移入 main()（if __name__ 守卫内）——模块顶层 basicConfig 会被任何
@@ -404,12 +405,15 @@ def incr_request(kind="list"):
     总量上限语义不变；分账计数供血缘统计与漂移诊断。
     """
     global _request_counter
-    _request_counter += 1
-    _request_budget[kind] = _request_budget.get(kind, 0) + 1
-    if _request_counter > MAX_API_REQUESTS:
+    # 加锁：并发详情路径每任务都会调用，避免计数漏加/超发（2026-09-22 审计修复）
+    with _request_counter_lock:
+        _request_counter += 1
+        _request_budget[kind] = _request_budget.get(kind, 0) + 1
+        n = _request_counter
+    if n > MAX_API_REQUESTS:
         raise RuntimeError(f"已达到单次最大请求数 {MAX_API_REQUESTS}，停止抓取")
-    if _request_counter >= MAX_API_REQUESTS * 0.8:
-        log.warning(f"⚠️ 请求次数接近上限: {_request_counter}/{MAX_API_REQUESTS}")
+    if n >= MAX_API_REQUESTS * 0.8:
+        log.warning(f"⚠️ 请求次数接近上限: {n}/{MAX_API_REQUESTS}")
 
 
 # ============================================================
@@ -4473,7 +4477,7 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
         f"--user-data-dir={cdp_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--remote-allow-origins=*",
+        f"--remote-allow-origins=http://localhost:{cdp_port},http://127.0.0.1:{cdp_port}",
     ]
     launch_chrome(cmd)
 

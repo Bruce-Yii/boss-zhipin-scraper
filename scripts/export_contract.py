@@ -190,6 +190,9 @@ def flush_jobs(path, meta, jobs):
 
     counts = dict(old_counts)
     counts["new"] += new_count
+    # 注：duplicate 语义为"逐次写盘的重复重发量"（write amplification 诊断，
+    # 由 test_flush_jobs_accumulates_record_counts_across_writes 锁定），
+    # 2026-09-22 审计曾疑其失真，经复核认定为**刻意设计**，保持不变。
     counts["duplicate"] += dup_count
     counts["quarantine"] = counts.get("quarantine", 0) + len(quarantine)
     meta["record_counts"] = counts
