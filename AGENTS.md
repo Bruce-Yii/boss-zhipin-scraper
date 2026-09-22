@@ -22,7 +22,9 @@
 ## 目录结构
 
 ```
-scripts/boss_cdp_raw.py   # 核心：抓取 + CLI 主入口（~1900 行，单文件）
+scripts/boss_cdp_raw.py   # 核心：抓取 + CLI 编排（CDP/链路/CLI）
+scripts/ratelimit.py      # 稳定纯逻辑：令牌桶 + 自适应限速（主文件 re-export）
+scripts/export_contract.py# 稳定纯逻辑：契约/脱敏/口径一/原子写（主文件 re-export）
 scripts/job_summary.py    # 抓取结果 → Markdown 求职分析摘要
 data/city_codes.json      # 全量城市码表（300+ 城市，外置；见下）
 tests/test_chrome_setup.py    # unittest，全 mock，不依赖真实 Chrome/网络
@@ -32,7 +34,7 @@ requirements.txt          # 仅 requests + websocket-client
 SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 ```
 
-**重要边界：核心逻辑都放 `scripts/boss_cdp_raw.py`，不要随手新建文件**（见 `CONTRIBUTING.md`「单文件原则」）。`docs/` 被 `.gitignore` 忽略，是本地产物，不要提交。**例外**：`data/city_codes.json` 是城市码表数据（非逻辑代码），外置便于用户查看支持哪些城市；改它要同步跑 `tests.test_chrome_setup` 的城市码表防回归测试。
+**重要边界：核心编排/CDP/CLI 都在 `scripts/boss_cdp_raw.py`；稳定纯逻辑可抽 `scripts/ratelimit.py`、`scripts/export_contract.py`（主文件顶部 re-export，见 `CONTRIBUTING.md`「模块边界」）。**`docs/` 被 `.gitignore` 忽略，是本地产物，不要提交。**例外**：`data/city_codes.json` 是城市码表数据（非逻辑代码），外置便于用户查看支持哪些城市；改它要同步跑 `tests.test_chrome_setup` 的城市码表防回归测试。
 
 ## 环境与命令
 
