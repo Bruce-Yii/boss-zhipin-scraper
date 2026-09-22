@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.13.1"
+__version__ = "2.14.0"
 
 import argparse
 import base64
@@ -133,6 +133,11 @@ DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保�
 DETAIL_API_TAB_BUDGET = 5       # 详情 API 每 tab 预算：实测同一 tab 第 6 次返回 code 37
                                 # （即可用 5 次，2026-09-22 E3 复核），换新 tab 立即重置 → 主动轮换
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
+# DOM 详情通道提速（《DOM 与速度控制专题》落地）：原路径固定 sleep（导航后 5-10s + 3-7 次滚动
+# 各 0.8-5s + 页间 10-25s）→ 实测 ~38s/条，比同行独立详情页（~9.5s/条）慢约 4×。
+# 改为"轮询就绪即返回"+ 轻量滚动 + 缩短页间间隔。
+DETAIL_DOM_READY_TIMEOUT = 12.0       # 等待 JD 区渲染就绪的上限（秒）；就绪立即返回
+DETAIL_DOM_GAP_SECONDS = (4.0, 9.0)   # DOM 详情页间间隔（原 10-25s；就绪等待已保证渲染，间隔只作节奏）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 # FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
 SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
@@ -1142,13 +1147,13 @@ EXTRACT_DETAIL_JS = """
         }
         return false;
     }
-    document.querySelectorAll('.job-tags .tag-all span, .job-keyword-list span').forEach(function(s){
+    document.querySelectorAll('.job-tags .tag-all span, .job-keyword-list span, .job-keyword-list li').forEach(function(s){
         var t = s.innerText.trim();
         if(t && !isBenefit(t)) tags.push(t);
     });
     // 刻意用 innerText（而非 textContent）：跳过 <style>/<script> 源码与 display:none 诱饵文本
     var jd = '';
-    var sections = document.querySelectorAll('.job-detail-section, .job-sec');
+    var sections = document.querySelectorAll('.job-detail-section, .job-sec, .job-detail-body, .job-sec-text');
     for (var i = 0; i < sections.length; i++) {
         var text = (sections[i].innerText || '').trim();
         if (text.indexOf('职位描述') !== -1 && text.length > jd.length) {
@@ -1169,6 +1174,25 @@ EXTRACT_DETAIL_JS = """
         publish_time: publishTime,
         hr_active_time: hrActive
     });
+})()
+"""
+
+# DOM 详情"就绪判定"：JD 区出现即视为渲染完成（替代固定 sleep，提速核心）
+DETAIL_READY_JS = """
+(function(){
+    return document.querySelector(
+        '.job-detail-section, .job-sec, .job-detail-body, .job-sec-text') !== null;
+})()
+"""
+
+# 移除可能遮挡 JD 的弹窗/遮罩（Snseam 手法：dialog-wrap/boss-layer/boss-popup）
+REMOVE_DIALOG_JS = """
+(function(){
+    var sels = ['div.dialog-wrap', '.boss-layer', '.boss-popup'];
+    for (var i = 0; i < sels.length; i++) {
+        document.querySelectorAll(sels[i]).forEach(function(n){ n.remove(); });
+    }
+    return true;
 })()
 """
 
@@ -1357,6 +1381,12 @@ def _is_boss_activity_line(text):
     return text == "在线" or text.endswith("活跃")
 
 
+# HR 活跃度全系文案（专题 #8，zhipin-zhuaqu ACT_RE；不含裸"在线"以免页面误命中）
+_HR_ACTIVE_RE = re.compile(
+    r"(刚刚活跃|今日活跃|\d+日内活跃|本周活跃|\d+周内活跃|"
+    r"\d+个月内活跃|\d+月内活跃|半年前活跃)")
+
+
 def map_list_boss_active_status(job):
     """Map list-API job fields to ``boss_active_status``.
 
@@ -1538,6 +1568,11 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
     hr_active_time = str(extracted.get("hr_active_time") or "").strip()
     if not boss_active_status and _is_boss_activity_line(hr_active_time):
         boss_active_status = hr_active_time
+    # 再兜底：页面全文按 ACT_RE 全系文案匹配（专题 #8；不含裸"在线"防误命中）
+    if not boss_active_status:
+        act_m = _HR_ACTIVE_RE.search(page_text)
+        if act_m:
+            boss_active_status = act_m.group(1)
     # 相对发布时间（div.info-publis>p；仅 DOM 路径，形如"3天前发布"）
     publish_time = _normalize_detail_whitespace(
         str(extracted.get("publish_time") or "")).strip()
@@ -3200,7 +3235,7 @@ def eval_detail_with_retry(ws, sid, detail_url, retries=1):
             break
         print("  ⚠️ 提取为空，刷新页面重试一次...")
         ws.send("Page.navigate", {"url": detail_url}, sid)
-        time.sleep(random.uniform(5, 10))
+        time.sleep(random.uniform(2, 4))
         d = _extract_once()
     return d
 
@@ -3849,6 +3884,30 @@ def progress_line(completed, total, ok_count):
 # 由文件顶部导入兼容层 re-export（见 P1 架构重构 2026-09-22）。
 
 
+def _wait_for_detail_ready(ws, sid, timeout=DETAIL_DOM_READY_TIMEOUT, poll=0.4):
+    """轮询等待详情页 JD 区渲染就绪（就绪即返回 True；超时返回 False）。
+
+    DOM 详情提速核心：替代原来"导航后固定 sleep 5-10s"——绝大多数页面 1-3s 就绪。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if ws.eval_js(DETAIL_READY_JS, sid):
+                return True
+        except _cdp_exception_types():
+            return False
+        time.sleep(poll)
+    return False
+
+
+def _dismiss_dialogs(ws, sid):
+    """移除可能遮挡 JD 的弹窗/遮罩（dialog-wrap/boss-layer/boss-popup，Snseam 手法）。"""
+    try:
+        ws.eval_js(REMOVE_DIALOG_JS, sid)
+    except _cdp_exception_types():
+        log.debug("dialog 清理失败", exc_info=True)
+
+
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                        limiter=None, verbose=False, security_id=None,
                        api_session=None, city_code="", search_keyword=""):
@@ -3899,7 +3958,11 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         ws.send("Page.navigate", {"url": detail_url}, sid)
         if verbose:
             print("  加载页面...")
-        time.sleep(random.uniform(5, 10))
+        # 就绪等待（替代固定 sleep 5-10s）：JD 区出现即继续；就绪后先清弹窗遮罩
+        ready = _wait_for_detail_ready(ws, sid)
+        _dismiss_dialogs(ws, sid)
+        if verbose:
+            print(f"  就绪={'是' if ready else '超时'}，抽取中...")
 
         # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入
         is_risk, risk_reason = classify_risk_page(probe_risk_page(ws, sid))
@@ -3907,32 +3970,26 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "risk_timeout", "message": risk_reason}
 
-        # 模拟人类阅读详情页的滚动行为
-        scroll_count = random.randint(3, 7)
+        # 轻量滚动（提速：1-2 次、0.3-0.9s；就绪等待已保证内容渲染，滚动仅作拟人）
+        scroll_count = random.randint(1, 2)
         if verbose:
             print(f"  模拟滚动 ({scroll_count} 次)...")
         for _ in range(scroll_count):
             if stop_event is not None and stop_event.is_set():
                 return {"ok": False, "detail": None, "job_id": job_id,
                         "reason": "stopped", "message": "已收到停止信号"}
-            if random.random() < 0.12:
-                delta = -random.randint(80, 200)
-            else:
-                delta = random.randint(200, 600)
+            delta = random.randint(200, 500)
             ws.eval_js(f"window.scrollBy(0,{delta})", sid)
-            if random.random() < 0.35:
-                time.sleep(random.uniform(2.0, 5.0))
-            else:
-                time.sleep(random.uniform(0.8, 1.8))
+            time.sleep(random.uniform(0.3, 0.9))
 
-        # 偶尔模拟鼠标移动
+        # 偶尔模拟鼠标移动（保留但缩短）
         if random.random() < 0.5:
             ws.send("Input.dispatchMouseEvent", {
                 "type": "mouseMoved",
                 "x": random.randint(200, 800),
                 "y": random.randint(200, 600)
             }, sid)
-            time.sleep(random.uniform(0.5, 1.5))
+            time.sleep(random.uniform(0.3, 0.8))
 
         d = eval_detail_with_retry(ws, sid, detail_url)
         try:
@@ -4272,12 +4329,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
                     save_pending_ids(output_path, pending)
 
         # 详情页间隔：API 通道用 burst-aware 串行节律（全局 ~0.44 req/s，全行
-        # 安全区）；DOM 通道沿用 10-25s。
+        # 安全区）；DOM 通道用 DETAIL_DOM_GAP_SECONDS（4-9s，就绪等待已保证渲染）。
         if detail_throttle is not None:
             print("  API 通道节律等待中...\n")
             detail_throttle.acquire()
         else:
-            gap = random.uniform(10, 25)
+            gap = random.uniform(*DETAIL_DOM_GAP_SECONDS)
             print(f"  等待 {gap:.0f}s 后抓下一个...\n")
             time.sleep(gap)
         progress = progress_line(idx + 1, len(jobs), serial_ok)

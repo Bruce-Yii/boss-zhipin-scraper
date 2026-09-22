@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.13（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.14（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.13.1-orange.svg)
+![Version](https://img.shields.io/badge/version-2.14.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -308,7 +308,7 @@ boss-zhipin-scraper/
 
 默认不会使用 DOM 提取列表，因为 DOM 薪资可能受字体反爬影响。只有明确传 `--allow-dom-fallback` 时，API 无数据才会降级 DOM。
 
-详情页只从包含“职位描述”的详情区提取 JD，整页 `body` 仅用于识别登录墙和导航页，不会直接写入结果。抽取时用 innerText 规避 `<style>`/隐藏诱饵文本，并逐行剥离“举报/微信扫码分享/去APP”等页面 UI 噪声行。若页面出现“登录查看完整内容”，抓取会明确报错并停止，避免把截断正文、招聘者信息、公司介绍和推荐职位当成完整 JD 保存。
+详情页只从包含“职位描述”的详情区提取 JD，整页 `body` 仅用于识别登录墙和导航页，不会直接写入结果。抽取时用 innerText 规避 `<style>`/隐藏诱饵文本，并逐行剥离“举报/微信扫码分享/去APP”等页面 UI 噪声行。DOM 回退通道已提速：JD 区**就绪即返回**（替代固定等待）+ 选择器兜底 + 弹窗清理，单条约 **38s → ~8–14s**。若页面出现“登录查看完整内容”，抓取会明确报错并停止，避免把截断正文、招聘者信息、公司介绍和推荐职位当成完整 JD 保存。
 
 `--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。
 

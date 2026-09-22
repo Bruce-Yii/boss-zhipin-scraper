@@ -4917,6 +4917,58 @@ def _normalize_version(raw):
     return f"{major}.{minor}"
 
 
+class DomSpeedupTests(unittest.TestCase):
+    """DOM 详情提速（专题落地）：就绪轮询 / dialog 清理 / 选择器兜底 / ACT_RE / 页间隔。"""
+
+    def test_wait_for_detail_ready_returns_true_when_ready(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.side_effect = [False, False, True]
+        with mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module, "DETAIL_DOM_READY_TIMEOUT", 5.0):
+            self.assertTrue(module._wait_for_detail_ready(ws, "s", poll=0.0))
+
+    def test_wait_for_detail_ready_timeout_returns_false(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = False
+        with mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module, "DETAIL_DOM_READY_TIMEOUT", 0.0):
+            self.assertFalse(module._wait_for_detail_ready(ws, "s"))
+
+    def test_dismiss_dialogs_calls_remove_js(self):
+        module = load_module()
+        ws = mock.Mock()
+        module._dismiss_dialogs(ws, "s")
+        ws.eval_js.assert_called_once()
+        self.assertEqual(ws.eval_js.call_args.args[0], module.REMOVE_DIALOG_JS)
+
+    def test_dom_js_expose_selector_fallbacks(self):
+        module = load_module()
+        self.assertIn(".job-detail-body", module.EXTRACT_DETAIL_JS)
+        self.assertIn(".job-sec-text", module.EXTRACT_DETAIL_JS)
+        self.assertIn(".job-keyword-list li", module.EXTRACT_DETAIL_JS)
+        self.assertIn(".job-detail-body", module.DETAIL_READY_JS)
+        for sel in ("dialog-wrap", "boss-layer", "boss-popup"):
+            self.assertIn(sel, module.REMOVE_DIALOG_JS)
+
+    def test_dom_gap_reduced_from_legacy(self):
+        module = load_module()
+        lo, hi = module.DETAIL_DOM_GAP_SECONDS
+        self.assertLessEqual(hi, 10.0, "DOM 页间间隔应从 10-25s 降到 ≤10s")
+        self.assertGreater(lo, 0)
+
+    def test_extract_detail_fields_act_re_fallback(self):
+        """footer/选择器都没取到活跃度时，用 ACT_RE 全系文案兜底。"""
+        module = load_module()
+        description = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        fields = module.extract_detail_fields({
+            "jd": f"职位描述\n{description}",
+            "page_text": f"{description}招聘者 3周内活跃 某公司",
+        })
+        self.assertEqual(fields["boss_active_status"], "3周内活跃")
+
+
 class MultiKeywordTests(unittest.TestCase):
     """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
 

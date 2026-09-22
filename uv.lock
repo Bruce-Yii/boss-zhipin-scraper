@@ -12,7 +12,7 @@ resolution-markers = [
 
 [[package]]
 name = "boss-zhipin-scraper"
-version = "2.13.1"
+version = "2.14.0"
 source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
