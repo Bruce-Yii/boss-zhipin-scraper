@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.12（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.13（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.12.1-orange.svg)
+![Version](https://img.shields.io/badge/version-2.13.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -165,7 +165,7 @@ python3 scripts/job_summary.py --top 15
 
 | 参数 | 说明 |
 |------|------|
-| `--keyword` | 搜索关键词（默认 "AI Agent"） |
+| `--keyword` | 搜索关键词（默认 "AI Agent"）；支持逗号分隔多关键词，依次抓取并按 job_id 自动合并（如 `"Java 后端,Java 风控"`） |
 | `--city` | 城市（中文或 9 位代码，默认上海）。**支持全国城市**（一二三四五线全覆盖，共 300+ 个），运行时自动从 BOSS 同步最新城市码；码表见 [`data/city_codes.json`](data/city_codes.json)，或用 `--list-cities` 查看。本地及在线码表均无法识别的城市名会报错退出，避免静默得到 0 条结果 |
 | `--list-cities [关键词]` | 打印支持的城市列表，可选关键词过滤，如 `--list-cities 江` |
 | `--pages` | 页数（上限 10） |
