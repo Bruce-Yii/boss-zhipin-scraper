@@ -38,7 +38,7 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 
 ## 环境与命令
 
-- Python **>=3.10**，依赖见 `requirements.txt`（requests + websocket-client + pandas + matplotlib；依赖按需引入，不再设"零依赖"约束）。用项目里的 `.venv`（`source .venv/bin/activate`），别用 pyenv 全局解释器（会缺依赖报错）。
+- Python **>=3.12**，依赖见 `requirements.txt`（requests + websocket-client + pandas + matplotlib；依赖按需引入，不再设"零依赖"约束）。用项目里的 `.venv`（`source .venv/bin/activate`），别用 pyenv 全局解释器（会缺依赖报错）。
 - 包管理用 `uv`（仓库有 `uv.lock`），也可 `pip install -r requirements.txt`。
 - 跑测试：`python3 -m unittest tests.test_chrome_setup`（无需 Chrome / 联网，全 mock）。改了 `job_summary` 再加跑 `tests.test_job_summary`。
 - 语法自检：`python3 -m py_compile scripts/boss_cdp_raw.py`。

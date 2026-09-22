@@ -20,7 +20,7 @@ pip install -r requirements.txt          # 或 uv sync
 python3 -m unittest tests.test_chrome_setup   # 跑测试，确保全绿
 ```
 
-要求 Python 3.10+，运行依赖 `requests`、`websocket-client`（抓取）与 `pandas`、`matplotlib`（`boss-summary` 摘要/图表）。
+要求 Python 3.12+，运行依赖 `requests`、`websocket-client`（抓取）与 `pandas`、`matplotlib`（`boss-summary` 摘要/图表）。
 
 ## 代码规范
 

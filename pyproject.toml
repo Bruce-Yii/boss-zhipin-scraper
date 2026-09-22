@@ -4,7 +4,7 @@ version = "2.5.0"
 description = "BOSS直聘职位抓取工具 — Chrome CDP + API 明文薪资"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "eatmoreduck" }
 ]
@@ -28,8 +28,7 @@ all = [
 ]
 dev = [
     "ruff==0.16.4",
-    # [toml] extra：Python 3.10 无内置 tomllib，需 tomli 才能读 [tool.coverage]
-    "coverage[toml]>=7.4",
+    "coverage>=7.4",
 ]
 
 [project.scripts]
@@ -49,7 +48,7 @@ force-include = { "data/city_codes.json" = "data/city_codes.json" }
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

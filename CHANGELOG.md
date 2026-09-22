@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### 变更
+- **收窄 Python 支持到 3.12**（个人自用）：`requires-python >=3.12`；CI 矩阵去除 3.10；`coverage[toml]` extra 不再需要（3.12 自带 `tomllib`）；ruff `target-version → py312`；文档/徽章同步 3.12+
+
 ### 工程 / CI
 - **CI 固定 ruff 版本**（`requirements-dev.txt` 钉 `ruff==0.16.4`），避免规则漂移
 - **CI 覆盖率门禁**：`coverage report --fail-under=70`（当前约 74%）

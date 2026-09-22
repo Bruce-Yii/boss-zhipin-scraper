@@ -17,7 +17,7 @@ metadata:
 ## 前置条件
 
 - Chrome 浏览器已安装
-- Python 3.10+
+- Python 3.12+
 - 用户已登录 zhipin.com（或愿意手动登录）
 
 ## 脚本位置
