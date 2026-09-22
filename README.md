@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.2（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.5（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
-![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
+![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.2.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.5.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -42,9 +42,10 @@ python3 scripts/boss_cdp_raw.py --list-cities 江
 
 # 4. 抓取后生成聚合摘要 + 提示词（默认读取最新结果）
 python3 scripts/job_summary.py
+# 摘要默认同时生成薪资图表（PNG，输出到结果目录 charts/），可用 --no-charts 关闭
 ```
 
-抓完直接拿到：薪资分布、经验要求、高频技能词、求职材料优化提示词。提示词只基于岗位数据，不读取本地简历文件，也不给岗位算个人匹配分。
+抓完直接拿到：薪资分布、经验要求、高频技能词、薪资图表、求职材料优化提示词。提示词只基于岗位数据，不读取本地简历文件，也不给岗位算个人匹配分。统计口径：中位数（偶数样本取两中位均值）、区间 P10/P90 分位、可解析样本 <30 时输出样本量警示。
 
 ## ✨ 特性
 
@@ -160,13 +161,21 @@ python3 scripts/job_summary.py --top 15
 | `--city` | 城市（中文或 9 位代码，默认上海）。**支持全国城市**（一二三四五线全覆盖，共 300+ 个），运行时自动从 BOSS 同步最新城市码；码表见 [`data/city_codes.json`](data/city_codes.json)，或用 `--list-cities` 查看。本地及在线码表均无法识别的城市名会报错退出，避免静默得到 0 条结果 |
 | `--list-cities [关键词]` | 打印支持的城市列表，可选关键词过滤，如 `--list-cities 江` |
 | `--pages` | 页数（上限 10） |
+| `--max-jobs` | 列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超上限；不设则按 `--pages` 抓满） |
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
+| `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
+| `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
+| `--status` | 状态总览（运行态 + 缓存态，接管用；**不发请求**，登录态仍需 `--check`） |
+| `--verify` | 校验已抓取结果文件完整性（列表/详情可解析、字段齐全、JD 完整、覆盖率；只校验不抓取，不依赖 Chrome） |
+| `--list-results` | 列出结果目录中的历史抓取结果文件（分类 + 时间 + 大小） |
+| `--archive [KEEP]` | 归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 `archive/` 子目录；pending 活动文件不归档 |
+| `--batch CONFIG.json` | 批量抓取（**默认列表 + 详情**）：配置文件为 JSON 数组，每个元素一个任务（keyword 必填；city/pages/sleep/detail/筛选字段可选），逐任务执行、任务间自动等待防风控；`--no-detail` 或任务级 `detail:false` 可仅列表 |
 | `--smoke-test` | 用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test，不写结果文件 |
 | `--setup-chrome` | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile（默认、首次启动、重复启动都不复制） |
@@ -175,14 +184,63 @@ python3 scripts/job_summary.py --top 15
 | `--login-timeout` | `--setup-chrome` 等待登录完成的秒数（默认 300） |
 | `--stop-chrome` | 关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不碰主 Chrome） |
 | `--close-chrome` | 抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态） |
+| `-v, --verbose` | 输出 DEBUG 级别日志（可叠加 `-vv`；调试 CDP 消息、探测详情等） |
+| `-q, --quiet` | 静默模式：日志降到 WARNING 级别（结果行/EXPORT 行仍输出 stdout） |
 | `--output` | 列表输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
 | `--detail-output` | 详情输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
-| `--cdp-port` | CDP 端口（默认 9222） |
+| `--cdp-port` | CDP 端口（默认 45222——固定高位端口，绕开 BOSS 安全 JS 扫描的 9222/9223/9229） |
 | `--scale/--salary/--experience/--degree` | 筛选条件 |
+
+### 退出码
+
+| 码 | 含义 |
+|----|------|
+| 0 | 成功 |
+| 1 | 运行期错误（登录失败/风控/未预期异常——干净错误消息，无 traceback） |
+| 2 | CLI 误用（未知参数/非法值/冲突命令，argparse 默认） |
+| 130 | 用户 Ctrl+C 中断（128+signal 约定） |
+
+### 告警推送
+
+异常时通过 Worker 端点推送告警（飞书卡片等下游通道由端点侧配置）：风控/验证码全停（`EXPORT_FAIL reason=risk_blocked`）、**登录失效**（`EXPORT_FAIL reason=login_failed`）、详情验证码全停（`warnings: detail_risk_blocked`）。
+
+- 配置：项目根目录 `.env`（gitignore 排除，不入仓库）——`ALERT_WEBHOOK_URL=<端点地址>`、`ALERT_WEBHOOK_TOKEN=<Bearer token>`
+- 未配置或网络失败时静默跳过，不影响抓取主流程（失败仅记日志）
+
+## 导出契约 v2
+
+列表 JSON 为下游程序提供稳定契约（供 ai-pm-job-intel 等系统消费）：
+
+```json
+{
+  "format_version": 2,
+  "keyword": "AI产品经理", "city": "上海",
+  "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
+  "jobs": [
+    {"job_id": "...", "title": "...", "location": "...", "job_link": "...",
+     "company_name": "...", "salary": "25-35K", "experience": "3-5年",
+     "education": "本科", "skills": ["大模型", "Agent"], "...": "..."}
+  ]
+}
+```
+
+- `format_version` 递增表示契约变更；`warnings` 记录采集异常（API 空数据/风控）
+- 必填字段：`job_id`/`title`/`location`/`job_link`/`company_name`；导出前自动过滤敏感字段（凭据不落文件）
+- 可选字段（列表抓取时）：`exhausted`（bool，本 run 是否翻到底：任一副页返回 <30 条 → true；`--pages 1` 单页 <30 条 → true；满页未到底 → false。规格侧抽样感知下架判定依据；随契约 v2 正式纳入，字段缺失按 false 处理）、`anonymous`（匿名岗位标记 0/1——招聘方隐藏公司名）、`job_valid_status`（BOSS 官方在招状态，可校准下架推断）、`icon_flags`/`icon_word`（"急"/"新"等平台标签）、`proxy_job`/`proxy_type`（代招标记：猎头/外包）、`job_type`（岗位类型编码）
+- 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）
+- **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；每 tab 约 4-5 次配额，程序自动轮换 tab；`--input` 补抓老文件时自动回退 DOM 渲染
+- **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
+- **显式双通道**（2026-09-22）：详情抓取在 meta 记 `detail_channel`（`api`/`dom`/`mixed`）——有 `securityId` 走 API 快通道、否则 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则 DOM 并**明确告警**
+- **securityId 受限 sidecar**（2026-09-22，红线例外）：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、60 分钟 TTL、run 结束即删；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
+- 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词
 
-`scripts/job_summary.py` 只读取已抓取的 `boss_jobs_*.json` 和 `boss_details_*.json`，做简单聚合分析并生成一段可复制提示词。它不读取本地简历文件，不引入 PDF 依赖，也不给个人与岗位做分数判断。
+`scripts/job_summary.py` 只读取已抓取的 `boss_jobs_*.json` 和 `boss_details_*.json`，做**可靠聚合统计**（薪资行情/经验薪资/高薪岗位榜/经验/学历/地区/公司/规模/融资阶段/技能标签）并生成一段可复制提示词。**自动剔除疑似销售岗**（关键词模糊匹配混入的非目标岗位：title 含"销售/BD/客户经理"等强特征，或 JD 含"提成/业绩指标/回款"等强特征；产品岗 JD 的"销售"单字不误伤），剔除数在摘要中标注。它不读取本地简历文件，不引入 PDF 依赖，也不给个人与岗位做分数判断。
+
+> 设计分工：脚本只做"数字类"统计（100% 准确），**语义分析交给 AI agent**——提示词会引用完整列表/详情数据文件路径，agent 可读取完整 JD 做深度调研（高薪岗位技能画像、岗位类型聚类、求职策略等）。
+>
+> **筛选环节**：`经验薪资` 一行回答"我这个经验水平大概什么价位"（如 3-5年 中位 25K）；`高薪岗位` 榜单直接列出薪资上限 TOP 岗位（含公司/地区），快速定位"值得投的"。
 
 ```bash
 # 读取默认结果目录下最新的 boss_jobs_*.json，并自动匹配同时间戳或最新详情文件

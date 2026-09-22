@@ -1,10 +1,10 @@
 [project]
 name = "boss-zhipin-scraper"
-version = "2.2.0"
+version = "2.5.0"
 description = "BOSS直聘职位抓取工具 — Chrome CDP + API 明文薪资"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "eatmoreduck" }
 ]
@@ -13,12 +13,22 @@ keywords = ["zhipin", "boss", "scraper", "cdp", "jobs"]
 dependencies = [
     "websocket-client>=1.6.0,<2.0.0",
     "requests>=2.28.0,<3.0.0",
+    # job_summary 入口（boss-summary）在顶层导入 pandas/matplotlib 生成图表；
+    # 缺任一都会 ModuleNotFoundError，故列入运行时依赖（与 requirements.txt 对齐）。
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
 ]
 
 [project.optional-dependencies]
 all = [
     "websocket-client>=1.6.0,<2.0.0",
     "requests>=2.28.0,<3.0.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+]
+dev = [
+    "ruff==0.16.4",
+    "coverage>=7.4",
 ]
 
 [project.scripts]
@@ -35,3 +45,20 @@ build-backend = "hatchling.build"
 packages = ["scripts"]
 # 城市码表 data/city_codes.json 打进 wheel，pip install 后也能读到（见 issue #24）
 force-include = { "data/city_codes.json" = "data/city_codes.json" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+source = ["scripts"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]

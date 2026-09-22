@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.2 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.5 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
-![Python](https://img.shields.io/badge/python-3.10+-blue.svg)
+![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.2.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.5.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -158,13 +158,21 @@ python3 scripts/job_summary.py --top 15
 | `--city` | City (Chinese name or 9-digit code, default Shanghai). **Supports cities nationwide** (300+, incl. tier-3/4/5); city codes auto-sync from BOSS at runtime. See [`data/city_codes.json`](data/city_codes.json), or run `--list-cities`. An unrecognized city name now exits with an error instead of silently producing zero results |
 | `--list-cities [keyword]` | Print the supported city list, optional keyword filter, e.g. `--list-cities 江` |
 | `--pages` | Number of pages (max 10) |
+| `--max-jobs` | List size cap; stops as soon as reached (BOSS returns 30 per page, so actual count may slightly exceed the cap; unset = scrape all `--pages`) |
 | `--format` | json / csv; csv also exports list and detail CSVs |
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
+| `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors). **The API channel reuses a shared tab pool** and paces about 15s per worker (`DETAIL_API_PACE_SECONDS`), i.e. about N/15 requests per second at concurrency N |
+| `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
 | `--check` | Environment check (CDP + deps + login state) |
+| `--status` | Status overview (runtime + cache, for takeover; **no requests**; login still needs `--check`) |
+| `--verify` | Verify scraped result files (list/detail parseability, required fields, JD completeness, coverage; verification only, no scraping, no Chrome needed) |
+| `--list-results` | List historical result files in the result dir (kind + time + size) |
+| `--archive [KEEP]` | Archive historical results: keep the newest KEEP files per kind (default 1), move the rest into `archive/`; active pending files are never archived |
+| `--batch CONFIG.json` | Batch scraping (**list + details by default**): config is a JSON array, one task per element (keyword required; city/pages/sleep/detail/filter fields optional), runs tasks sequentially with anti-risk gaps; `--no-detail` or per-task `detail:false` for list only |
 | `--smoke-test` | Run one real Chrome/CDP BOSS search API smoke test, writes no result files |
 | `--setup-chrome` | One-shot launch of Chrome CDP (persistent isolated profile) |
 | `--copy-login-state` | Manually import the main Chrome's Local State + cookie-related files into the isolated profile (never copied by default, on first run, or on repeated runs) |
@@ -173,14 +181,63 @@ python3 scripts/job_summary.py --top 15
 | `--login-timeout` | Seconds to wait for login under `--setup-chrome` (default 300) |
 | `--stop-chrome` | Close the dedicated BOSS CDP Chrome (matched precisely by the isolated profile; never touches your main Chrome) |
 | `--close-chrome` | Auto-close the dedicated Chrome after a scrape finishes normally (off by default; not triggered on errors, so the login state is kept) |
+| `-v, --verbose` | Print DEBUG-level logs (stackable: `-vv`; CDP messages, probe details, etc.) |
+| `-q, --quiet` | Quiet mode: logs drop to WARNING (result/EXPORT lines still go to stdout) |
 | `--output` | List output path (default `~/.boss-zhipin-scraper/job-result/`) |
 | `--detail-output` | Detail output path (default `~/.boss-zhipin-scraper/job-result/`) |
-| `--cdp-port` | CDP port (default 9222) |
+| `--cdp-port` | CDP port (default 45222 — fixed high port, bypasses the 9222/9223/9229 ports scanned by BOSS security JS) |
 | `--scale/--salary/--experience/--degree` | Filters |
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Runtime error (login failure / risk block / unexpected exception — clean message, no traceback) |
+| 2 | CLI misuse (unknown argument / invalid value / conflicting commands, argparse default) |
+| 130 | Interrupted by user Ctrl+C (128+signal convention) |
+
+### Alert Push
+
+On anomalies, alerts are pushed via a Worker endpoint (downstream channels such as Feishu cards are configured by the endpoint side): risk/captcha full-stop (`EXPORT_FAIL reason=risk_blocked`), **login failure** (`EXPORT_FAIL reason=login_failed`), detail captcha full-stop (`warnings: detail_risk_blocked`).
+
+- Configure in the project root `.env` (gitignored, not committed): `ALERT_WEBHOOK_URL=<endpoint URL>`, `ALERT_WEBHOOK_TOKEN=<Bearer token>`
+- Silent skip if unconfigured or on network failure (logged only); never blocks the scrape flow
+
+## Export Contract v2
+
+The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-job-intel):
+
+```json
+{
+  "format_version": 2,
+  "keyword": "AI产品经理", "city": "上海",
+  "page_count": 5, "job_count": 128, "warnings": ["第3页API未返回数据，已刷新重试"],
+  "jobs": [
+    {"job_id": "...", "title": "...", "location": "...", "job_link": "...",
+     "company_name": "...", "salary": "25-35K", "experience": "3-5年",
+     "education": "本科", "skills": ["大模型", "Agent"], "...": "..."}
+  ]
+}
+```
+
+- `format_version` increments on contract changes; `warnings` records scrape anomalies (empty API responses / risk blocks)
+- Required fields: `job_id`/`title`/`location`/`job_link`/`company_name`; sensitive fields are stripped before writing (credentials never land in files)
+- Optional (list scraping): `exhausted` (bool — whether this run reached the end of the result set: any page returning <30 items → true; `--pages 1` with <30 items → true; full pages without reaching the end → false. Basis for the spec-side sampling-aware de-listing; formally included in contract v2; missing field treated as false), `anonymous` (anonymous-posting flag 0/1 — recruiter hides the company name), `job_valid_status` (BOSS's official in-recruitment status, can calibrate de-listing inference), `icon_flags`/`icon_word` (platform labels such as "urgent"/"new"), `proxy_job`/`proxy_type` (proxy-hiring markers: headhunter/outsourcing), `job_type` (job type code)
+- Optional (detail scraping): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — DOM path only, unavailable via the API channel), `job_status_desc` (job status description), `brand_introduce` (company intro), `brand_stage_name`/`brand_scale_name`/`brand_industry_name` (company semantic dimensions)
+- **Detail scraping uses the API channel** (2026-08-14): one lightweight request per job (`/wapi/zpgeek/job/detail.json`) instead of full-page rendering — JD returns in ~0s; `securityId` is passed in-process from the list stage (never written to export files, red line preserved); each tab allows ~4-5 requests and the program rotates tabs automatically; `--input` backfill of old files automatically falls back to DOM rendering
+- **Mode 1 (default): jd merged into the export, jobs without JD are dropped** (2026-09-22): every job carries `jd` inline; JD-less jobs are removed (meta records `jd_coverage` and `dropped_no_jd`); `--keep-without-jd` keeps them with a marker
+- **Explicit dual-channel** (2026-09-22): the detail phase records `detail_channel` in meta (`api`/`dom`/`mixed`) — API fast path when `securityId` is available, otherwise the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it falls back to DOM **with an explicit warning**
+- **securityId restricted sidecar** (2026-09-22, red-line exception): stored under `~/.boss-zhipin-scraper/.session/` (outside the repo), `chmod 600`, 60-min TTL, deleted on normal finish; **never enters exports/logs/git**; the login cookie is never persisted. See `AGENTS.md`/`CONTRIBUTING.md`
+- On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)
 
 ## Post-Scrape Summary & Prompt
 
-`scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, does simple aggregation, and produces a copy-paste prompt. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
+`scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, computes **reliable aggregate stats** (salary market / salary-by-experience / top-salary ranking / experience / degree / district / company / scale / stage / skill tags) and produces a copy-paste prompt. **Suspected sales jobs are auto-filtered** (non-target roles mixed in by BOSS's fuzzy keyword matching: strong title markers like "sales/BD/account manager", or strong JD markers like "commission/revenue target/collection"; a lone "sales" word in a PM JD is not flagged), with the filtered count annotated in the summary. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
+
+> Design split: the script only computes number-based stats (100% accurate); **semantic analysis is left to the AI agent** — the prompt references the full list/detail data file paths so the agent can read the complete JDs for deep research (skill profile of high-paying jobs, job-type clustering, job-search strategy, etc.).
+>
+> **Screening stage**: the `salary-by-experience` line answers "what is my experience level worth" (e.g. 3-5 yrs median 25K); the `top-salary` ranking lists the highest-paying jobs with company & district for quick shortlisting.
 
 ```bash
 # Read the newest boss_jobs_*.json under the default result dir and auto-match the same-timestamp or newest detail file

@@ -20,13 +20,13 @@ pip install -r requirements.txt          # 或 uv sync
 python3 -m unittest tests.test_chrome_setup   # 跑测试，确保全绿
 ```
 
-要求 Python 3.10+，依赖只有 `requests` 和 `websocket-client`。
+要求 Python 3.12+，运行依赖 `requests`、`websocket-client`（抓取）与 `pandas`、`matplotlib`（`boss-summary` 摘要/图表）。
 
 ## 代码规范
 
 - **风格**：遵循 [PEP 8](https://peps.python.org/pep-0008/)，用 4 空格缩进、UTF-8、LF 换行。
 - **异常处理**：不要用 bare `except:`，必须捕获具体异常类型（`requests.ConnectionError`、`json.JSONDecodeError` 等），项目现有的代码就是这么做的，请保持一致。
-- **单文件原则**：核心逻辑都在 `scripts/boss_cdp_raw.py`，新增小工具函数也放这里，不要随手建新文件。
+- **模块边界**：核心编排、CDP 会话与 CLI 仍在 `scripts/boss_cdp_raw.py`。已抽出的**稳定纯逻辑**模块为 `scripts/ratelimit.py`（令牌桶/自适应限速）与 `scripts/export_contract.py`（契约/脱敏/口径一/原子写）；新增代码优先放主文件，确有必要再按同一标准（纯逻辑、无 CDP 依赖、由主文件 re-export）增模块，不要随手建文件。
 - **注释**：复杂逻辑要写注释（参考 `human_scroll` 的做法）；公开函数补 docstring。
 
 ## 测试要求

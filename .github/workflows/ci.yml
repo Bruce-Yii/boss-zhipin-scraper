@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# 连推时取消旧 run（每 run 4 job 矩阵，旧 run 排队纯浪费）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff, 版本固定于 requirements-dev.txt)
+        run: ruff check scripts tests
+
+      - name: Unit tests + coverage gate
+        run: |
+          coverage run --source=scripts -m unittest discover -s tests
+          coverage report --fail-under=70
+
+      - name: Syntax check
+        run: python -m py_compile scripts/boss_cdp_raw.py scripts/job_summary.py
+
+  package-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build wheel & smoke-test entry points
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          pip install dist/*.whl
+          boss-scraper --version
+          boss-summary --help
+
+  contract-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 双端契约一致校验（消费端校验器 vendor 副本）
+        run: |
+          out=$(python tests/fixtures/consumer_validator/scripts/validate_export.py tests/fixtures/sample_export_v2.json)
+          echo "$out"
+          echo "$out" | grep -q "validator=v2.0.0" || { echo "FAIL: 校验器版本不匹配（需与 ai-pm-job-intel 对齐）"; exit 1; }
+          echo "$out" | grep -q "ok=True" || { echo "FAIL: 样例未通过消费端契约校验"; exit 1; }

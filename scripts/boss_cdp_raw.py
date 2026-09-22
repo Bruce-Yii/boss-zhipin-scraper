@@ -19,49 +19,96 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.2.0"
+__version__ = "2.5.0"
 
-import json
-import time
-import random
-import sys
 import argparse
-import os
-import re
-import hashlib
 import csv
 import glob
+import hashlib
+import json
+import logging
+import math
+import ntpath
+import os
 import platform
-import subprocess
+import queue
+import random
+import re
 import shutil
 import signal
-import logging
-import ntpath
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
-from collections import Counter
 from enum import Enum
-from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
-from urllib.request import Request, urlopen
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 websocket = None
 requests = None
+
+# ============================================================
+# 抽出模块的导入兼容层（P1 架构重构 2026-09-22）
+# 主文件对 scripts/*.py 子模块做 re-export，保持 scripts.boss_cdp_raw.X 导入面；
+# 按路径加载（测试 spec_from_file_location / 直接运行脚本）时 scripts 非包 →
+# 回退同目录 import。
+# ============================================================
+try:
+    from scripts import ratelimit as _ratelimit
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import ratelimit as _ratelimit
+
+TokenBucket = _ratelimit.TokenBucket
+AdaptiveRateLimiter = _ratelimit.AdaptiveRateLimiter
+DETAIL_API_PACE_SECONDS = _ratelimit.DETAIL_API_PACE_SECONDS
+
+try:
+    from scripts import export_contract as _export_contract
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import export_contract as _export_contract
+
+FORMAT_VERSION = _export_contract.FORMAT_VERSION
+_scrub_secrets = _export_contract._scrub_secrets
+_sanitize_job = _export_contract._sanitize_job
+_missing_required_fields = _export_contract._missing_required_fields
+merge_unique = _export_contract.merge_unique
+_atomic_write_json = _export_contract._atomic_write_json
+cleanup_stale_tmp_files = _export_contract.cleanup_stale_tmp_files
+flush_jobs = _export_contract.flush_jobs
+_merge_jd_into_export = _export_contract._merge_jd_into_export
 
 # ============================================================
 # 全局常量
 # ============================================================
 
 # CDP 默认端口（可通过 --cdp-port 覆盖）
-DEFAULT_CDP_PORT = 9222
+DEFAULT_CDP_PORT = 45222  # 固定高位端口：绕开 BOSS 安全 JS 扫描名单（9222/9223/9229 实测被扫）
 
 # API 基础路径（便于统一修改）
 API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
+PAGE_SIZE = 30  # BOSS 每页条数（exhausted 翻底判定基准：本页 <PAGE_SIZE 即已到底）
 HOT_CITY_URL = "https://www.zhipin.com/wapi/zpgeek/search/job/hot/city.json"
 CITY_GROUP_URL = "https://www.zhipin.com/wapi/zpCommon/data/cityGroup.json"
 
 # 请求频率保护
 MAX_PAGES = 10          # 单次最大页数
 MAX_API_REQUESTS = 500  # 单次最大 API 请求数
+API_ATTEMPT_LIMIT = 2   # 列表 API 单页最大尝试次数（规格 NFR-3：最多 1 次自动重试）
+MAX_CDP_CONSECUTIVE_ERRORS = 3  # 详情会话连续失败熔断阈值（浏览器会话异常判定）
+CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重开（防"熔断→重启→再熔断"循环）
+CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
+DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
+# DETAIL_API_PACE_SECONDS 已抽出到 scripts/ratelimit.py（见顶部导入兼容层）
+DETAIL_API_TAB_BUDGET = 4       # 详情 API 每 tab 预算：实测同一 tab 连续约 4-5 次后返回
+                                # code 37，换新 tab 立即重置（2026-09-22 实证）→ 主动轮换支撑批量
+MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
+LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
+# FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
+SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
 
 def get_default_chrome_path():
     system = platform.system()
@@ -110,6 +157,93 @@ DEFAULT_PROFILE_DIR = get_default_profile_dir()
 
 DEFAULT_CDP_DATA_DIR = os.path.expanduser("~/.boss-zhipin-scraper/chrome-profile")
 DEFAULT_RESULT_DIR = os.path.expanduser("~/.boss-zhipin-scraper/job-result")
+
+# ============================================================
+# securityId 受限 sidecar（P1 双通道策略；红线例外，严格约束）
+# 仅 securityId（每岗短期接口令牌，**非登录凭据**）允许落盘，且：仓库外 +
+# 600 权限 + 短 TTL + run 结束即删 + 绝不进导出/日志/git。登录 cookie 绝不落盘。
+# ============================================================
+SECURITY_SIDECAR_DIR = os.path.expanduser("~/.boss-zhipin-scraper/.session")
+SECURITY_SIDECAR_TTL_SECONDS = 3600
+
+
+def security_sidecar_path(list_path):
+    """sidecar 路径：<SECURITY_SIDECAR_DIR>/<列表文件名>.security.json。"""
+    base = os.path.basename(list_path or "list.json")
+    return os.path.join(SECURITY_SIDECAR_DIR, base + ".security.json")
+
+
+def write_security_sidecar(list_path, security_map):
+    """把 securityId 映射落到受限 sidecar（仓库外/600/短 TTL）。
+
+    security_map 为空时不写（避免空文件）。返回 sidecar 路径或 None。
+    """
+    if not list_path or not security_map:
+        return None
+    path = security_sidecar_path(list_path)
+    try:
+        os.makedirs(SECURITY_SIDECAR_DIR, exist_ok=True)
+        _atomic_write_json(path, {
+            "security_map": {str(k): str(v) for k, v in security_map.items()},
+        })
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+    except OSError:
+        log.warning("securityId sidecar 写入失败", exc_info=True)
+        return None
+
+
+def load_security_sidecar(list_path):
+    """读取 securityId sidecar；缺失/过期返回 {}（过期会顺手删除）。"""
+    if not list_path:
+        return {}
+    path = security_sidecar_path(list_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
+            os.remove(path)
+            return {}
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        smap = data.get("security_map") if isinstance(data, dict) else None
+        if not isinstance(smap, dict):
+            return {}
+        return {str(k): str(v) for k, v in smap.items()}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def delete_security_sidecar(list_path):
+    """删除指定列表对应的 sidecar（run 正常结束时调用）。"""
+    if not list_path:
+        return
+    path = security_sidecar_path(list_path)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def cleanup_security_sidecars():
+    """删除过期 sidecar（启动时调用）；返回删除数。"""
+    removed = 0
+    try:
+        for name in os.listdir(SECURITY_SIDECAR_DIR):
+            path = os.path.join(SECURITY_SIDECAR_DIR, name)
+            try:
+                if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        return removed
+    return removed
 DEFAULT_CITY_INPUT = "上海"
 LOGIN_PROBE_QUERY = "Java"
 LOGIN_PROBE_CITY = "101020100"
@@ -121,33 +255,25 @@ LOGIN_PROBE_TARGETS = (
 LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
-LOGIN_RESTRICTED_CODES = {31, 37}
-# BOSS 风控码会随平台策略变化，码表追不上时按 message 关键字兜底识别风控/限流，
-# 避免把「已登录但被风控」误判为 RESPONSE_ERROR 进而当成登录失败。
-LOGIN_RESTRICTED_MESSAGE_KEYWORDS = (
-    "环境存在异常",
-    "访问频繁",
-    "操作太频繁",
-    "安全校验",
-    "滑块",
-    "验证",
-)
+LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
+# 未知非零 code 一律按受限（降速）处理，见 probe_login_state 的 code != 0 分支
 DEFAULT_LOGIN_TIMEOUT = 300
 
 # 全局请求计数器
 _request_counter = 0
+_request_counter_lock = threading.Lock()  # 并发下保护 _request_counter（2026-09-22 审计修复）
 _live_city_maps_cache = None
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+# logging 配置移入 main()（if __name__ 守卫内）——模块顶层 basicConfig 会被任何
+# import（含测试）触发并改动 root logger，且 -q 时模块级 handler 残留
 log = logging.getLogger("boss_cdp")
 
 
 def default_output_path(kind):
-    filename = f"boss_{kind}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    # 秒级时间戳 + pid 后缀：并发（--max-concurrent/多 batch 进程）同秒写盘不撞名
+    # （分钟级在单进程下够用，并发后同分钟互相覆盖导致数据丢失——灰度实测暴露）
+    filename = (f"boss_{kind}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                f"_{os.getpid()}.json")
     return os.path.join(DEFAULT_RESULT_DIR, filename)
 
 
@@ -201,7 +327,7 @@ def _city_data_path():
         from importlib.resources import files  # py3.9+
         pkg_data = files(__package__ or "__main__").joinpath("..", "data", CITY_DATA_FILENAME) \
             if __package__ else None
-    except Exception:
+    except Exception:  # 有意宽捕：importlib.resources 在不同 Python/打包形态抛不同类型异常
         pkg_data = None
     if pkg_data is not None and os.path.isfile(str(pkg_data)):
         return str(pkg_data)
@@ -221,7 +347,7 @@ def load_local_city_map():
     name_to_code = {}
     try:
         path = _city_data_path()
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             raw = json.load(f)
         if isinstance(raw, dict):
             for name, code in raw.items():
@@ -267,23 +393,38 @@ INDUSTRY_MAP = {
 
 
 # ============================================================
-# 全局请求计数器辅助
+# 全局请求计数器辅助（预算分账：探测/列表/详情独立计数）
 # ============================================================
-def incr_request():
-    """递增全局请求计数，达到上限时抛出异常"""
+_request_budget = {"probe": 0, "list": 0, "detail": 0}
+
+
+def incr_request(kind="list"):
+    """递增全局请求计数（分账统计），达到上限时抛出异常
+
+    kind: probe（登录探测）/ list（列表 API）/ detail（详情导航）
+    总量上限语义不变；分账计数供血缘统计与漂移诊断。
+    """
     global _request_counter
-    _request_counter += 1
-    if _request_counter > MAX_API_REQUESTS:
+    # 加锁：并发详情路径每任务都会调用，避免计数漏加/超发（2026-09-22 审计修复）
+    with _request_counter_lock:
+        _request_counter += 1
+        _request_budget[kind] = _request_budget.get(kind, 0) + 1
+        n = _request_counter
+    if n > MAX_API_REQUESTS:
         raise RuntimeError(f"已达到单次最大请求数 {MAX_API_REQUESTS}，停止抓取")
-    if _request_counter >= MAX_API_REQUESTS * 0.8:
-        log.warning(f"⚠️ 请求次数接近上限: {_request_counter}/{MAX_API_REQUESTS}")
+    if n >= MAX_API_REQUESTS * 0.8:
+        log.warning(f"⚠️ 请求次数接近上限: {n}/{MAX_API_REQUESTS}")
 
 
 # ============================================================
 # CDP 连接
 # ============================================================
+class TargetCrashedError(Exception):
+    """CDP target 崩溃/会话 detached（如渲染进程 OOM）——立即失败，避免 evaluate 永久挂起。"""
+
+
 class CDPSession:
-    def __init__(self, cdp_port=DEFAULT_CDP_PORT):
+    def __init__(self, cdp_port=DEFAULT_CDP_PORT, heartbeat_interval=30):
         if not require_runtime_dependencies("requests", "websocket"):
             raise RuntimeError("缺少 CDP 运行依赖")
         self.cdp_port = cdp_port
@@ -291,6 +432,37 @@ class CDPSession:
         ws_url = resp.json()["webSocketDebuggerUrl"]
         self.ws = websocket.create_connection(ws_url, timeout=60)
         self.mid = 0
+        self._dead = False
+        if heartbeat_interval and heartbeat_interval > 0:
+            self._start_heartbeat(heartbeat_interval)
+
+    def _start_heartbeat(self, interval):
+        """后台线程 HTTP 探活：NAT/代理静默断连时尽早标记 _dead（防僵尸连接）。
+
+        CDP 无内置保活，空闲连接可能被静默掐断且收不到任何事件；
+        用同端口 /json/version HTTP 探活（不干扰 ws 消息循环），
+        连续失败即标记连接死亡，send 快速失败而非挂起 30s 超时。
+        """
+        import threading
+
+        def _beat():
+            while not self._dead:
+                try:
+                    requests.get(
+                        f"http://127.0.0.1:{self.cdp_port}/json/version",
+                        timeout=5,
+                    )
+                except requests.RequestException:
+                    self._dead = True
+                    try:
+                        self.ws.close()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(interval)
+
+        threading.Thread(target=_beat, daemon=True,
+                         name="cdp-heartbeat").start()
 
     def send(self, method, params=None, sid=None, timeout=30):
         """发送 CDP 命令并等待匹配的响应。
@@ -305,8 +477,14 @@ class CDPSession:
             CDP 响应字典
 
         Raises:
-            TimeoutError: 超过 max_retries 仍未收到匹配响应
+            ConnectionError: 连接已死亡/WebSocket 异常断开（快速失败，不挂起）
+            TargetCrashedError: 渲染进程崩溃/会话 detached（Inspector.detached/targetCrashed）
+            TimeoutError: 超过 timeout 仍未收到匹配响应
         """
+        if self._dead:
+            raise ConnectionError(
+                f"CDP 连接已断开（心跳探活失败），method={method}"
+            )
         self.mid += 1
         msg = {"id": self.mid, "method": method, "params": params or {}}
         if sid:
@@ -328,13 +506,28 @@ class CDPSession:
             try:
                 raw = self.ws.recv()
             except websocket.WebSocketTimeoutException:
-                raise TimeoutError(f"CDP WebSocket recv 超时, method={method}")
+                raise TimeoutError(
+                    f"CDP WebSocket recv 超时, method={method}") from None
+            except websocket.WebSocketException:
+                # 连接被对端关闭（NAT 掐断/Chrome 退出）——快速失败，不等到超时
+                self._dead = True
+                raise ConnectionError(
+                    f"CDP WebSocket 连接异常断开, method={method}"
+                ) from None
 
             try:
                 r = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
                 log.debug(f"跳过非 JSON 消息: {raw[:100]}")
                 continue
+
+            if r.get("method") in ("Inspector.detached", "Target.targetCrashed"):
+                # OOM 时只发 Inspector.detached（reason="Render process gone."）且
+                # pending evaluate 会永久挂起（社区已知 bug）——必须立即失败
+                raise TargetCrashedError(
+                    f"CDP target 崩溃/会话断开: {r.get('method')} "
+                    f"{json.dumps(r.get('params', {}), ensure_ascii=False)[:200]}"
+                )
 
             if r.get("id") == self.mid:
                 return r
@@ -352,7 +545,11 @@ class CDPSession:
         return r.get("result", {}).get("result", {}).get("value", None)
 
     def close(self):
-        self.ws.close()
+        self._dead = True
+        try:
+            self.ws.close()
+        except websocket.WebSocketException:
+            pass
 
 
 BACKGROUND_VISIBILITY_SCRIPT = (
@@ -391,6 +588,118 @@ def create_page_session(cdp, background=True):
 
 
 # ============================================================
+# 页面级风控/验证码检测与人工介入
+#
+# API 层风控（code 31/37 等）由 classify_login_probe_response 处理；
+# 这里补"页面级"判据：滑块验证、安全验证页、登录墙等需要人工介入的场景。
+# 判据参考 nothing248/boss-scrapy 的四重检测思路。
+# ============================================================
+DEFAULT_RISK_WAIT_TIMEOUT = 120   # 等待人工处理的最长秒数
+RISK_WAIT_INTERVAL = 5            # 轮询间隔秒数
+
+RISK_PROBE_JS = """
+(function(){
+    var title = document.title || '';
+    var url = location.href || '';
+    var bodyText = document.body ? (document.body.innerText || '') : '';
+    var slider = document.querySelector(
+        '.nc_scale, .captcha-slider, .puzzle-captcha, .geetest_slider, ' +
+        '.yidun_slider, .captcha_verify_box, .verify-captcha'
+    );
+    return JSON.stringify({
+        url: url,
+        title: title,
+        hasSlider: !!slider,
+        hasLoginWall: bodyText.indexOf('登录查看完整内容') !== -1
+    });
+})()
+"""
+
+RISK_TITLE_KEYWORDS = ("安全验证", "安全检查", "滑块验证", "验证码", "安全校验")
+RISK_URL_KEYWORDS = ("security-check", "security.html", "verify", "captcha")
+
+
+def _cdp_exception_types():
+    """返回 CDP 层可预期异常的元组。
+
+    websocket-client 是 lazy 导入（模块顶部 websocket=None），且测试环境中是
+    Mock（其属性不是异常类）。这里动态解析真实异常类，避免 except 元组里出现
+    非异常类型导致 TypeError。
+    """
+    types = (RuntimeError, TimeoutError, KeyError, OSError)
+    ws_exc = getattr(websocket, "WebSocketException", None) if websocket is not None else None
+    if isinstance(ws_exc, type) and issubclass(ws_exc, BaseException) and ws_exc not in types:
+        types += (ws_exc,)
+    return types
+
+
+def probe_risk_page(cdp, sid):
+    """通过注入 JS 探测当前页面是否存在风控/验证码痕迹。
+
+    Returns:
+        dict: {"url", "title", "hasSlider", "hasLoginWall"}；探测失败返回 {}。
+    """
+    try:
+        val = cdp.eval_js(RISK_PROBE_JS, sid)
+    except _cdp_exception_types():
+        log.debug("风控页面探测失败", exc_info=True)
+        return {}
+    if not val:
+        return {}
+    try:
+        probe = json.loads(val) if isinstance(val, str) else val
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return {}
+    return probe if isinstance(probe, dict) else {}
+
+
+def classify_risk_page(probe):
+    """判断页面探测结果是否命中风控/验证码判据。
+
+    Args:
+        probe: probe_risk_page 返回的 dict
+
+    Returns:
+        (is_risk, reason): is_risk 为 True 时 reason 说明命中的判据
+    """
+    if not isinstance(probe, dict):
+        return False, ""
+    url = str(probe.get("url") or "")
+    title = str(probe.get("title") or "")
+    if any(kw in url.lower() for kw in RISK_URL_KEYWORDS):
+        return True, "访问到验证/安全页面"
+    if any(kw in title for kw in RISK_TITLE_KEYWORDS):
+        return True, f"页面标题含验证关键词「{title}」"
+    if probe.get("hasSlider"):
+        return True, "检测到滑块验证元素"
+    if probe.get("hasLoginWall"):
+        return True, "页面出现登录墙"
+    return False, ""
+
+
+def wait_for_risk_clear(cdp, sid, timeout=DEFAULT_RISK_WAIT_TIMEOUT,
+                        interval=RISK_WAIT_INTERVAL):
+    """页面命中风控时提示用户人工处理，轮询直到恢复或超时。
+
+    Returns:
+        True: 风控已解除（判据消失）；False: 等待超时。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        probe = probe_risk_page(cdp, sid)
+        is_risk, reason = classify_risk_page(probe)
+        if not is_risk:
+            return True
+        remaining = int(deadline - time.time())
+        print(f"⚠️ 检测到风控/验证码：{reason}。")
+        print(f"   请在专用 Chrome 中完成人工验证（滑动/点选等），等待恢复（剩余 {remaining}s）...")
+        time.sleep(min(interval, remaining) if remaining > 0 else interval)
+    print(f"❌ 等待人工处理超时（{timeout}s），已停止当前任务。")
+    print("   可稍后重试；如果频繁出现，请检查网络环境（代理/VPN 出口 IP 可能触发风控）。")
+    return False
+
+
+# ============================================================
 # 通过页面内 XHR 调 API 获取列表数据（明文薪资）
 # ============================================================
 FETCH_API_JS_TEMPLATE = """
@@ -409,13 +718,23 @@ FETCH_API_JS_TEMPLATE = """
             location: (j.cityName || '') + '\\u00b7' + (j.areaDistrict || '') + '\\u00b7' + (j.businessDistrict || ''),
             tags: [j.jobExperience || '', j.jobDegree || ''].filter(function(t){return t && t !== '\\u4e0d\\u9650';}).join(' | '),
             boss_name: j.brandName || '',
+            company_name: j.brandName || '',
             boss_title: j.bossTitle || '',
             boss_active_status: j.activeTimeDesc || (j.bossOnline ? '\\u5728\\u7ebf' : ''),
+            anonymous: j.anonymous !== undefined ? j.anonymous : '',
+            job_valid_status: j.jobValidStatus !== undefined ? j.jobValidStatus : '',
+            icon_flags: (j.iconFlagList || []).join('|'),
+            icon_word: j.iconWord || '',
+            proxy_job: j.proxyJob || '',
+            proxy_type: j.proxyType || '',
+            job_type: j.jobType || '',
+            experience: j.jobExperience || '',
+            education: j.jobDegree || '',
             company_scale: j.brandScaleName || '',
             company_stage: j.brandStageName || '',
             company_industry: j.brandIndustry || '',
             job_labels: (j.jobLabels || []).join(' | '),
-            skills: (j.skills || []).join(' | '),
+            skills: j.skills || [],
             security_id: j.securityId || '',
             lid: j.lid || '',
             encrypt_job_id: j.encryptJobId || '',
@@ -480,11 +799,15 @@ MIN_DETAIL_TEXT_LENGTH = 120
 
 
 class DetailExtractionError(ValueError):
-    """The rendered page does not contain a usable job description."""
+    """详情提取失败（页面结构漂移/内容过短），不进 pending。"""
 
 
 class DetailLoginRequiredError(DetailExtractionError):
     """The detail page is truncated because the BOSS session is not logged in."""
+
+
+class DetailRiskError(DetailExtractionError):
+    """详情 API 返回风控码（code!=0）：退避重试，连续命中走熔断全停。"""
 
 
 EXTRACT_DETAIL_JS = """
@@ -534,6 +857,137 @@ def _normalize_detail_whitespace(text):
     normalized = "\n".join(lines).strip()
     normalized = re.sub(r"\n{3,}", "\n\n", normalized)
     return re.sub(r"[ \t]{2,}", " ", normalized)
+
+
+# ============================================================
+# 详情 API 通道（2026-08-14，替代详情页 DOM 渲染为主路径）
+# /wapi/zpgeek/job/detail.json?jobId=&securityId=&city= 实测 code 0：
+#   postDescription = 完整 JD（纯文本，无 HTML、无截断——已实证）
+#   bossInfo/brandComInfo = HR 与公司完整信息块
+#   address/longitude/latitude = 详情级精确位置
+# securityId 来自列表 API（每岗），同进程内存传递，不落导出文件（红线）。
+# 相比详情页 DOM 渲染：每岗 1 次轻量 XHR（非整页渲染），成本降一个量级。
+# ============================================================
+DETAIL_API_JS = r"""
+(function(){
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '__API_URL__', false);
+    xhr.send();
+    if (xhr.status !== 200) return JSON.stringify({error: 'http_' + xhr.status});
+    var d;
+    try { d = JSON.parse(xhr.responseText); } catch (e) { return JSON.stringify({error: 'parse'}); }
+    if (d.code !== 0) return JSON.stringify({code: d.code, msg: d.message || ''});
+    var zp = d.zpData || {};
+    var info = zp.jobInfo || {};
+    var boss = zp.bossInfo || {};
+    var brand = zp.brandComInfo || {};
+    return JSON.stringify({
+        code: 0,
+        jd: info.postDescription || '',
+        job_status_desc: info.jobStatusDesc || '',
+        boss_active_status: boss.activeTimeDesc || '',
+        brand_introduce: brand.introduce || '',
+        brand_stage_name: brand.stageName || '',
+        brand_scale_name: brand.scaleName || '',
+        brand_industry_name: brand.industryName || ''
+    });
+})()
+"""
+
+DETAIL_API_PATH = "/wapi/zpgeek/job/detail.json"
+
+
+def build_detail_api_url(job, security_id, city_code=""):
+    """构造详情 API URL（jobId+securityId 为必需参数，city 探测实证需带）。"""
+    job_id = str(job.get("encrypt_job_id") or "")
+    if not job_id:
+        # 列表 job_link 自带 encryptJobId（详情 DOM 导航同源）
+        m = re.search(r"/job_detail/([^./]+)\.html", str(job.get("job_link") or ""))
+        if m:
+            job_id = m.group(1)
+    params = {
+        "jobId": job_id,
+        "securityId": str(security_id or ""),
+        "city": str(city_code or ""),
+    }
+    return f"{DETAIL_API_PATH}?{urlencode(params)}"
+
+
+def _open_api_tab(cdp_port, keyword, city_code):
+    """开一个停靠在 zhipin 域搜索页的 tab（详情 API 通道用）。
+
+    返回**可变会话列表** ``[ws, target_id, session_id, hits]``（第 4 位记录本 tab
+    已成功详情数，用于按 ``DETAIL_API_TAB_BUDGET`` 主动轮换）。
+    """
+    ws = CDPSession(cdp_port)
+    tid, sid = create_page_session(ws)
+    ws.send("Page.navigate",
+            {"url": build_search_url(keyword or "", city_code or "", 1, {})}, sid)
+    time.sleep(random.uniform(4, 8))
+    return [ws, tid, sid, 0]
+
+
+def _close_api_tab(session):
+    """关闭详情 API tab（无 session 时静默返回）。"""
+    if not session:
+        return
+    try:
+        session[0].send("Target.closeTarget", {"targetId": session[1]})
+        session[0].close()
+    except _cdp_exception_types():
+        log.debug("关闭详情 API 会话失败", exc_info=True)
+
+
+def _rotate_api_tab(session, cdp_port, keyword, city_code):
+    """轮换详情 API tab：关旧开新并**原地**更新 session（hits 归零）。
+
+    实测同一 tab 连续约 4-5 次详情后 code 37，换 tab 立即重置；轮换用于
+    批量抓取与"风控码疑似配额耗尽"时的重试。返回是否轮换成功。
+    """
+    _close_api_tab(session)
+    try:
+        fresh = _open_api_tab(cdp_port, keyword, city_code)
+    except _cdp_exception_types():
+        log.warning("轮换详情 API tab 失败", exc_info=True)
+        return False
+    session[0], session[1], session[2], session[3] = fresh
+    return True
+
+
+def _parse_detail_api_value(val, job):
+    """解析详情 API 返回（DETAIL_API_JS 输出）。
+
+    Returns:
+        dict: {jd, boss_active_status, page_update_date(''), address, ...}——失败抛异常：
+        error → DetailExtractionError；code!=0 → DetailRiskError；jd 过短 → DetailExtractionError。
+    """
+    try:
+        payload = json.loads(val)
+    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise DetailExtractionError(f"详情 API 返回不是有效 JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise DetailExtractionError("详情 API 返回结构异常")
+    if payload.get("error"):
+        raise DetailExtractionError(f"详情 API 请求失败: {payload['error']}")
+    if payload.get("code", 0) != 0:
+        raise DetailRiskError(f"详情 API 风控码: code={payload.get('code')} {payload.get('msg', '')}")
+    jd = str(payload.get("jd") or "")
+    jd = jd.replace("\u3000", " ")  # 全角空格清理（探测实证 postDescription 含全角空格）
+    jd = _normalize_detail_whitespace(jd)
+    if len(jd) < MIN_DETAIL_TEXT_LENGTH:
+        raise DetailExtractionError(
+            f"job description too short after validation: {len(jd)} < {MIN_DETAIL_TEXT_LENGTH}"
+        )
+    return {
+        "jd": jd,
+        "boss_active_status": str(payload.get("boss_active_status") or ""),
+        "page_update_date": "",  # API 通道无详情页"页面更新时间"（可选字段，退化点已记录）
+        "job_status_desc": str(payload.get("job_status_desc") or ""),
+        "brand_introduce": str(payload.get("brand_introduce") or ""),
+        "brand_stage_name": str(payload.get("brand_stage_name") or ""),
+        "brand_scale_name": str(payload.get("brand_scale_name") or ""),
+        "brand_industry_name": str(payload.get("brand_industry_name") or ""),
+    }
 
 
 def _looks_like_navigation_page(text):
@@ -666,7 +1120,13 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
         raise DetailExtractionError(
             f"job description too short after validation: {len(jd)} < {min_length}"
         )
-    return {"jd": jd, "boss_active_status": boss_active_status}
+    # 页面更新时间：BOSS 详情页唯一岗位侧日期（招聘方最后编辑岗位时间，
+    # 非发布日期——平台不公开发布时间）；列表 API 无任何时间字段。
+    # 非契约可选字段，缺失留空；用于区分"岗位侧更新时间"与"我方抓取时间"。
+    update_m = re.search(r"页面更新时间[：:]\s*(\d{4}-\d{2}-\d{2})", page_text)
+    page_update_date = update_m.group(1) if update_m else ""
+    return {"jd": jd, "boss_active_status": boss_active_status,
+            "page_update_date": page_update_date}
 
 
 def extract_job_description(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
@@ -686,9 +1146,9 @@ class CityResolutionError(ValueError):
 
 
 def fetch_boss_json(url, timeout=10):
-    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
 
     if not isinstance(data, dict):
         raise CityAPIResponseError(f"BOSS 城市接口返回非对象响应: {url}")
@@ -854,11 +1314,9 @@ def classify_login_probe_response(data, http_status=200):
     if code in LOGIN_RESTRICTED_CODES:
         return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
     if code != 0:
-        # code 不在已知风控码集合里时，再按 message 关键字兜底判定是否风控，
-        # 避免新风控码被当成不可恢复的 RESPONSE_ERROR 误拦已登录用户。
-        if any(kw in message for kw in LOGIN_RESTRICTED_MESSAGE_KEYWORDS):
-            return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
-        return LoginProbeResult(LoginProbeStatus.RESPONSE_ERROR, code=code, message=message)
+        # 未知非零 code 一律按受限处理（降速语义）——新风控形态不被误判为
+        # 不可恢复的 RESPONSE_ERROR（避免"误拦已登录用户"与静默放弃并存）
+        return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
 
     zp_data = data.get("zpData")
     if not isinstance(zp_data, dict):
@@ -918,7 +1376,7 @@ def probe_login_state(cdp, sid, query=LOGIN_PROBE_QUERY, city_code=LOGIN_PROBE_C
         }});
     }})()
     """
-    incr_request()
+    incr_request("probe")
     val = cdp.eval_js(js, sid)
     if not val:
         return LoginProbeResult(
@@ -980,8 +1438,39 @@ def describe_login_probe_result(result):
 # ============================================================
 # 登录状态检测
 # ============================================================
-def check_login_state(cdp_port=DEFAULT_CDP_PORT):
-    """通过 CDP 检测 BOSS直聘登录状态。
+_LOGIN_PROBE_CACHE = {"ts": 0.0, "result": None}
+
+
+def check_login_state(cdp_port=DEFAULT_CDP_PORT, use_cache=True):
+    """通过 CDP 检测 BOSS直聘登录状态（会话内结果缓存）。
+
+    同一进程内 TTL 内重复调用（如 --check 与抓取前的登录检测）直接复用
+    上次探测结果，避免重复开 tab、导航与请求；`--login-timeout` 等待循环
+    不受影响（走 wait_for_login，不经过本缓存）。
+
+    Args:
+        cdp_port: CDP 端口
+        use_cache: False 时强制重新探测（绕过缓存）
+
+    Returns:
+        LoginProbeResult: 登录探测的结构化状态
+    """
+    cached = _LOGIN_PROBE_CACHE
+    if use_cache and cached["result"] is not None \
+            and time.time() - cached["ts"] < LOGIN_PROBE_CACHE_TTL:
+        return cached["result"]
+    result = _probe_login_state_uncached(cdp_port)
+    cached["ts"] = time.time()
+    cached["result"] = result
+    return result
+
+
+def _probe_login_state_uncached(cdp_port=DEFAULT_CDP_PORT):
+    """实际探测逻辑（无缓存）：多组关键词/城市轮换探测。
+
+    单次探测可能因关键词恰好 0 结果而误判（EMPTY），轮换可降低误判；
+    未登录（UNAUTHENTICATED）与风控（RESTRICTED）是确定状态，命中直接
+    返回，不继续轮换。
 
     Returns:
         LoginProbeResult: 登录探测的结构化状态
@@ -996,7 +1485,20 @@ def check_login_state(cdp_port=DEFAULT_CDP_PORT):
         cdp.send("Page.navigate", {"url": "https://www.zhipin.com/"}, sid)
         time.sleep(4)
 
-        return probe_login_state(cdp, sid)
+        last_result = None
+        for query, city_code in LOGIN_PROBE_TARGETS:
+            result = probe_login_state(cdp, sid, query=query, city_code=city_code)
+            if result.status in (
+                LoginProbeStatus.AVAILABLE,
+                LoginProbeStatus.UNAUTHENTICATED,
+                LoginProbeStatus.RESTRICTED,
+            ):
+                return result
+            last_result = result
+        return last_result if last_result is not None else LoginProbeResult(
+            LoginProbeStatus.RESPONSE_ERROR,
+            message="全部探测均无结果",
+        )
     except (requests.ConnectionError, requests.Timeout, KeyError,
             json.JSONDecodeError, websocket.WebSocketException,
             TimeoutError, RuntimeError) as e:
@@ -1123,53 +1625,346 @@ def write_detail_csv(csv_path, details):
 # ============================================================
 # 增量写入 JSON
 # ============================================================
-def append_json(path, new_jobs):
-    """追加 jobs 到 JSON 文件，每条按 job_id 去重"""
-    existing = []
-    seen_ids = set()
-    data = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            existing = data.get("jobs", [])
-            seen_ids = {j.get("job_id", "") for j in existing}
-        except (json.JSONDecodeError, OSError, ValueError):
-            data = {}
-    added = 0
-    for j in new_jobs:
-        if j.get("job_id") not in seen_ids:
-            existing.append(j)
-            seen_ids.add(j.get("job_id", ""))
-            added += 1
-    data["jobs"] = existing
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return added
+# merge_unique / _atomic_write_json / cleanup_stale_tmp_files / _scrub_secrets
+# 已抽出到 scripts/export_contract.py（见顶部导入兼容层；P1 架构重构 2026-09-22）。
 
 
-def flush_jobs(path, meta, jobs):
-    """每次有新数据就全量刷写（jobs 去重后），保证异常退出也能保留"""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # 合并已有文件
-    existing_jobs = []
-    seen_ids = set()
-    if os.path.exists(path):
+# ============================================================
+# 告警推送（规格侧 Worker /webhook/alert，Bearer token）
+# 配置放项目根 .env（ALERT_WEBHOOK_URL / ALERT_WEBHOOK_TOKEN，不落仓库）；
+# 推送是旁路：配置缺失/发送失败不抛异常，不影响抓取主流程。
+# ============================================================
+def load_alert_config(env_path=None):
+    """读取 .env 中的告警配置：ALERT_WEBHOOK_URL / ALERT_WEBHOOK_TOKEN。
+
+    默认查找项目根目录 .env；文件缺失或键缺失返回空配置（推送禁用）。
+    """
+    if env_path is None:
+        env_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+    cfg = {"url": "", "token": ""}
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                if key == "ALERT_WEBHOOK_URL":
+                    cfg["url"] = value
+                elif key == "ALERT_WEBHOOK_TOKEN":
+                    cfg["token"] = value
+    except OSError:
+        pass
+    return cfg
+
+
+def send_alert(title, text, timeout=10):
+    """发送告警到规格侧 Worker 端点（requests POST，Bearer 鉴权）。
+
+    幂等由端点保证（同内容去重）；失败仅记日志返回 False。
+    """
+    cfg = load_alert_config()
+    if not cfg["url"] or not cfg["token"]:
+        return False
+    if requests is None:  # 延迟导入：测试/未初始化环境静默禁用
+        return False
+    try:
+        resp = requests.post(
+            cfg["url"],
+            json={"source": "boss-zhipin-scraper", "title": title, "text": text},
+            headers={"Authorization": f"Bearer {cfg['token']}"},
+            timeout=timeout,
+        )
+        return resp.status_code == 200
+    except OSError:
+        # requests.RequestException 继承 IOError(=OSError)；网络层失败不阻塞主流程
+        log.warning("告警发送失败", exc_info=True)
+        return False
+# _INTERNAL_KEYS / _sanitize_job / _missing_required_fields / flush_jobs
+# 已抽出到 scripts/export_contract.py（见顶部导入兼容层；P1 架构重构 2026-09-22）。
+
+
+# ============================================================
+# 单进程互斥（规格 §3.6：防止多任务并发启动超频/竞争 Chrome）
+# 锁文件格式：第一行最大并发数 N，后续每行一个持有 pid，
+# 熔断时追加一行 risk（任一并发任务遇风控 → 全停广播）
+#   N
+#   pid1
+#   pid2
+#   risk
+# 并发上限默认 1（现状）；--max-concurrent N 仅指令显式放开（如 2-3）
+# ============================================================
+RISK_LINE = "risk"
+
+
+def _pid_is_running(pid):
+    """检查 pid 对应进程是否存活（跨平台）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        if platform.system() == "Windows":
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"Get-Process -Id {pid} -ErrorAction SilentlyContinue"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5)
+            return bool(r.stdout.strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _read_scrape_lock():
+    """读取锁文件，返回 (max_concurrent, 持有 pid 列表, risk 标志)；损坏返回 (1, [], False)。"""
+    try:
+        with open(SCRAPE_LOCK_PATH, encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f.read().splitlines() if ln.strip()]
+    except (OSError, UnicodeDecodeError, ValueError):
+        return 1, [], False
+    if not lines:
+        return 1, [], False
+    try:
+        max_concurrent = int(lines[0])
+    except (TypeError, ValueError):
+        max_concurrent = 1
+    risk = RISK_LINE in lines
+    holders = [ln for ln in lines[1:] if ln != RISK_LINE]
+    return max_concurrent, holders, risk
+
+
+def _write_scrape_lock(max_concurrent, holders, risk=False):
+    """原子写锁文件（tmp + os.replace + fsync，防并发撕裂/断电丢失）。"""
+    tmp = SCRAPE_LOCK_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(str(max_concurrent) + "\n")
+        for pid in holders:
+            f.write(str(pid) + "\n")
+        if risk:
+            f.write(RISK_LINE + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SCRAPE_LOCK_PATH)
+
+
+def _scrape_lock_guard_path():
+    return SCRAPE_LOCK_PATH + ".guard"
+
+
+def _with_scrape_lock_guard(action, timeout=5.0):
+    """用 O_CREAT|O_EXCL guard 文件对锁文件读-改-写做进程间互斥（防 RMW 竞态）。
+
+    并发上限可配后（--max-concurrent>1）多进程同时 acquire 会 check-then-act：
+    两进程同读空位 → 各自覆盖写 → 前者的 pid 丢失，实际并发超限。
+    guard 原子创建保证同一时刻只有一个进程做 RMW；抢不到 spin + 超时。
+
+    Args:
+        action: 无参可调用，在持有 guard 期间执行（内部做读-改-写）。
+        timeout: 最大等待秒数。
+    """
+    guard = _scrape_lock_guard_path()
+    deadline = time.monotonic() + timeout
+    while True:
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                old = json.load(f)
-            existing_jobs = old.get("jobs", [])
-            seen_ids = {j.get("job_id", "") for j in existing_jobs}
-        except (json.JSONDecodeError, OSError, ValueError):
+            fd = os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                return False  # 超时：另一进程持 guard 过久（可能崩溃残留）
+            time.sleep(0.05)
+        except OSError:
+            return False
+    try:
+        action()
+        return True
+    finally:
+        try:
+            os.remove(guard)
+        except OSError:
             pass
-    for j in jobs:
-        if j.get("job_id") not in seen_ids:
-            existing_jobs.append(j)
-            seen_ids.add(j.get("job_id", ""))
-    meta["total"] = len(existing_jobs)
-    meta["jobs"] = existing_jobs
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# CDP 熔断冷却（防"熔断→立即重启→再熔断"循环）
+# ============================================================
+def _cdp_cooldown_path():
+    """冷却时间戳文件（与锁文件同目录，跨进程共享）。"""
+    return os.path.join(os.path.dirname(SCRAPE_LOCK_PATH), "cdp.cooldown")
+
+
+def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
+    """熔断时记录冷却截止时间戳（原子写）。
+
+    文件两行：首行冷却截止，次行恢复期截止（冷却结束后仍限速减半，
+    渐变恢复而非跳回全速，防恢复瞬间再触发风控）。
+    """
+    try:
+        os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
+        tmp = _cdp_cooldown_path() + ".tmp"
+        now = time.time()
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(str(now + seconds) + "\n")
+            f.write(str(now + seconds + CDP_RECOVERY_SECONDS) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _cdp_cooldown_path())
+    except OSError:
+        pass
+
+
+def check_cdp_recovery():
+    """熔断冷却结束后进入渐变恢复期：返回剩余恢复秒数（0=无恢复期）。
+
+    调用方（如详情限速器）在恢复期内降低速率，冷却结束不直接跳回全速。
+    冷却与恢复期都结束后清理残留标记文件。
+    """
+    try:
+        with open(_cdp_cooldown_path(), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        deadline = float(lines[0])
+        recovery_until = float(lines[1]) if len(lines) > 1 else deadline
+        remaining = recovery_until - time.time()
+        if remaining > 0:
+            return remaining
+        if time.time() > deadline:
+            try:
+                os.remove(_cdp_cooldown_path())
+            except OSError:
+                pass
+        return 0.0
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+def check_cdp_cooldown():
+    """检查冷却期：未冷却返回 None；冷却中返回剩余秒数。
+
+    冷却期过后返回 None（不再删除标记——恢复期信息保留在文件第二行，
+    由 check_cdp_recovery 在恢复期结束后清理）。
+    文件首行为冷却截止（第二行为恢复期截止，冷却判断只看首行）。
+    """
+    try:
+        with open(_cdp_cooldown_path(), encoding="utf-8") as f:
+            deadline = float(f.read().splitlines()[0])
+    except (OSError, UnicodeDecodeError, ValueError, IndexError):
+        return None
+    remaining = deadline - time.time()
+    if remaining > 0:
+        return int(remaining)
+    return None
+
+
+def acquire_scrape_lock(max_concurrent=1):
+    """获取并发锁；熔断中或存活持有者已达上限时返回 False。
+
+    max_concurrent=1 时行为与旧版单 pid 互斥一致（硬防线，默认）。
+    持锁进程崩溃（pid 已死）自动清理其条目并接管。
+    熔断标志（risk）一旦置位即拒绝新任务（挂起等人工确认；
+    人工处理后 --reset-lock 清除，再重开）。
+    """
+    if max_concurrent < 1:
+        max_concurrent = 1
+    try:
+        os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
+    except OSError:
+        return False
+    # guard 内 RMW：读-存活过滤-写 全程互斥，杜绝 check-then-act 竞态
+    result = {"acquired": False}
+
+    def _do_acquire():
+        max_c, holders, risk = _read_scrape_lock()
+        if risk:
+            return  # 熔断中：必须人工确认（--reset-lock）后才能重开
+        if os.path.exists(SCRAPE_LOCK_PATH):
+            alive = [p for p in holders if _pid_is_running(p)]
+            if len(alive) >= max(max_c, max_concurrent):
+                return
+        else:
+            alive = []
+        _write_scrape_lock(max_concurrent, alive + [str(os.getpid())])
+        result["acquired"] = True
+
+    if not _with_scrape_lock_guard(_do_acquire):
+        return False
+    return result["acquired"]
+
+
+def set_scrape_lock_risk():
+    """置熔断标志：任一并发任务遇风控时广播全停（其他任务在页间检查并停止）。"""
+    def _do_set_risk():
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return
+        max_c, holders, risk = _read_scrape_lock()
+        if risk:
+            return
+        _write_scrape_lock(max_c, holders, risk=True)
+
+    try:
+        _with_scrape_lock_guard(_do_set_risk)
+    except OSError:
+        pass
+
+
+def is_scrape_lock_risk():
+    """读取当前锁文件是否已熔断（并发任务全停广播）。"""
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return False
+        _, _, risk = _read_scrape_lock()
+        return risk
+    except OSError:
+        return False
+
+
+def release_scrape_lock():
+    """释放本进程持有的锁；只移除自己的 pid（他人 pid 保留）。
+
+    熔断中（risk 已置位）保留锁文件（挂起等人工确认），不因持有者退出而删除；
+    无 risk 且无剩余持有者时删除锁文件。
+    """
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return
+        max_c, holders, risk = _read_scrape_lock()
+        mine = str(os.getpid())
+        rest = [p for p in holders if p != mine]
+        if len(rest) == len(holders):
+            return  # 锁里没有自己（他人/已清理），不动
+        if rest or risk:
+            # 仍有持有者，或熔断中需保留风险状态
+            _write_scrape_lock(max_c, rest, risk=risk)
+        else:
+            os.remove(SCRAPE_LOCK_PATH)
+    except OSError:
+        pass
+
+
+def clear_scrape_lock_risk():
+    """人工确认后清除熔断状态（--reset-lock）。
+
+    仅清除 risk 标志；若锁文件内仍有存活持有者则保留（他人任务在跑不动）。
+    """
+    try:
+        if not os.path.exists(SCRAPE_LOCK_PATH):
+            return True
+        max_c, holders, risk = _read_scrape_lock()
+        if not risk:
+            return True
+        if holders:
+            _write_scrape_lock(max_c, holders, risk=False)
+        else:
+            os.remove(SCRAPE_LOCK_PATH)
+        return True
+    except OSError:
+        return False
 
 
 # ============================================================
@@ -1186,23 +1981,15 @@ def merge_jobs(external_path, new_jobs):
         合并后的 jobs 列表
     """
     try:
-        with open(external_path, "r", encoding="utf-8") as f:
+        with open(external_path, encoding="utf-8") as f:
             old_data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError) as e:
         log.warning(f"无法加载合并文件 {external_path}: {e}")
         return new_jobs
 
     old_jobs = old_data.get("jobs", [])
-    merged = list(old_jobs)
-    seen_ids = {j.get("job_id", "") for j in merged}
-
-    added = 0
-    for j in new_jobs:
-        if j.get("job_id") not in seen_ids:
-            merged.append(j)
-            seen_ids.add(j.get("job_id", ""))
-            added += 1
-
+    merged = merge_unique(old_jobs, new_jobs)
+    added = len(merged) - len(old_jobs)
     print(f"合并: 旧文件 {len(old_jobs)} 条 + 新抓取 {len(new_jobs)} 条 = {len(merged)} 条 (新增 {added})")
     return merged
 
@@ -1223,7 +2010,7 @@ def merge_details(external_path, new_details):
     if not external_path:
         return new_details
     try:
-        with open(external_path, "r", encoding="utf-8") as f:
+        with open(external_path, encoding="utf-8") as f:
             old_data = json.load(f)
     except (json.JSONDecodeError, OSError, ValueError) as e:
         log.warning(f"无法加载合并详情文件 {external_path}: {e}")
@@ -1243,16 +2030,7 @@ def merge_details(external_path, new_details):
 
 def merge_details_from_lists(old_details, new_details):
     """把两份详情列表按 job_id 合并去重，new_details 优先（同 id 用新覆盖旧）。"""
-    by_id = {}
-    for d in old_details:
-        jid = d.get("job_id", "") if isinstance(d, dict) else ""
-        if jid:
-            by_id[jid] = d
-    for d in new_details:
-        jid = d.get("job_id", "") if isinstance(d, dict) else ""
-        if jid:
-            by_id[jid] = d
-    return list(by_id.values())
+    return merge_unique(old_details, new_details, new_overrides=True)
 
 
 # ============================================================
@@ -1289,10 +2067,31 @@ def parse_api_jobs_eval_value(value):
     return jobs
 
 
+def is_zhipin_host(url):
+    """精确校验 URL 主机为 zhipin.com 或其子域（防伪造 host 的钓鱼导航）。
+
+    对照开源 boss-agent-cli 实践：不做子串判断（"zhipin.com" in url 会被
+    zhipin.com.evil.example 这类伪造 host 骗过）。
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    host = host.rstrip(".").lower()
+    return host == "zhipin.com" or host.endswith(".zhipin.com")
+
+
 def build_detail_url(job):
-    """Build the URL used for detail navigation without mutating job_link."""
+    """Build the URL used for detail navigation without mutating job_link.
+
+    仅接受 zhipin.com 主机：job_link 可能来自外部文件（--merge/--input），
+    拒绝导航到任意站点。
+    """
     link = job.get("job_link", "")
     if not link:
+        return ""
+    if not is_zhipin_host(link):
+        log.warning(f"跳过非 zhipin.com 详情链接（防外部导航）: {link}")
         return ""
 
     parsed = urlparse(link)
@@ -1309,7 +2108,8 @@ def build_detail_url(job):
 
 def find_latest_detail_file(result_dir=DEFAULT_RESULT_DIR):
     pattern = os.path.join(result_dir, "boss_details_*.json")
-    files = [path for path in glob.glob(pattern) if os.path.isfile(path)]
+    files = [path for path in glob.glob(pattern)
+             if os.path.isfile(path) and not path.endswith(".pending.json")]
     if not files:
         return None
     return max(files, key=lambda path: (os.path.getmtime(path), path))
@@ -1357,13 +2157,30 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # 抓取列表
 # ============================================================
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
-                cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False):
+                cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
+                max_jobs=None, max_concurrent=1):
     city_name, city_code = resolve_city(city_input)
+    # 单进程互斥（规格 §3.6）：默认并发上限 1（现状）；--max-concurrent N 仅指令显式放开
+    if not acquire_scrape_lock(max_concurrent=max_concurrent):
+        print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
+        print(f"EXPORT_FAIL reason=lock_held city={city_name} keyword={keyword}")
+        return {"keyword": keyword, "city": city_name, "total": 0, "jobs": [],
+                "security_map": {}, "city_code": city_code}
     cdp = CDPSession(cdp_port)
     all_jobs = []
     seen = set()
     if not output_path:
         output_path = default_output_path("jobs")
+
+    # run 级血缘字段：本次运行是谁、什么代码、何时开始（record_counts 由 flush_jobs 累积）
+    run_id = uuid.uuid4().hex
+    run_started_at = datetime.now().isoformat()
+    # B 增量同步观察集合：本 run 观察到的全部 job_id（新增+重复，raw 事实，
+    # 独立于累积 jobs 数组；B 方案 A 契约字段 observed_jobs）
+    observed_ids = []
+    # 详情 API 通道凭据：{job_id: securityId}——同进程内存传递（详情阶段用），
+    # 不落导出文件（红线：security_id 属内部标识）。导出时 _sanitize 剔除，此处仅内存。
+    security_map = {}
 
     # 显示筛选条件
     filter_desc = []
@@ -1392,18 +2209,23 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             if v == filters["industry"]:
                 filter_desc.append(f"行业={k}")
 
-    print(f"=== BOSS直聘抓取 ===")
+    print("=== BOSS直聘抓取 ===")
     print(f"关键词: {keyword} | 城市: {city_name} | 页数: {max_pages}")
     if filter_desc:
         print(f"筛选: {' | '.join(filter_desc)}")
     print()
+
+    # 契约 meta（规格 §3.2）：实际翻页数与异常提示，随每次写盘落文件
+    actual_pages = 0
+    warnings = []
+    empty_pages = 0  # 连续空页计数（风控静默降级信号，>=2 即停）
 
     tid, sid = create_page_session(cdp)
 
     def human_scroll(cdp, sid):
         """模拟人类滚动: 随机次数、随机距离、随机停顿，偶尔回滚一点"""
         total_scrolls = random.randint(3, 6)
-        for i in range(total_scrolls):
+        for _ in range(total_scrolls):
             # 大部分往下滚，偶尔往上回滚一点（模拟阅读回看）
             if random.random() < 0.15:
                 delta = -random.randint(50, 150)
@@ -1426,19 +2248,42 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             }, sid)
 
     try:
+        exhausted = False  # 本 run 是否翻到底（规格侧抽样感知下架判定依据：契约 v2 顶层字段）
         for pg in range(1, max_pages + 1):
+            # 并发熔断检查：其他任务已广播风控 → 本任务立即全停（不降并发续跑）
+            if is_scrape_lock_risk():
+                print("⚠️ 并发任务已触发风控熔断，本任务立即停止（保留已抓数据）。")
+                warnings.append("并发任务风控熔断")
+                print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                return {"keyword": keyword, "city": city_name,
+                        "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
+            actual_pages = pg
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
-            incr_request()
+            incr_request("list")
 
             # 第一页：导航到搜索页建立 cookie/session
             if pg == 1:
                 url = build_search_url(keyword, city_code, pg, filters)
                 cdp.send("Page.navigate", {"url": url}, sid)
                 time.sleep(random.uniform(6, 10))
+                # 页面级风控检测：滑块/验证页/登录墙命中时提示人工介入
+                is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                if is_risk:
+                    print(f"⚠️ 搜索页 {reason}，等待人工处理...")
+                    set_scrape_lock_risk()  # 并发熔断广播：其他任务全停
+                    if not wait_for_risk_clear(cdp, sid):
+                        print("列表页风控未解除，停止抓取（保留已抓数据）。")
+                        warnings.append(f"搜索页风控未解除: {reason}")
+                        print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        return {"keyword": keyword, "city": city_name,
+                                "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                 human_scroll(cdp, sid)
                 human_mouse_jitter(cdp, sid)
 
-            # 优先用 API 获取明文数据
+            # 优先用 API 获取明文数据；失败时刷新页面重试（凭证自愈），
+            # 让浏览器重新完成挑战/刷新 stoken，最多 API_ATTEMPT_LIMIT 次。
             api_params = {
                 "scene": "1",
                 "query": keyword,
@@ -1450,13 +2295,34 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 if v:
                     api_params[k] = v
             api_url = f"{API_JOB_LIST_PATH}?{urlencode(api_params)}"
-            api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
-            val = cdp.eval_js(api_js, sid)
 
-            jobs = parse_api_jobs_eval_value(val)
+            jobs = []
+            for attempt in range(API_ATTEMPT_LIMIT):
+                api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
+                val = cdp.eval_js(api_js, sid)
+                jobs = parse_api_jobs_eval_value(val)
+                if jobs:
+                    break
+                if attempt < API_ATTEMPT_LIMIT - 1:
+                    print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
+                    warnings.append(f"第{pg}页API未返回数据，已刷新重试")
+                    cdp.send("Page.navigate",
+                             {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
+                    # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
+                    # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
+                    time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
+                    is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                    if is_risk:
+                        print(f"⚠️ 刷新后 {reason}，等待人工处理...")
+                        if not wait_for_risk_clear(cdp, sid):
+                            print("风控未解除，停止抓取（保留已抓数据）。")
+                            warnings.append(f"刷新后风控未解除: {reason}")
+                            jobs = []
+                            break
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
             if should_use_dom_fallback(jobs, allow_dom_fallback):
+                warnings.append(f"第{pg}页API获取失败，回退DOM提取（数据可能不完整）")
                 log.warning("⚠️ API 获取失败，回退到 DOM 提取（此方式已弃用，数据可能不完整）")
                 if pg > 1:
                     url = build_search_url(keyword, city_code, pg, filters)
@@ -1468,19 +2334,36 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     try:
                         jobs = json.loads(val) if isinstance(val, str) else val
                     except (json.JSONDecodeError, ValueError):
-                        print(f"  ⚠️ JSON 解析失败")
+                        print("  ⚠️ JSON 解析失败")
                         jobs = []
             elif not jobs:
                 log.warning("⚠️ API 未返回职位数据，已跳过 DOM fallback；如需强制降级可加 --allow-dom-fallback")
 
             if not jobs:
-                print("  ⚠️ 无数据")
+                # 空数据可能是风控静默降级信号（HTTP 200 + 空 jobList），
+                # 连续 N 页空则按风控处理挂起等人工，而非静默跳过
+                empty_pages += 1
+                if empty_pages >= 2:
+                    print("⚠️ 连续多页无数据（疑似风控静默降级），停止抓取（保留已抓数据）。")
+                    warnings.append("连续多页无数据（疑似风控静默降级）")
+                    print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                    send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                    return {"keyword": keyword, "city": city_name,
+                            "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
+                print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
                 continue
+
+            if len(jobs) < PAGE_SIZE:
+                exhausted = True  # 本页不足一页 → 已翻到底（--pages 1 单页 <30 同理）
 
             new = 0
             for j in jobs:
                 key = j.get('job_link') or j['title']
                 j['job_id'] = hashlib.md5(key.encode()).hexdigest()[:16]
+                observed_ids.append(j['job_id'])
+                sid_ = j.get('security_id')
+                if sid_:
+                    security_map[j['job_id']] = sid_
                 if key in seen:
                     continue
                 seen.add(key)
@@ -1504,12 +2387,38 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                     "filters": filters,
                     "filter_desc": filter_desc,
                     "scraped_at": datetime.now().isoformat(),
+                    "page_count": pg,
+                    "warnings": warnings,
+                    "run_id": run_id,
+                    "scraper_version": __version__,
+                    "started_at": run_started_at,
+                    "mode": "incremental",
+                    "observed_jobs": sorted(set(observed_ids)),
+                    "exhausted": exhausted,
                 }, all_jobs)
 
+            # 条数上限：抓够即停，不再翻页（BOSS 每页 30 条，实际可能略超上限）
+            if max_jobs and len(all_jobs) >= max_jobs:
+                print(f"  已抓 {len(all_jobs)} 条 ≥ 目标 {max_jobs}，停止翻页")
+                break
+
             if pg < max_pages:
-                d = random.uniform(12, 22)
+                # 并发 >1 时页间隔自动拉长（规格 §3.6 修订：12-22s → 20-30s）
+                if max_concurrent > 1:
+                    d = random.uniform(20, 30)
+                else:
+                    d = random.uniform(12, 22)
                 print(f"  翻页等待 {d:.0f}s...\n")
-                time.sleep(d)
+                # 长等待期间分片检查熔断广播（其他任务风控 → 立即停，不等到翻页完成）
+                for _ in range(4):
+                    if is_scrape_lock_risk():
+                        print("⚠️ 并发任务已触发风控熔断，本任务立即停止（保留已抓数据）。")
+                        warnings.append("并发任务风控熔断")
+                        print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                        return {"keyword": keyword, "city": city_name,
+                                "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
+                    time.sleep(d / 4)
 
     except KeyboardInterrupt:
         print("\n中断")
@@ -1518,18 +2427,28 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     finally:
         cdp.send("Target.closeTarget", {"targetId": tid})
         cdp.close()
+        release_scrape_lock()
 
     print(f"\n{'='*60}")
     print(f"完成: {len(all_jobs)} 条")
 
     if all_jobs:
-        # 最终写入（含时间戳更新）
+        # 最终写入（含时间戳更新 + run 级血缘字段 + B 增量观察集合）
         flush_jobs(output_path, {
             "keyword": keyword,
             "city": city_name,
             "filters": filters,
             "filter_desc": filter_desc,
             "scraped_at": datetime.now().isoformat(),
+            "page_count": actual_pages or 1,
+            "warnings": warnings,
+            "run_id": run_id,
+            "scraper_version": __version__,
+            "started_at": run_started_at,
+            "ended_at": datetime.now().isoformat(),
+            "mode": "incremental",
+            "observed_jobs": sorted(set(observed_ids)),
+            "exhausted": exhausted,
         }, all_jobs)
         print(f"已保存: {output_path}")
 
@@ -1540,7 +2459,10 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     else:
         print("无数据")
 
-    return {"keyword": keyword, "city": city_name, "total": len(all_jobs), "jobs": all_jobs}
+    # AS-8 结构化结果行（规格 §3.4）：供下游程序/人 30 秒判断本次导出可信度
+    print(f"EXPORT_OK jobs={len(all_jobs)} city={city_name} keyword={keyword} path={output_path}")
+    return {"keyword": keyword, "city": city_name, "total": len(all_jobs),
+            "jobs": all_jobs, "output_path": output_path, "security_map": security_map, "city_code": city_code}
 
 
 # ============================================================
@@ -1565,59 +2487,752 @@ def build_detail_record(job, extracted):
         "link": link,
         "skill_tags": extracted.get("tags", []),
         "jd": extracted.get("jd", ""),
+        "page_update_date": extracted.get("page_update_date", ""),
+        # 详情 API 通道新增可选字段（2026-08-14；用户拍板精简范围；DOM 路径缺省空，兼容）
+        "job_status_desc": extracted.get("job_status_desc", ""),
+        "brand_introduce": extracted.get("brand_introduce", ""),
+        "brand_stage_name": extracted.get("brand_stage_name", ""),
+        "brand_scale_name": extracted.get("brand_scale_name", ""),
+        "brand_industry_name": extracted.get("brand_industry_name", ""),
     }
 
 
-def scrape_details(list_data, max_details=None, output_path=None,
-                   cdp_port=DEFAULT_CDP_PORT, fmt="json"):
-    jobs = list_data.get("jobs", [])
-    if max_details:
-        jobs = jobs[:max_details]
-    if not output_path:
-        output_path = default_output_path("details")
+def eval_detail_with_retry(ws, sid, detail_url, retries=1):
+    """提取详情页 JS；完全为空时刷新页面重试（凭证自愈）。
 
-    print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
-    results = []
-    seen_links = set()
+    Returns:
+        解析后的 dict（{jd, page_text, tags, url}）；全部失败返回 {"jd": "", "tags": []}。
+    """
+    def _extract_once():
+        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
+        try:
+            return json.loads(val) if isinstance(val, str) else {"jd": "", "tags": []}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {"jd": "", "tags": []}
 
-    for idx, job in enumerate(jobs):
-        link = job.get("job_link", "")
-        title = job.get("title", "")
-        company = job.get("boss_name", "")
-        if not link:
+    d = _extract_once()
+    for _ in range(max(retries, 0)):
+        if d.get("jd") or d.get("page_text"):
+            break
+        print("  ⚠️ 提取为空，刷新页面重试一次...")
+        ws.send("Page.navigate", {"url": detail_url}, sid)
+        time.sleep(random.uniform(5, 10))
+        d = _extract_once()
+    return d
+
+
+def load_existing_detail_ids(output_path=None):
+    """读取已有详情文件中的 job_id 集合，用于跨运行跳过已抓详情。
+
+    Returns:
+        set: 已有 job_id；文件不存在或损坏返回空集合。
+    """
+    if not output_path or not os.path.exists(output_path):
+        return set()
+    try:
+        with open(output_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return set()
+    items = data if isinstance(data, list) else []
+    return {d.get("job_id", "") for d in items if isinstance(d, dict) and d.get("job_id")}
+
+
+def pending_path_for(output_path):
+    """待重试详情 job_id 清单文件路径（与输出文件同目录）。"""
+    return f"{output_path}.pending.json"
+
+
+def load_pending_ids(output_path, force_ids=None):
+    """读取待重试详情 job_id → 已重试次数映射。
+
+    兼容旧格式（纯字符串 job_id 列表，计数归零）；达到重试上限的
+    job 直接放弃（不返回），避免永久失败的短 JD 反复消耗请求。
+
+    Args:
+        output_path: 详情输出路径（pending 文件与其同目录）
+        force_ids: 用户强制重试白名单（iterable of str）；名单内 job_id
+            无视重试次数上限，文件中未记录的也会加入返回结果
+
+    Returns:
+        dict: {job_id: attempts}
+    """
+    force = {str(j).strip() for j in (force_ids or []) if str(j).strip()}
+    path = pending_path_for(output_path)
+    if not os.path.exists(path):
+        return {jid: 0 for jid in force}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {jid: 0 for jid in force}
+    if not isinstance(data, list):
+        return {jid: 0 for jid in force}
+
+    pending = {}
+    for item in data:
+        if isinstance(item, str):
+            job_id, attempts = item.strip(), 0
+        elif isinstance(item, dict):
+            job_id = str(item.get("job_id") or "").strip()
+            try:
+                attempts = int(item.get("attempts") or 0)
+            except (TypeError, ValueError):
+                attempts = 0
+        else:
             continue
+        if job_id and (attempts < MAX_PENDING_RETRIES or job_id in force):
+            pending[job_id] = attempts
+    for jid in force:
+        if jid not in pending:
+            pending[jid] = 0
+    return pending
 
-        # 按 link 去重
-        if link in seen_links:
-            print(f"[{idx+1}/{len(jobs)}] 跳过重复: {company} - {title}")
+
+def save_pending_ids(output_path, ids):
+    """原子写回待重试详情（job_id → 重试次数）；空映射时删除文件。
+
+    Args:
+        ids: {job_id: attempts} 映射
+    """
+    path = pending_path_for(output_path)
+    if not ids:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return
+    _atomic_write_json(path, [
+        {"job_id": job_id, "attempts": attempts}
+        for job_id, attempts in sorted(ids.items())
+    ])
+
+
+# ============================================================
+# --verify 结果文件校验
+# ============================================================
+def _classify_result_file(name):
+    """按文件名分类结果目录条目：jobs / details / pending / other。"""
+    if name.endswith(".pending.json"):
+        return "pending"
+    if name.startswith("boss_jobs_"):
+        return "jobs"
+    if name.startswith("boss_details_"):
+        return "details"
+    return "other"
+
+
+def list_results(result_dir=DEFAULT_RESULT_DIR):
+    """列出结果目录中的结果文件（按修改时间倒序）。
+
+    Returns:
+        list of dict: {"path", "kind", "size", "modified"}
+    """
+    entries = []
+    try:
+        names = os.listdir(result_dir)
+    except OSError:
+        return entries
+    for name in names:
+        if not name.endswith(".json"):
             continue
-        seen_links.add(link)
+        path = os.path.join(result_dir, name)
+        kind = _classify_result_file(name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        entries.append({
+            "path": path, "kind": kind,
+            "size": st.st_size, "modified": st.st_mtime,
+        })
+    entries.sort(key=lambda e: e["modified"], reverse=True)
+    return entries
 
-        t0 = time.time()
-        print(f"[{idx+1}/{len(jobs)}] {company} - {title}")
 
-        incr_request()
+# _merge_jd_into_export 已抽出到 scripts/export_contract.py
+# （见顶部导入兼容层；P1 架构重构 2026-09-22）。
 
-        # 每个详情页用新 session 避免检测；自动化 target 默认后台创建。
+
+def archive_results(result_dir=DEFAULT_RESULT_DIR, keep_latest=1, archive_dir=None):
+    """归档结果目录中的历史结果文件。
+
+    jobs 与 details 各自保留最新的 keep_latest 个，其余移到 archive 子目录；
+    pending 是断点续抓的活动文件，不归档；CSV 不移动。
+
+    Args:
+        result_dir: 结果目录
+        keep_latest: 每个类型保留的最新文件数
+        archive_dir: 归档目录（默认 result_dir/archive）
+
+    Returns:
+        int: 归档的文件数
+    """
+    archive_dir = archive_dir or os.path.join(result_dir, "archive")
+    moved = 0
+    for kind in ("jobs", "details"):
+        candidates = [e for e in list_results(result_dir) if e["kind"] == kind]
+        for entry in candidates[keep_latest:]:
+            os.makedirs(archive_dir, exist_ok=True)
+            dst = os.path.join(archive_dir, os.path.basename(entry["path"]))
+            shutil.move(entry["path"], dst)
+            moved += 1
+            print(f"  📦 归档 {os.path.basename(entry['path'])}")
+    return moved
+
+
+def run_list_results(result_dir=DEFAULT_RESULT_DIR):
+    """打印 --list-results 报告并返回退出码。"""
+    entries = list_results(result_dir)
+    if not entries:
+        print(f"结果目录为空: {result_dir}")
+        return 0
+    print(f"\n=== 抓取结果文件（{len(entries)} 个）===")
+    for e in entries:
+        modified = datetime.fromtimestamp(e["modified"]).strftime("%Y-%m-%d %H:%M")
+        print(f"  [{e['kind']:>7}] {modified}  {e['size']:>9} B  {os.path.basename(e['path'])}")
+    print()
+    return 0
+
+
+def run_archive(result_dir=DEFAULT_RESULT_DIR, keep_latest=1):
+    """执行 --archive 并返回退出码。"""
+    print(f"\n=== 归档历史结果（保留每个类型最新 {keep_latest} 个）===")
+    moved = archive_results(result_dir, keep_latest=keep_latest)
+    if moved == 0:
+        print("  ℹ️  无需归档")
+    else:
+        print(f"  ✅ 已归档 {moved} 个文件到 {os.path.join(result_dir, 'archive')}")
+    print()
+    return 0
+
+
+# ============================================================
+# --batch 批量任务编排
+# ============================================================
+FILTER_KEYS = ["scale", "stage", "salary", "experience", "degree", "industry"]
+
+
+def load_batch_config(path):
+    """加载 --batch 任务配置（JSON 数组）；返回 (tasks, errors)。
+
+    每个任务支持字段：keyword(必填)、city(默认上海)、pages(默认 3，
+    自动限制在 1..MAX_PAGES)、sleep(任务间等待秒数，缺省随机 30-60)、
+    detail(可选布尔，覆盖全局"默认抓完整"设置；false = 仅列表)、
+    scale/stage/salary/experience/degree/industry（筛选）。非法任务
+    跳过并记录错误，不中断其余任务。
+
+    Args:
+        path: 配置文件路径
+
+    Returns:
+        (list, list): 合法任务列表与错误信息列表
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        return [], [f"配置文件无法读取: {e}"]
+    if not isinstance(data, list):
+        return [], ["配置必须是 JSON 数组（每个元素一个任务）"]
+
+    tasks = []
+    errors = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict):
+            errors.append(f"任务 {i + 1}: 不是对象，已跳过")
+            continue
+        keyword = str(item.get("keyword") or "").strip()
+        if not keyword:
+            errors.append(f"任务 {i + 1}: 缺少 keyword，已跳过")
+            continue
+        try:
+            pages = int(item.get("pages") or 3)
+        except (TypeError, ValueError):
+            errors.append(f"任务 {i + 1}: pages 必须是整数，已跳过")
+            continue
+        task = {
+            "keyword": keyword,
+            "city": str(item.get("city") or DEFAULT_CITY_INPUT).strip(),
+            "pages": min(max(pages, 1), MAX_PAGES),
+        }
+        if item.get("sleep") is not None:
+            try:
+                task["sleep"] = max(float(item["sleep"]), 0)
+            except (TypeError, ValueError):
+                errors.append(f"任务 {i + 1}: sleep 必须是数字，已忽略该字段")
+        if item.get("detail") is not None:
+            task["detail"] = bool(item["detail"])
+        for key in FILTER_KEYS:
+            if item.get(key):
+                task[key] = item[key]
+        tasks.append(task)
+    return tasks, errors
+
+
+def _detail_path_for_list(list_path):
+    """由列表文件路径推导详情文件路径（同名 boss_details_*）；无法推导返回 None。"""
+    if not list_path:
+        return None
+    base = os.path.basename(list_path)
+    if not base.startswith("boss_jobs_"):
+        return None
+    return os.path.join(os.path.dirname(list_path),
+                        "boss_details_" + base[len("boss_jobs_"):])
+
+
+def _list_has_detail_risk(list_path):
+    """列表文件 warnings 是否含详情风控降级标记（detail_risk_blocked）。"""
+    try:
+        with open(list_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        return any("detail_risk_blocked" in str(w)
+                   for w in (meta.get("warnings") or []))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return False
+
+
+def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
+              detail=True, detail_concurrency=1, keep_without_jd=False):
+    """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
+
+    与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
+    securityId 由列表阶段内存传递）。命中详情风控（验证码/风控码）时全停并
+    提前结束批量（不硬闯、不重试风暴），等人工处理后重跑（断点续抓自动补齐）。
+
+    支持 --max-concurrent 透传：多个 batch 进程并行时锁允许多个持有者
+    （如 2 个 batch 各跑一半任务 + max_concurrent=2 即并发 2）。
+
+    完成后自动完整性校验（2026-08-12 撞名事故教训）：对比任务数 vs
+    结果目录新增文件数，不一致输出 EXPORT_FAIL reason=batch_shortfall
+    （并发/撞名/写盘异常时立即暴露，不必等人工数文件）。
+
+    Returns:
+        int: 退出码（0 全成功 / 1 有任务失败、配置错误或详情风控命中提前结束）
+    """
+    tasks, errors = load_batch_config(config_path)
+    for err in errors:
+        print(f"⚠️  {err}")
+    if not tasks:
+        print("❌ 没有可执行的批量任务")
+        return 1
+
+    # 记录开始前的结果目录文件集合（供完成校验对比）
+    try:
+        before = {n for n in os.listdir(DEFAULT_RESULT_DIR)
+                  if n.startswith("boss_jobs_") and n.endswith(".json")}
+    except OSError:
+        before = set()
+
+    print(f"\n=== 批量列表抓取（{len(tasks)} 个任务，max_concurrent={max_concurrent}）===")
+    failed = 0
+    for i, task in enumerate(tasks):
+        filters = {k: task[k] for k in FILTER_KEYS if k in task}
+        print(f"\n[{i + 1}/{len(tasks)}] {task['keyword']} @ {task['city']} "
+              f"（{task['pages']} 页）")
+        try:
+            list_data = scrape_list(
+                task["keyword"], task["city"], task["pages"], filters, None,
+                cdp_port=cdp_port, max_jobs=None,
+                max_concurrent=max_concurrent,
+            )
+        except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
+            failed += 1
+            print(f"  ❌ 任务失败: {e}")
+            list_data = None
+
+        # 默认抓完整：列表抓完即接详情（详情 API 通道；--no-detail/任务级
+        # detail=false 时跳过）；风控命中则全停并提前结束批量
+        task_detail = task.get("detail", detail)
+        has_jobs = (isinstance(list_data, dict)
+                    and isinstance(list_data.get("jobs"), list)
+                    and list_data["jobs"])
+        if task_detail and has_jobs:
+            raw_path = list_data.get("output_path")
+            list_path = raw_path if isinstance(raw_path, str) else ""
+            try:
+                details_result = scrape_details(
+                    list_data, output_path=_detail_path_for_list(list_path),
+                    cdp_port=cdp_port, concurrency=detail_concurrency,
+                    list_output_path=list_path or None,
+                    security_map=list_data.get("security_map"),
+                )
+            except Exception as e:  # 有意宽捕：详情失败不中断批量其余任务
+                failed += 1
+                print(f"  ❌ 详情抓取失败: {e}")
+                details_result = None
+            if list_path and _list_has_detail_risk(list_path):
+                print("\n⚠️ 详情风控命中（已全停），批量任务提前结束；"
+                      "请人工处理后重跑（断点续抓自动补齐）。")
+                return 1
+            # 口径一：把 jd 并入列表并剔除无 JD 岗位（与单命令路径一致）
+            if list_path and isinstance(details_result, list):
+                merged_export = _merge_jd_into_export(
+                    list_path, details_result, base=list_data,
+                    keep_without_jd=keep_without_jd)
+                if merged_export:
+                    kept, dropped = merged_export
+                    print(f"  ✅ 口径一：{task['keyword']}@{task['city']} 导出 {kept} 条"
+                          + (f"，剔除无 JD {dropped} 条" if dropped else ""))
+
+        if i < len(tasks) - 1:
+            gap = task.get("sleep") or random.uniform(30, 60)
+            print(f"任务间等待 {gap:.0f}s 防风控...")
+            time.sleep(gap)
+
+    # 完成校验：任务数 vs 实际落盘新文件数
+    try:
+        after = {n for n in os.listdir(DEFAULT_RESULT_DIR)
+                 if n.startswith("boss_jobs_") and n.endswith(".json")}
+    except OSError:
+        after = set()
+    new_files = after - before
+    expected_files = len(tasks) - failed  # 失败任务不出文件
+    if len(new_files) < expected_files:
+        print(f"\n❌ 完整性校验失败：任务 {expected_files} 个（失败 {failed}），"
+              f"结果目录新增文件 {len(new_files)} 个（可能撞名/写盘异常）。")
+        print(f"EXPORT_FAIL reason=batch_shortfall tasks_done={len(new_files)} "
+              f"tasks_expected={expected_files}")
+        return 1
+
+    print(f"\n✅ 批量任务完成：成功 {len(tasks) - failed}/{len(tasks)}，"
+          f"落盘 {len(new_files)} 个文件（完整性校验通过）")
+    return 0 if failed == 0 else 1
+
+
+def latest_results_file(kind):
+    """默认结果目录下最新文件（kind: "jobs" / "details"）；目录缺失返回 None。"""
+    prefix = "boss_jobs_" if kind == "jobs" else "boss_details_"
+    candidates = []
+    try:
+        for name in os.listdir(DEFAULT_RESULT_DIR):
+            if name.startswith(prefix) and name.endswith(".json"):
+                path = os.path.join(DEFAULT_RESULT_DIR, name)
+                candidates.append((os.path.getmtime(path), path))
+    except OSError:
+        return None
+    return max(candidates)[1] if candidates else None
+
+
+def _latest_details_path(list_path):
+    """自动查找与列表同目录的详情文件：同时间戳优先，其次最新。"""
+    base = os.path.dirname(list_path) or "."
+    stem = os.path.basename(list_path)
+    if stem.startswith("boss_jobs_"):
+        stamp = stem[len("boss_jobs_"):]
+        same_stamp = os.path.join(base, f"boss_details_{stamp}")
+        if os.path.exists(same_stamp):
+            return same_stamp
+    candidates = []
+    try:
+        for name in os.listdir(base):
+            if name.startswith("boss_details_") and name.endswith(".json") \
+                    and not name.endswith(".pending.json"):
+                path = os.path.join(base, name)
+                candidates.append((os.path.getmtime(path), path))
+    except OSError:
+        return None
+    return max(candidates)[1] if candidates else None
+
+
+def verify_results(list_path, details_path=None):
+    """校验已抓取结果文件完整性。
+
+    检查：列表/详情 JSON 可解析性、job 必备字段（job_id/title）、重复
+    job_id、详情 JD 完整度（短于 MIN_DETAIL_TEXT_LENGTH 视为残缺）、
+    列表-详情覆盖率。
+
+    Args:
+        list_path: boss_jobs_*.json 路径
+        details_path: boss_details_*.json 路径；不传则自动查找
+            （同时间戳优先，其次最新）
+
+    Returns:
+        dict: {"ok", "issues", "list": {"count"}, "details": {"count"},
+               "detail_path", "coverage", "missing"}
+    """
+    issues = []
+
+    list_count = 0
+    list_ids = set()
+    if not os.path.exists(list_path):
+        issues.append(f"列表文件不存在: {list_path}")
+        list_data = None
+    else:
+        try:
+            with open(list_path, encoding="utf-8") as f:
+                list_data = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            issues.append(f"列表文件无法解析: {e}")
+            list_data = None
+    if list_data is not None:
+        jobs = list_data.get("jobs") if isinstance(list_data, dict) else None
+        if not isinstance(jobs, list) or not jobs:
+            issues.append("列表没有职位数据（jobs 为空或缺失）")
+        else:
+            list_count = len(jobs)
+            seen = set()
+            missing_fields = 0
+            dup = set()
+            for job in jobs:
+                if not isinstance(job, dict):
+                    continue
+                jid = str(job.get("job_id") or "").strip()
+                if not jid or not str(job.get("title") or "").strip():
+                    missing_fields += 1
+                if jid:
+                    if jid in seen:
+                        dup.add(jid)
+                    seen.add(jid)
+                    list_ids.add(jid)
+            if missing_fields:
+                issues.append(f"列表有 {missing_fields} 条记录缺少 job_id 或 title")
+            if dup:
+                issues.append(f"列表存在重复 job_id: {', '.join(sorted(dup)[:5])}")
+            if not list_ids:
+                issues.append("列表没有有效的 job_id，无法与详情匹配")
+
+    if details_path is None:
+        details_path = _latest_details_path(list_path)
+    detail_count = 0
+    detail_ids = set()
+    if details_path is None or not os.path.exists(details_path):
+        issues.append("未找到详情文件（可用 --detail-output 指定路径）")
+        details = None
+    else:
+        try:
+            with open(details_path, encoding="utf-8") as f:
+                details = json.load(f)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            issues.append(f"详情文件无法解析: {e}")
+            details = None
+    if details is not None:
+        if not isinstance(details, list) or not details:
+            issues.append("详情文件没有数据（空列表）")
+        else:
+            detail_count = len(details)
+            seen = set()
+            dup = set()
+            short_jd = 0
+            for d in details:
+                if not isinstance(d, dict):
+                    continue
+                jid = str(d.get("job_id") or "").strip()
+                if jid:
+                    if jid in seen:
+                        dup.add(jid)
+                    seen.add(jid)
+                    detail_ids.add(jid)
+                if len(str(d.get("jd") or "")) < MIN_DETAIL_TEXT_LENGTH:
+                    short_jd += 1
+            if dup:
+                issues.append(f"详情存在重复 job_id: {', '.join(sorted(dup)[:5])}")
+            if short_jd:
+                issues.append(f"详情有 {short_jd} 条 JD 过短（<{MIN_DETAIL_TEXT_LENGTH} 字），可能抓取残缺")
+
+    missing = sorted(list_ids - detail_ids) if list_ids else []
+    coverage = (len(list_ids) - len(missing)) / len(list_ids) if list_ids else 0.0
+    if list_ids and coverage < 1.0:
+        shown = ", ".join(missing[:5])
+        more = f" 等 {len(missing)} 条" if len(missing) > 5 else ""
+        issues.append(f"详情覆盖率 {coverage:.0%}，缺失 {len(missing)} 条: {shown}{more}")
+
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "list": {"count": list_count},
+        "details": {"count": detail_count},
+        "detail_path": details_path,
+        "coverage": coverage,
+        "missing": missing,
+    }
+
+
+def run_verify(list_path, details_path=None):
+    """打印 --verify 报告并返回退出码（0 全过 / 1 有问题）。"""
+    print("\n=== 校验抓取结果文件 ===")
+    print(f"列表: {list_path}")
+    report = verify_results(list_path, details_path)
+    print(f"详情: {report['detail_path'] or '未指定'}")
+    print(f"列表 {report['list']['count']} 条 / 详情 {report['details']['count']} 条 "
+          f"/ 覆盖率 {report['coverage']:.0%}")
+    if not report["issues"]:
+        print("✅ 校验通过：文件完整、字段齐全、详情覆盖列表")
+    else:
+        for i in report["issues"]:
+            print(f"  ❌ {i}")
+    print()
+    return 0 if report["ok"] else 1
+
+
+def progress_step(total):
+    """阶段进度汇报粒度：总量 ≤200 条每 10 条一报，超 200 后按 5%（取整）。
+
+    Args:
+        total: 待处理总数
+
+    Returns:
+        int: 汇报间隔（条数，至少 10）
+    """
+    return max(10, int(math.ceil(total * 0.05)))
+
+
+def resume_hint(pending, output_path):
+    """生成断点续抓提示；pending 为空返回空串。
+
+    详情输出路径不变时，pending 文件会被自动加载，重跑原命令即自动
+    跳过已抓、只补失败详情，无需拼写任何参数。
+
+    Args:
+        pending: {job_id: attempts} 待重试映射
+        output_path: 详情输出路径
+
+    Returns:
+        str: 提示文本（可能为空串）
+    """
+    if not pending:
+        return ""
+    path = pending_path_for(output_path)
+    return (f"ℹ️  {len(pending)} 个详情待重试（已记录到 {path}）。"
+            f"续抓：重跑刚才的命令即可——输出路径不变时自动跳过已抓、"
+            f"只补这 {len(pending)} 条")
+
+
+def _format_elapsed(seconds):
+    """耗时格式化：≥60 秒显示"X 分 Y 秒"，否则"Y 秒"。"""
+    seconds = int(seconds)
+    if seconds >= 60:
+        return f"{seconds // 60} 分 {seconds % 60} 秒"
+    return f"{seconds} 秒"
+
+
+def run_summary(elapsed_sec, total, ok_count, reason_counts):
+    """生成详情抓取结束统计行；无任务返回空串。
+
+    Args:
+        elapsed_sec: 已耗时（秒）
+        total: 处理总数
+        ok_count: 成功数
+        reason_counts: 失败原因分类 {reason: count}（不含成功）
+
+    Returns:
+        str: 统计行（可能为空串）
+    """
+    if total <= 0:
+        return ""
+    failed = total - ok_count
+    reason_txt = "，".join(
+        f"{k}:{v}" for k, v in sorted(reason_counts.items())) if reason_counts else "—"
+    rate = math.ceil(elapsed_sec / total)
+    line = (f"  ✅ 完成 {total} 条：成功 {ok_count}，失败 {failed}（{reason_txt}）"
+            f"| 耗时 {_format_elapsed(elapsed_sec)}，平均 {rate}s/条")
+    # 平台漂移信号：列表正常但详情大面积 CDP 会话失败 → 提示检查页面结构/风控，
+    # 不要在同一轮里反复重试（平台侧结构性变化，重试纯浪费）
+    cdp_fails = reason_counts.get("cdp_session", 0)
+    if failed >= 5 and cdp_fails / max(failed, 1) > 0.5:
+        line += ("\n  ⚠️ 平台漂移信号：详情大面积 CDP 会话失败（列表正常但详情异常），"
+                 "建议检查页面结构/风控状态后再重试详情")
+    return line
+
+
+def progress_line(completed, total, ok_count):
+    """生成阶段进度汇总行；未到汇报点返回 None（避免刷屏）。
+
+    每 progress_step(total) 条汇报一次，完成时（completed == total）
+    即使不整除也汇报，保证任务结束有最终汇总。
+
+    Args:
+        completed: 已处理条数
+        total: 总数
+        ok_count: 成功条数
+
+    Returns:
+        str|None: 汇总行文本
+    """
+    if total <= 0:
+        return None
+    if completed % progress_step(total) != 0 and completed != total:
+        return None
+    pct = completed / total * 100
+    return f"  [进度 {completed}/{total} {pct:.0f}%] 成功 {ok_count}，失败 {completed - ok_count}"
+
+
+# TokenBucket / AdaptiveRateLimiter 已抽出到 scripts/ratelimit.py，
+# 由文件顶部导入兼容层 re-export（见 P1 架构重构 2026-09-22）。
+
+
+def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
+                       limiter=None, verbose=False, security_id=None,
+                       api_session=None, city_code="", search_keyword=""):
+    """抓取单个岗位详情（串行/并发共用的 worker 单元，不写盘、不管理 pending）。
+
+    Args:
+        job: 列表 job dict（含 job_link / job_id / title 等）
+        cdp_port: CDP 端口
+        stop_event: 可选 threading.Event；置位时提前返回（登录墙/熔断等
+            全局停止信号），不再发起新会话
+        limiter: 可选 AdaptiveRateLimiter；并发模式下在导航前申请全局配额
+        security_id: 列表阶段暂存的岗位 securityId（详情 API 通道凭据，
+            内存传递不落盘）；为 None 时回退详情页 DOM 渲染路径（--input 兼容）
+        api_session: 可选 (CDPSession, target_id, session_id) 共享会话——
+            详情 API 通道复用一个停靠在 zhipin 域的 tab，避免每岗导航
+        city_code: 城市码（详情 API 参数）
+        search_keyword: 本次抓取关键词（详情 API 通道自建 tab 时的停靠页参数）
+
+    Returns:
+        dict: {"ok": bool, "detail": dict|None, "job_id": str,
+               "reason": str, "message": str}
+        reason 取值: "" | "stopped" | "cdp_session" | "risk_timeout"
+                   | "invalid_detail" | "login_required"
+    """
+    job_id = job.get("job_id", "")
+    if stop_event is not None and stop_event.is_set():
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "stopped", "message": "已收到停止信号"}
+
+    # 详情 API 通道（security_id 存在时优先；轻量 XHR 替代整页渲染）
+    if security_id:
+        return _scrape_one_detail_via_api(
+            job, cdp_port, stop_event=stop_event, limiter=limiter,
+            verbose=verbose, security_id=security_id,
+            api_session=api_session, city_code=city_code,
+            search_keyword=search_keyword)
+
+    ws = None
+    tid = None
+    try:
         ws = CDPSession(cdp_port)
         tid, sid = create_page_session(ws)
 
         detail_url = build_detail_url(job)
+        # 并发模式全局限速：导航（真实请求）前申请配额
+        if limiter is not None:
+            limiter.acquire()
         ws.send("Page.navigate", {"url": detail_url}, sid)
-        print(f"  加载页面...")
+        if verbose:
+            print("  加载页面...")
         time.sleep(random.uniform(5, 10))
+
+        # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入
+        is_risk, risk_reason = classify_risk_page(probe_risk_page(ws, sid))
+        if is_risk and not wait_for_risk_clear(ws, sid):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "risk_timeout", "message": risk_reason}
 
         # 模拟人类阅读详情页的滚动行为
         scroll_count = random.randint(3, 7)
-        print(f"  模拟滚动 ({scroll_count} 次)...")
-        for i in range(scroll_count):
+        if verbose:
+            print(f"  模拟滚动 ({scroll_count} 次)...")
+        for _ in range(scroll_count):
+            if stop_event is not None and stop_event.is_set():
+                return {"ok": False, "detail": None, "job_id": job_id,
+                        "reason": "stopped", "message": "已收到停止信号"}
             if random.random() < 0.12:
-                # 偶尔往上回滚（回看内容）
                 delta = -random.randint(80, 200)
             else:
                 delta = random.randint(200, 600)
             ws.eval_js(f"window.scrollBy(0,{delta})", sid)
-            # 有时快滚，有时停下来"阅读"
             if random.random() < 0.35:
                 time.sleep(random.uniform(2.0, 5.0))
             else:
@@ -1632,64 +3247,544 @@ def scrape_details(list_data, max_details=None, output_path=None,
             }, sid)
             time.sleep(random.uniform(0.5, 1.5))
 
-        print(f"  提取 JD...")
-        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
-        try:
-            d = json.loads(val) if isinstance(val, str) else {"jd": "", "tags": []}
-        except (json.JSONDecodeError, ValueError, TypeError):
-            d = {"jd": "", "tags": []}
-
+        d = eval_detail_with_retry(ws, sid, detail_url)
         try:
             fields = extract_detail_fields(d)
             d["jd"] = fields["jd"]
-            d["boss_active_status"] = resolve_boss_active_status(
-                list_status=job.get("boss_active_status", ""),
-                detail_status=fields["boss_active_status"],
-            )
+            d["boss_active_status"] = fields["boss_active_status"]
+            d["page_update_date"] = fields["page_update_date"]
         except DetailLoginRequiredError as exc:
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
-            raise RuntimeError(
-                "BOSS detail login expired; stopped before writing truncated JD data"
-            ) from exc
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "login_required", "message": str(exc)}
         except DetailExtractionError as exc:
-            print(f"  跳过无效详情页: {exc}")
-            ws.send("Target.closeTarget", {"targetId": tid})
-            ws.close()
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": str(exc)}
+
+        return {"ok": True, "detail": build_detail_record(job, d),
+                "job_id": job_id, "reason": "", "message": ""}
+    except _cdp_exception_types() as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "cdp_session", "message": str(exc)}
+    finally:
+        if ws is not None:
+            try:
+                if tid is not None:
+                    ws.send("Target.closeTarget", {"targetId": tid})
+                ws.close()
+            except _cdp_exception_types():
+                log.debug("关闭详情会话失败", exc_info=True)
+
+
+def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
+                               verbose=False, security_id="", api_session=None,
+                               city_code="", search_keyword=""):
+    """详情 API 通道：1 次轻量 XHR 取完整 JD（替代详情页整页渲染）。
+
+    复用 api_session（共享停靠 tab，避免每岗导航）；无 api_session 时自建
+    tab 并导航搜索页（一次，用真实关键词而非岗位标题——避免误导性额外搜索）。
+    失败分类：风控码 → risk_timeout（上层全停）、内容过短/结构异常 →
+    invalid_detail（不进 pending）、网络 → cdp_session。
+    """
+    job_id = job.get("job_id", "")
+    shared = api_session is not None
+    ws = None
+    tid = None
+    sid = None
+    try:
+        if shared:
+            ws, tid, sid = api_session[0], api_session[1], api_session[2]
+        else:
+            ws = CDPSession(cdp_port)
+            tid, sid = create_page_session(ws)
+            # 停靠 zhipin 域页面（搜索页），fetch 需要同域 + 会话 cookie；
+            # 用真实关键词而非岗位标题（岗位标题会导致每次都是一次无关搜索，
+            # 既浪费也增加风控暴露——2026-09-22 审计修复）
+            ws.send("Page.navigate", {"url": build_search_url(
+                search_keyword or "", city_code or "", 1, {})}, sid)
+            time.sleep(random.uniform(4, 8))
+
+        if limiter is not None:
+            limiter.acquire()
+        api_url = build_detail_api_url(job, security_id, city_code=city_code)
+        js = DETAIL_API_JS.replace("__API_URL__", api_url)
+        val = ws.eval_js(js, sid)
+        try:
+            fields = _parse_detail_api_value(val, job)
+        except DetailRiskError as exc:
+            # 风控码：与列表阶段同构——退避重试由上层 pending/全停逻辑接管
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "risk_timeout", "message": str(exc)}
+        except DetailExtractionError as exc:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail", "message": str(exc)}
+        return {"ok": True, "detail": build_detail_record(job, fields),
+                "job_id": job_id, "reason": "", "message": ""}
+    except _cdp_exception_types() as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "cdp_session", "message": str(exc)}
+    finally:
+        if not shared and ws is not None:
+            try:
+                if tid is not None:
+                    ws.send("Target.closeTarget", {"targetId": tid})
+                ws.close()
+            except _cdp_exception_types():
+                log.debug("关闭详情 API 会话失败", exc_info=True)
+
+
+def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
+    """验证码命中 → 全停。输出 EXPORT_FAIL risk_blocked（08 规格 §3.6 语义，
+    规格侧判定信号）+ 列表文件 warnings 追加原因 + 告警推送。
+
+    注：列表阶段成功已输出 EXPORT_OK（时序事实不可撤回）；详情阶段全停
+    追加 EXPORT_FAIL 行，规格侧以 EXPORT_FAIL 为当日异常判定信号。
+    """
+    fail_line = (f"EXPORT_FAIL reason=risk_blocked city={city_name} "
+                 f"keyword={keyword} detail=验证码命中已全部停止")
+    print("⚠️ 验证码命中，已全部停止（保留已抓数据）")
+    print(fail_line)
+    send_alert("验证码全停", fail_line)
+    if not list_output_path or not os.path.exists(list_output_path):
+        return
+    try:
+        with open(list_output_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        warnings = meta.setdefault("warnings", [])
+        if not any("detail_risk_blocked" in w for w in warnings):
+            warnings.append(
+                "detail_risk_blocked: 验证码命中，已全部停止（保留已抓数据）")
+            _atomic_write_json(list_output_path, meta)
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
+def scrape_details(list_data, max_details=None, output_path=None,
+                   cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
+                   concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
+                   security_map=None):
+    """抓取详情。
+
+    Args:
+        list_output_path: 可选列表文件路径——E 降级（验证码命中全停）时
+            在列表文件 meta.warnings 追加降级原因（规格侧方案：EXPORT_OK
+            + warnings 承载降级信号；None 时不更新列表文件）。
+        security_map: 可选 {job_id: securityId}（scrape_list 同进程内存传递，
+            详情 API 通道凭据；为 None 时走详情页 DOM 渲染路径）。
+    """
+    jobs = list_data.get("jobs", [])
+    if max_details:
+        jobs = jobs[:max_details]
+    if not output_path:
+        output_path = default_output_path("details")
+
+    print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
+    # 断点续抓：先加载已有结果文件，避免"跳过已抓 + 全量覆盖"把旧数据冲掉
+    results = []
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                results = data
+        except (json.JSONDecodeError, OSError, ValueError):
+            log.warning(f"加载已有详情文件失败，从空开始: {output_path}")
+    seen_links = set()
+    # 历史 job_id 预加载：已抓过的详情直接跳过（省请求、降风控触发概率）
+    existing_ids = load_existing_detail_ids(output_path)
+    if existing_ids:
+        print(f"ℹ️  已加载 {len(existing_ids)} 个历史详情 job_id，命中直接跳过")
+    # 断点续跑：上次失败待重试的 job_id（即使已在结果文件里也重新抓取）
+    pending = dict(pending_ids) if pending_ids is not None else load_pending_ids(output_path)
+    if pending:
+        print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
+
+    # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/渐进落盘/pending
+    if concurrency > 1:
+        print(f"⚡ 并发详情抓取（--concurrency {concurrency}，全局限速 + 错误率自适应降速）")
+        results, pending = _scrape_details_parallel(
+            jobs, cdp_port, concurrency,
+            existing_ids=existing_ids, pending_ids=pending,
+            existing_results=results, output_path=output_path,
+            list_output_path=list_output_path,
+            keyword=list_data.get("keyword", ""),
+            security_map=security_map or {},
+            city=list_data.get("city", ""),
+            city_code=list_data.get("city_code", ""))
+        if pending:
+            print(resume_hint(pending, output_path))
+        print(f"\n详情已保存: {output_path}")
+        if fmt == "csv":
+            csv_path = output_path.rsplit(".", 1)[0] + ".csv"
+            write_detail_csv(csv_path, results)
+        return results
+
+    consecutive_cdp_errors = 0
+    serial_ok = 0
+    serial_done = 0
+    serial_reasons = {}
+    start_time = time.time()
+
+    # 详情 API 通道（串行）：停靠 zhipin 域 tab，按 DETAIL_API_TAB_BUDGET 主动
+    # 轮换（实测同一 tab 连续约 4-5 次详情后 code 37，换 tab 立即重置），
+    # 从而支撑批量抓取（余下均为轻量 XHR，避免整页渲染）
+    api_session = None
+    detail_keyword = list_data.get("keyword", "") or ""
+    detail_city_code = list_data.get("city_code", "") or ""
+    if security_map:
+        try:
+            api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
+        except _cdp_exception_types():
+            log.warning("详情 API 共享会话建立失败，回退逐岗自建会话", exc_info=True)
+            api_session = None
+
+    for idx, job in enumerate(jobs):
+        link = job.get("job_link", "")
+        title = job.get("title", "")
+        company = job.get("boss_name", "")
+        job_id = job.get("job_id", "")
+        if not link:
             continue
 
-        detail = build_detail_record(job, d)
-        results.append(detail)
+        # 按 link 去重
+        if link in seen_links:
+            print(f"[{idx+1}/{len(jobs)}] 跳过重复: {company} - {title}")
+            continue
+        seen_links.add(link)
 
-        if d.get("tags"):
-            print(f"  技能: {', '.join(d['tags'])}")
-        if d.get("boss_active_status"):
-            print(f"  活跃: {d['boss_active_status']}")
-        print(f"  JD: {len(d.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
+        # 跨运行跳过已抓详情（pending 中的例外，待重试）
+        if job_id and job_id in existing_ids and job_id not in pending:
+            print(f"[{idx+1}/{len(jobs)}] 跳过已抓详情: {company} - {title}")
+            continue
 
-        # 每抓完一个详情就写入，异常退出也能保留
-        if output_path:
-            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-            with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(results, f, ensure_ascii=False, indent=2)
+        t0 = time.time()
+        print(f"[{idx+1}/{len(jobs)}] {company} - {title}")
 
-        ws.send("Target.closeTarget", {"targetId": tid})
-        ws.close()
-        # 详情页间隔加大，随机 10-25 秒
-        gap = random.uniform(10, 25)
+        incr_request("detail")
+
+        # 预算轮换：同一 tab 连续详情达预算即换新 tab（否则下一次必 code 37）
+        job_security = (security_map or {}).get(job_id)
+        if api_session is not None and api_session[3] >= DETAIL_API_TAB_BUDGET:
+            if _rotate_api_tab(api_session, cdp_port, detail_keyword, detail_city_code):
+                print(f"  ♻️ 详情 API 轮换新 tab（每 tab 预算 {DETAIL_API_TAB_BUDGET} 次）")
+            else:
+                api_session = None
+
+        result = _scrape_one_detail(job, cdp_port, verbose=True,
+                                    security_id=job_security,
+                                    api_session=api_session,
+                                    city_code=detail_city_code,
+                                    search_keyword=detail_keyword)
+        # 风控码可能是"本 tab 配额耗尽"：换 tab 重试一次；仍失败才判定真风控（全停）
+        if (result["reason"] == "risk_timeout" and job_security
+                and api_session is not None):
+            incr_request("detail")
+            if _rotate_api_tab(api_session, cdp_port, detail_keyword, detail_city_code):
+                print("  ♻️ 命中风控码，换 tab 重试该岗位一次...")
+                result = _scrape_one_detail(job, cdp_port, verbose=True,
+                                            security_id=job_security,
+                                            api_session=api_session,
+                                            city_code=detail_city_code,
+                                            search_keyword=detail_keyword)
+        if result["ok"] and api_session is not None:
+            api_session[3] += 1
+        reason = result["reason"]
+
+        if result["ok"]:
+            detail = result["detail"]
+            results.append(detail)
+            serial_ok += 1
+            serial_done += 1
+            # 抓取成功：从待重试清单移除
+            if job_id:
+                pending.pop(job_id, None)
+            if detail.get("tags"):
+                print(f"  技能: {', '.join(detail['tags'])}")
+            if detail.get("boss_active_status"):
+                print(f"  活跃: {detail['boss_active_status']}")
+            print(f"  JD: {len(detail.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
+            # 每抓完一个详情就写入，异常退出也能保留
+            if output_path:
+                _atomic_write_json(output_path, results)
+        elif reason == "login_required":
+            raise RuntimeError(
+                "BOSS detail login expired; stopped before writing truncated JD data"
+            )
+        elif reason == "cdp_session":
+            consecutive_cdp_errors += 1
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {result['message']}")
+            if job_id:
+                pending[job_id] = pending.get(job_id, 0) + 1
+                save_pending_ids(output_path, pending)
+            if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
+                print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
+                mark_cdp_cooldown()  # 熔断冷却：冷却内拒绝自动重开
+                print(f"  已进入冷却期（{CDP_COOLDOWN_SECONDS}s），可运行 --stop-chrome 后重新 --setup-chrome 再继续。")
+                break
+            continue
+        elif reason == "stopped":
+            break
+        elif reason == "risk_timeout":
+            # E 降级：详情风控命中（验证码/API 风控码）→ 全部停止
+            # （不再逐条等 120s 无效重试）；message 含实际风控形态（如 code=37），
+            # 必须打印——可观测性原则：风控形态不可见就无法区分频次限制与真验证码
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            print(f"  ⚠️ {result['message']}")
+            _note_detail_risk_blocked(list_output_path,
+                                      city_name=list_data.get("city", ""),
+                                      keyword=list_data.get("keyword", ""))
+            break
+        else:
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            if reason == "invalid_detail":
+                # 解析类失败（页面结构变了等）：重试纯浪费且掩盖结构漂移信号，不进 pending
+                print(f"  ⏭️ 跳过无效详情页（解析类失败不重试）: {result['message']}")
+            else:
+                print(f"  跳过无效详情页: {result['message']}")
+                if job_id:
+                    pending[job_id] = pending.get(job_id, 0) + 1
+                    save_pending_ids(output_path, pending)
+
+        # 详情页间隔：API 通道每 worker ≥ DETAIL_API_PACE_SECONDS（规格硬线，
+        # API 无渲染等待、限速器/间隔是唯一刹车）；DOM 通道沿用 10-25s。
+        if security_map:
+            gap = random.uniform(DETAIL_API_PACE_SECONDS, DETAIL_API_PACE_SECONDS * 1.6)
+        else:
+            gap = random.uniform(10, 25)
         print(f"  等待 {gap:.0f}s 后抓下一个...\n")
+        progress = progress_line(idx + 1, len(jobs), serial_ok)
+        if progress:
+            print(progress)
         time.sleep(gap)
 
+    # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
+    _close_api_tab(api_session)
+
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
+    _atomic_write_json(output_path, results)
+    save_pending_ids(output_path, pending)
+    if serial_done:
+        print(run_summary(time.time() - start_time,
+                          serial_done, serial_ok, serial_reasons))
+    if pending:
+        print(resume_hint(pending, output_path))
     print(f"\n详情已保存: {output_path}")
 
     if fmt == "csv":
         csv_path = output_path.rsplit(".", 1)[0] + ".csv"
         write_detail_csv(csv_path, results)
     return results
+
+
+def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
+                             existing_ids=None, pending_ids=None,
+                             existing_results=None, output_path=None,
+                             write_every=5, list_output_path=None,
+                             keyword="", city="", security_map=None,
+                             city_code=""):
+    """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
+
+    Args:
+        jobs: 列表 job dict 列表
+        cdp_port: CDP 端口
+        concurrency: 并发 worker 数
+        limiter: 可选 AdaptiveRateLimiter（全局限速）；None 时按并发度自建
+        existing_ids: 历史已抓 job_id 集合（跳过）
+        pending_ids: 待重试 job_id 集合（优先重抓）
+        existing_results: 已有详情列表（断点续抓），并入返回与落盘
+        output_path: 非 None 时每 write_every 条渐进原子写盘（中断最多丢
+            write_every 条，与串行"每条写盘"的可靠性差距收敛）
+        write_every: 渐进写盘间隔（条数）
+        security_map: 详情 API 通道凭据（{job_id: securityId}）；为 None 走 DOM 渲染
+        city_code: 城市码（详情 API 参数）
+
+    Returns:
+        (results, pending): results 为全量详情（含 existing_results）；
+            pending 为待重试 job_id 集合
+    """
+    existing_ids = existing_ids if existing_ids is not None else set()
+    pending = dict(pending_ids) if pending_ids is not None else {}
+    if limiter is None:
+        if security_map:
+            # 详情 API 通道：单次请求约 1s（无整页渲染等待），限速器是唯一刹车。
+            # 按"每 worker 至少 DETAIL_API_PACE_SECONDS 间隔"设基线
+            # （并发 N → 全局约 N/PACE 次/秒），与串行 10-25s 间隔同量级；
+            # 旧公式 concurrency*0.5/秒 是为 DOM 渲染路径设计的（其加载/滚动
+            # 20-30s 天然限速），对 API 通道过快（2026-09-22 审计修复）。
+            base_rate = max(concurrency / DETAIL_API_PACE_SECONDS, 0.07)
+        else:
+            # DOM 路径：单条加载/滚动 20-30s 天然限速，令牌桶仅提供弱错峰
+            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时由
+            # AdaptiveRateLimiter 降半/暂停兜底。
+            base_rate = max(concurrency * 0.5, 0.5)
+        limiter = AdaptiveRateLimiter(base_rate=base_rate)
+        # 熔断恢复期：冷却结束后渐变恢复，恢复期内限速减半（不跳回全速）
+        recovery = check_cdp_recovery()
+        if recovery > 0:
+            limiter.base_rate /= 2.0
+            print(f"⚠️ 熔断恢复期（剩余约 {recovery:.0f}s），详情限速减半")
+
+    # 过滤已抓/重复（与串行路径同一套去重逻辑）
+    todo = []
+    seen_links = set()
+    for job in jobs:
+        link = job.get("job_link", "")
+        job_id = job.get("job_id", "")
+        if not link or link in seen_links:
+            continue
+        seen_links.add(link)
+        if job_id and job_id in existing_ids and job_id not in pending:
+            continue
+        todo.append(job)
+
+    results = list(existing_results) if existing_results is not None else []
+    stop_event = threading.Event()
+    consecutive_cdp_errors = 0
+    start_time = time.time()
+
+    def persist():
+        if output_path:
+            _atomic_write_json(output_path, results)
+            save_pending_ids(output_path, pending)
+
+    def handle_result(job, result):
+        # 仅主线程（as_completed 循环）调用，results/pending 无并发访问，无需加锁
+        nonlocal consecutive_cdp_errors
+        job_id = job.get("job_id", "")
+        if result["ok"]:
+            limiter.record_success()
+            results.append(result["detail"])
+            if job_id:
+                pending.pop(job_id, None)
+            return
+        limiter.record_failure()
+        reason = result["reason"]
+        if reason == "login_required":
+            stop_event.set()
+        elif reason == "risk_timeout":
+            # E 降级：详情风控命中（验证码/API 风控码）→ 全局停止；
+            # message 含实际风控形态（如 code=37），必须打印（可观测性）
+            print(f"  ⚠️ {result['message']}")
+            stop_event.set()
+            _note_detail_risk_blocked(list_output_path, city_name=city, keyword=keyword)
+        elif reason == "cdp_session":
+            consecutive_cdp_errors += 1
+            if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
+                stop_event.set()
+                mark_cdp_cooldown()  # 熔断冷却：防"熔断→立即重启→再熔断"循环
+        if reason == "invalid_detail":
+            # 解析类失败（页面结构变了等）：重试纯浪费且掩盖结构漂移信号，不进 pending
+            return
+        if job_id:
+            pending[job_id] = pending.get(job_id, 0) + 1
+            if output_path:
+                save_pending_ids(output_path, pending)
+
+    # 详情 API 通道并发：预建共享 tab 池（每 worker 一个停靠 tab，只导航一次）。
+    # 修复点（2026-09-22 审计）：此前并发模式每岗自建 tab 且用岗位标题导航
+    # 搜索页——既慢又制造大量无关搜索请求（风控暴露）。池化后每格仅 concurrency
+    # 次导航，其余全部为轻量 XHR。
+    api_pool = None
+    api_sessions = []
+    if security_map:
+        api_pool = queue.Queue()
+        for _ in range(concurrency):
+            try:
+                sess = _open_api_tab(cdp_port, keyword, city_code)  # 顺序错峰，避免同时打搜索页
+                api_sessions.append(sess)
+                api_pool.put(sess)
+                print(f"  ℹ️ 详情 API 共享会话 {len(api_sessions)}/{concurrency} 就绪")
+            except _cdp_exception_types():
+                log.warning("详情 API 共享会话建立失败（该槽位将按需自建）", exc_info=True)
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
+        # 每完成一个补提交一个；停止信号（熔断/登录墙）后不再补提交。
+        # 相比一次性提交全部：内存有界、停止即时生效（千级任务也安全）。
+        window = max(concurrency * 2, 2)
+        todo_iter = iter(todo)
+        total = len(todo)
+        in_flight = set()
+
+        def run_one(job):
+            job_id = job.get("job_id", "")
+            job_security = (security_map or {}).get(job_id)
+            session = api_pool.get() if api_pool is not None else None
+            try:
+                # 预算轮换：该 tab 详情数达预算即换新 tab（否则下次必 code 37）
+                if session is not None and session[3] >= DETAIL_API_TAB_BUDGET:
+                    _rotate_api_tab(session, cdp_port, keyword, city_code)
+                result = _scrape_one_detail(
+                    job, cdp_port, stop_event, limiter,
+                    security_id=job_security, api_session=session,
+                    city_code=city_code, search_keyword=keyword)
+                # 风控码疑似"配额耗尽"：换 tab 重试一次；仍失败才判定真风控
+                if (result["reason"] == "risk_timeout" and job_security
+                        and session is not None):
+                    if _rotate_api_tab(session, cdp_port, keyword, city_code):
+                        result = _scrape_one_detail(
+                            job, cdp_port, stop_event, limiter,
+                            security_id=job_security, api_session=session,
+                            city_code=city_code, search_keyword=keyword)
+                if result["ok"] and session is not None:
+                    session[3] += 1
+                return job, result
+            finally:
+                if api_pool is not None and session is not None:
+                    api_pool.put(session)  # 归还池（下次任务复用/轮换后的 tab）
+
+        def fill_window():
+            while len(in_flight) < window:
+                if stop_event.is_set():
+                    return
+                try:
+                    job = next(todo_iter)
+                except StopIteration:
+                    return
+                # 与串行路径一致：每个提交的详情计入全局请求预算（500 上限）
+                incr_request("detail")
+                in_flight.add(pool.submit(run_one, job))
+
+        fill_window()
+        completed = 0
+        parallel_ok = 0
+        parallel_reasons = {}
+        while in_flight:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    job, result = future.result()
+                except _cdp_exception_types() as exc:
+                    result = {"ok": False, "detail": None,
+                              "job_id": "", "reason": "cdp_session",
+                              "message": str(exc)}
+                handle_result(job, result)
+                completed += 1
+                if result["ok"]:
+                    parallel_ok += 1
+                else:
+                    reason = result["reason"] or "unknown"
+                    parallel_reasons[reason] = parallel_reasons.get(reason, 0) + 1
+                mark = "✓" if result["ok"] else f"✗ {result['reason']}"
+                print(f"  [并发 {completed}/{total}] {job.get('title', '')} {mark}")
+                progress = progress_line(completed, total, parallel_ok)
+                if progress:
+                    print(progress)
+                if output_path and completed % write_every == 0:
+                    persist()
+            fill_window()
+        if completed:
+            print(run_summary(time.time() - start_time,
+                              completed, parallel_ok, parallel_reasons))
+    # 关闭详情 API 共享会话池（复用 tab 释放）
+    for sess in api_sessions:
+        _close_api_tab(sess)
+    if output_path:
+        persist()
+    return results, pending
 
 
 # ============================================================
@@ -1775,7 +3870,7 @@ def analyze(list_data, details=None, search_keyword=""):
     print(f"{'='*60}")
 
     # 1. 薪资分析
-    print(f"\n--- 薪资分布 ---")
+    print("\n--- 薪资分布 ---")
     salary_ranges = Counter()
     for j in jobs:
         s = j.get("salary", "")
@@ -1790,7 +3885,7 @@ def analyze(list_data, details=None, search_keyword=""):
         print(f"  {s:<20} {c:>3}  {bar}")
 
     # 2. 经验要求
-    print(f"\n--- 经验要求 ---")
+    print("\n--- 经验要求 ---")
     exp_count = Counter()
     for j in jobs:
         tags = j.get("tags", "")
@@ -1801,7 +3896,7 @@ def analyze(list_data, details=None, search_keyword=""):
         print(f"  {e:<15} {c}")
 
     # 3. 学历要求
-    print(f"\n--- 学历要求 ---")
+    print("\n--- 学历要求 ---")
     edu_count = Counter()
     for j in jobs:
         tags = j.get("tags", "")
@@ -1812,7 +3907,7 @@ def analyze(list_data, details=None, search_keyword=""):
         print(f"  {e:<10} {c}")
 
     # 4. 地区分布
-    print(f"\n--- 地区分布 ---")
+    print("\n--- 地区分布 ---")
     loc_count = Counter()
     for j in jobs:
         loc = j.get("location", "")
@@ -1822,11 +3917,11 @@ def analyze(list_data, details=None, search_keyword=""):
             loc_count[parts[1]] += 1
         elif loc:
             loc_count[loc] += 1
-    for l, c in loc_count.most_common(10):
-        print(f"  {l:<15} {c}")
+    for loc, count in loc_count.most_common(10):
+        print(f"  {loc:<15} {count}")
 
     # 5. 公司分布
-    print(f"\n--- 高频公司 ---")
+    print("\n--- 高频公司 ---")
     company_count = Counter()
     for j in jobs:
         c = j.get("boss_name", "")
@@ -1838,7 +3933,7 @@ def analyze(list_data, details=None, search_keyword=""):
     # 6. 详情页的技能标签（如有）
     body_freq = Counter()
     if details:
-        print(f"\n--- 技能要求频次（来自 JD 标签）---")
+        print("\n--- 技能要求频次（来自 JD 标签）---")
         skill_freq = Counter()
         for d in details:
             for tag in d.get("skill_tags", []):
@@ -1848,7 +3943,7 @@ def analyze(list_data, details=None, search_keyword=""):
             print(f"  {s:<20} {c:>3}/{len(details)}  {bar}")
 
         # 7. JD 正文关键词（动态提取）
-        print(f"\n--- JD 正文高频技术词 ---")
+        print("\n--- JD 正文高频技术词 ---")
         tech_terms = extract_tech_terms_from_jds(details, search_keyword)
         for d in details:
             jd_lower = d.get("jd", "").lower()
@@ -1861,7 +3956,7 @@ def analyze(list_data, details=None, search_keyword=""):
             print(f"  {t:<20} {c:>3}/{len(details)} ({pct:.0f}%)  {bar}")
 
     # 8. 简历建议
-    print(f"\n--- 简历建议 ---")
+    print("\n--- 简历建议 ---")
     if details and body_freq:
         noise_list = {'BOSS直聘', 'boss', 'BOSS', '来自BOSS直聘', '金', '金币'}
         top_skills = [s for s, _ in Counter(
@@ -1883,16 +3978,6 @@ def analyze(list_data, details=None, search_keyword=""):
             print(f"  学历要求主流: {top_edu}")
     else:
         print("  提示: 用 --detail 抓取 JD 详情后可获得更精准的简历建议")
-
-
-def parse_jobs_eval_value(value):
-    if not value:
-        return []
-    try:
-        parsed = json.loads(value) if isinstance(value, str) else value
-    except (json.JSONDecodeError, ValueError, TypeError):
-        return []
-    return parsed if isinstance(parsed, list) else []
 
 
 def has_usable_smoke_jobs(jobs):
@@ -1925,7 +4010,7 @@ def run_smoke_test(cdp_port=DEFAULT_CDP_PORT):
         time.sleep(4)
         api_url = f"{API_JOB_LIST_PATH}?{urlencode({'scene': '1', 'query': LOGIN_PROBE_QUERY, 'city': city_code, 'page': 1, 'pageSize': 5})}"
         api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
-        jobs = parse_jobs_eval_value(cdp.eval_js(api_js, sid))
+        jobs = parse_api_jobs_eval_value(cdp.eval_js(api_js, sid))
         cdp.send("Target.closeTarget", {"targetId": tid})
         cdp.close()
 
@@ -1944,6 +4029,114 @@ def run_smoke_test(cdp_port=DEFAULT_CDP_PORT):
 # ============================================================
 # --check 环境检查
 # ============================================================
+def _git_short_sha():
+    """尽力取当前 git 短 SHA（非仓库/无 git 时返回空串，不抛）。"""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def run_status(cdp_port=DEFAULT_CDP_PORT, result_dir=DEFAULT_RESULT_DIR):
+    """一条命令看清"运行态 + 缓存态"（换窗口接管用；**不发 BOSS 请求**）。
+
+    - 运行态：CDP 端口、Chrome profile、互斥锁、熔断冷却/恢复期
+    - 缓存态：结果目录文件统计 + 最新列表文件 meta 摘要（含 jd 覆盖率）
+    - 技能/入口：指向项目与工作区文档（不复制内容）
+    """
+    print("=" * 54)
+    print("  BOSS直聘 爬虫状态总览（接管用）")
+    print("=" * 54)
+
+    # ── 运行态 ──
+    print("\n[运行态]")
+    try:
+        # 局部导入：模块级 requests 是懒加载（未初始化时为 None），此处需真实可用性
+        import requests as _requests
+    except ImportError:
+        _requests = None
+    if _requests is None:
+        print("  CDP 端口        : ⚠️ 缺少 requests，无法探测")
+    else:
+        try:
+            resp = _requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=5)
+            print(f"  CDP 端口        : ✅ {cdp_port} 可连（{resp.json().get('Browser', '未知')}）")
+        except (_requests.ConnectionError, _requests.Timeout):
+            print(f"  CDP 端口        : ❌ {cdp_port} 不可连（可跑 --setup-chrome 启动）")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  CDP 端口        : ⚠️ 响应异常: {e}")
+    try:
+        profile = prepare_cdp_profile(copy_login_state=False, reset=False)
+        print(f"  Chrome profile  : ✅ {os.path.normpath(profile['path'])}")
+    except Exception as e:  # 有意宽捕：状态命令不因探测失败而崩
+        print(f"  Chrome profile  : ⚠️ 探测失败: {e}")
+    max_conc, holders, risk = _read_scrape_lock()
+    if risk:
+        print(f"  互斥锁          : ⛔ 熔断挂起（上限 {max_conc}，持有 {len(holders)}）"
+              "——人工处理后 --reset-lock")
+    elif holders:
+        print(f"  互斥锁          : 🔒 被持有（上限 {max_conc}，"
+              f"持有 {len(holders)}: {', '.join(holders[:5])}）")
+    else:
+        print(f"  互斥锁          : 🔓 空闲（上限 {max_conc}）")
+    cooldown = check_cdp_cooldown()
+    recovery = check_cdp_recovery()
+    if cooldown is not None:
+        tail = f"（后接恢复期 {recovery:.0f}s）" if recovery > 0 else ""
+        print(f"  熔断冷却        : ⏳ 剩余约 {cooldown}s{tail}")
+    elif recovery > 0:
+        print(f"  熔断恢复期      : ⏳ 剩余约 {recovery:.0f}s（限速减半）")
+    else:
+        print("  熔断冷却        : 无")
+    print("  登录态          : 未探测（跑 --check 探测；会发一次请求）")
+
+    # ── 缓存态 ──
+    print(f"\n[缓存态] {result_dir}")
+    jobs = sorted(glob.glob(os.path.join(result_dir, "boss_jobs_*.json")))
+    details = sorted(glob.glob(os.path.join(result_dir, "boss_details_*.json")))
+    pending = sorted(glob.glob(os.path.join(result_dir, "*.pending.json")))
+    archive = glob.glob(os.path.join(result_dir, "archive", "*.json"))
+    if jobs:
+        latest = jobs[-1]
+        print(f"  列表文件        : {len(jobs)} 个｜最新 {os.path.basename(latest)}")
+        try:
+            with open(latest, encoding="utf-8") as f:
+                m = json.load(f)
+            cov = m.get("jd_coverage") or {}
+            extra = (f" jd={cov.get('with_jd')}/{cov.get('total_before')}" if cov else "")
+            print(f"    └ keyword={m.get('keyword')} city={m.get('city')} "
+                  f"jobs={m.get('job_count')}{extra}")
+        except (OSError, json.JSONDecodeError, ValueError):
+            print("    └ （meta 读取失败）")
+    else:
+        print("  列表文件        : 0 个")
+    print(f"  详情文件        : {len(details)} 个"
+          + (f"｜最新 {os.path.basename(details[-1])}" if details else ""))
+    print(f"  pending 文件    : {len(pending)} 个")
+    print(f"  归档文件        : {len(archive)} 个（archive/）")
+    try:
+        total = sum(os.path.getsize(p) for p in jobs + details + pending)
+        print(f"  本目录占用      : {total / 1024 / 1024:.1f} MB")
+    except OSError:
+        pass
+
+    # ── 技能 / 入口 ──
+    print("\n[技能 / 入口]（文档为准，不在此复制）")
+    print(f"  项目            : {os.path.dirname(os.path.dirname(os.path.abspath(__file__)))}")
+    print("    说明: SKILL.md · AGENTS.md · README.md")
+    print("  工作区文档      : docs/projects/boss-zhipin-scraper/"
+          "（架构与链路地图 / 待办总表 / 任务记录）")
+    sha = _git_short_sha()
+    if sha:
+        print(f"  版本            : HEAD {sha}")
+    print()
+    return 0
+
+
 def run_check(cdp_port=DEFAULT_CDP_PORT):
     """运行环境诊断检查"""
     print("=" * 50)
@@ -1957,28 +4150,28 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
     print("[1/3] Python 依赖...")
     deps_ok = require_runtime_dependencies("websocket", "requests")
     if requests is not None:
-        print(f"  ✅ requests 可导入")
+        print("  ✅ requests 可导入")
     if websocket is not None:
-        print(f"  ✅ websocket 可导入")
+        print("  ✅ websocket 可导入")
     if deps_ok:
-        print(f"  ✅ 依赖完整")
+        print("  ✅ 依赖完整")
     else:
         all_pass = False
 
     # 检查 2: CDP 端口连通性
     print("[2/3] CDP 端口连通性...")
     if requests is None:
-        print(f"  ❌ 跳过 — 缺少 requests")
+        print("  ❌ 跳过 — 缺少 requests")
         all_pass = False
     else:
         try:
             resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=5)
             data = resp.json()
             browser = data.get("Browser", "未知")
-            print(f"  ✅ 通过 — Chrome {browser}")
+            print(f"  ✅ 通过 — CDP 服务: {browser}")
         except (requests.ConnectionError, requests.Timeout):
             print(f"  ❌ 失败 — 无法连接 127.0.0.1:{cdp_port}")
-            print(f"     请先启动 Chrome CDP: python3 {__file__} --setup-chrome")
+            print(f"     请先启动 Chrome CDP: {sys.executable} {__file__} --setup-chrome")
             all_pass = False
         except (json.JSONDecodeError, KeyError) as e:
             print(f"  ❌ 失败 — CDP 响应异常: {e}")
@@ -1987,20 +4180,20 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
     # 检查 3: BOSS直聘登录状态
     print("[3/3] BOSS直聘登录状态...")
     if not deps_ok:
-        print(f"  ❌ 跳过 — 缺少运行依赖")
+        print("  ❌ 跳过 — 缺少运行依赖")
         all_pass = False
     else:
         try:
             login_result = check_login_state(cdp_port)
             if login_result.status is LoginProbeStatus.AVAILABLE:
-                print(f"  ✅ 已登录")
+                print("  ✅ 已登录")
             elif login_result.status is LoginProbeStatus.EMPTY:
                 print(f"  ⚠️  {describe_login_probe_result(login_result)}")
                 all_pass = False
             else:
                 print(f"  ❌ {describe_login_probe_result(login_result)}")
                 all_pass = False
-        except Exception as e:
+        except Exception as e:  # 有意宽捕：--check 是诊断命令，任何异常都应报错而非崩溃
             print(f"  ❌ 检测失败: {e}")
             all_pass = False
 
@@ -2045,7 +4238,7 @@ def prepare_cdp_profile(copy_login_state=False, reset=False):
                     os.makedirs(os.path.dirname(dst), exist_ok=True)
                     shutil.copy2(src, dst)
                     copied += 1
-                except Exception as e:
+                except Exception as e:  # 有意宽捕：单个 cookie 文件复制失败不应中断其余文件
                     print(f"  ⚠️  复制 {os.path.basename(src)} 失败: {e}")
 
     return {
@@ -2060,7 +4253,9 @@ def is_cdp_ready(cdp_port):
     try:
         resp = requests.get(f"http://127.0.0.1:{cdp_port}/json/version", timeout=2)
         return resp.status_code == 200
-    except Exception:
+    except (OSError, TimeoutError):
+        # requests 的 ConnectionError/Timeout 都是 OSError 子类；只吞网络层错误，
+        # 其余意外异常（如 ValueError）照常抛出便于排查
         return False
 
 
@@ -2098,9 +4293,11 @@ def iter_chrome_process_commands():
         try:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5,
             )
-        except Exception:
+        except (OSError, subprocess.TimeoutExpired):
+            # 进程枚举失败不阻塞主流程：调用方按"无进程"处理
             return []
         if not r.stdout.strip():
             return []
@@ -2124,8 +4321,10 @@ def iter_chrome_process_commands():
         return processes
 
     try:
-        r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True, timeout=5)
-    except Exception:
+        r = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        # 进程枚举失败不阻塞主流程：调用方按"无进程"处理
         return []
 
     processes = []
@@ -2265,7 +4464,7 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
                 return 0 if wait_for_login(cdp_port, timeout=login_timeout) else 1
             return 0
         print(f"\n❌ 端口 {cdp_port} 已被其他 Chrome CDP profile 占用")
-        print(f"   请关闭旧 CDP Chrome，或改用 --cdp-port 指定其他端口")
+        print("   请关闭旧 CDP Chrome，或改用 --cdp-port 指定其他端口")
         return 1
 
     stopped = stop_cdp_chrome(cdp_data_dir)
@@ -2279,7 +4478,7 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
         f"--user-data-dir={cdp_data_dir}",
         "--no-first-run",
         "--no-default-browser-check",
-        "--remote-allow-origins=*",
+        f"--remote-allow-origins=http://localhost:{cdp_port},http://127.0.0.1:{cdp_port}",
     ]
     launch_chrome(cmd)
 
@@ -2293,10 +4492,10 @@ def run_setup_chrome(cdp_port=DEFAULT_CDP_PORT, copy_login_state=False,
         if not wait_for_login(cdp_port, timeout=login_timeout):
             return 1
     print()
-    print(f"示例:")
-    print(f"  uv run python3 scripts/boss_cdp_raw.py --keyword \"AI Agent\" --city 上海 --pages 3")
-    print(f"  uv run python3 scripts/boss_cdp_raw.py --check")
-    print(f"  uv run python3 scripts/boss_cdp_raw.py --stop-chrome   # 抓完关闭专用 Chrome")
+    print("示例:")
+    print("  uv run python3 scripts/boss_cdp_raw.py --keyword \"AI Agent\" --city 上海 --pages 3")
+    print("  uv run python3 scripts/boss_cdp_raw.py --check")
+    print("  uv run python3 scripts/boss_cdp_raw.py --stop-chrome   # 抓完关闭专用 Chrome")
     print()
     return 0
 
@@ -2330,9 +4529,38 @@ def run_stop_chrome():
 # main
 # ============================================================
 def main():
+    # Windows 控制台默认 GBK 无法编码输出中的 emoji/部分中文，会直接 UnicodeEncodeError
+    # （实测 73 个单测中 8 个因此失败）。统一重配为 UTF-8，输出用 errors=replace 兜底。
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    # logging 配置只在真正运行 CLI 时生效（import/测试不触发）
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    try:
+        run_cli()
+    except KeyboardInterrupt:
+        print("已取消。", file=sys.stderr)
+        sys.exit(130)
+    except Exception as e:
+        # 退出码固化：0=成功 / 1=运行期错误（含未预期异常，干净消息无 traceback）/
+        # 2=CLI 误用（argparse 默认）
+        print(f"❌ 未预期错误: {_scrub_secrets(str(e))}", file=sys.stderr)
+        sys.exit(1)
+
+
+class _BossHelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
+                         argparse.RawDescriptionHelpFormatter):
+    """显示参数默认值，同时保留多行 epilog 原样。"""
+
+
+def build_parser():
     p = argparse.ArgumentParser(
         description=f"BOSS直聘抓取 + 分析 (CDP Raw) v{__version__}",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=_BossHelpFormatter,
         epilog="""
 筛选参数示例:
   --scale 305          公司规模 (301=0-20人 302=20-99 303=100-499 304=500-999 305=1000-9999 306=10000+)
@@ -2373,69 +4601,188 @@ def main():
   %(prog)s --setup-chrome
         """)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument("--keyword", default="AI Agent", help="搜索关键词")
-    p.add_argument("--city", default=DEFAULT_CITY_INPUT, help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
-    p.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
-    p.add_argument("--output", default=None, help="列表数据输出路径")
-    p.add_argument("--detail-output", default=None, help="详情数据输出路径")
-    p.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
-                   help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
-    p.add_argument("--format", default="json", choices=["json", "csv"],
-                   help="输出格式 (默认 json)")
-    p.add_argument("--merge", default=None,
-                   help="合并已有 JSON 文件 (按 job_id 去重)")
 
-    # 筛选参数
-    p.add_argument("--scale", default=None, help="公司规模代码")
-    p.add_argument("--stage", default=None, help="融资阶段代码")
-    p.add_argument("--salary", default=None, help="薪资范围代码")
-    p.add_argument("--experience", default=None, help="经验要求代码")
-    p.add_argument("--degree", default=None, help="学历要求代码")
-    p.add_argument("--industry", default=None, help="行业代码")
+    # ---- 搜索参数 ----
+    g_search = p.add_argument_group("搜索参数")
+    g_search.add_argument("--keyword", default="AI Agent", help="搜索关键词")
+    g_search.add_argument("--city", default=DEFAULT_CITY_INPUT,
+                          help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
+    g_search.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
+    g_search.add_argument("--max-jobs", type=int, default=None,
+                          help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
+    g_search.add_argument("--max-concurrent", type=int, default=1,
+                          help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
+                               "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
 
-    # 功能开关
-    p.add_argument("--detail", action="store_true", default=True, help="抓取详情页 JD（默认开启）")
-    p.add_argument("--no-detail", dest="detail", action="store_false", help="不抓取详情页")
-    p.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
-    p.add_argument("--analysis", action="store_true", help="输出分析报告")
-    p.add_argument("--input", default=None, help="从已有 JSON 文件读取（跳过抓取）")
-    p.add_argument("--allow-dom-fallback", action="store_true",
-                   help="API 无数据时允许降级 DOM 提取（薪资可能受字体反爬影响，默认关闭）")
+    # ---- 筛选参数 ----
+    g_filter = p.add_argument_group("筛选参数")
+    g_filter.add_argument("--scale", default=None, help="公司规模代码")
+    g_filter.add_argument("--stage", default=None, help="融资阶段代码")
+    g_filter.add_argument("--salary", default=None, help="薪资范围代码")
+    g_filter.add_argument("--experience", default=None, help="经验要求代码")
+    g_filter.add_argument("--degree", default=None, help="学历要求代码")
+    g_filter.add_argument("--industry", default=None, help="行业代码")
 
-    # 工具命令
-    p.add_argument("--check", action="store_true", help="运行环境诊断检查")
-    p.add_argument("--smoke-test", action="store_true",
-                   help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
-    p.add_argument("--list-cities", nargs="?", const="", default=None,
-                   metavar="关键词",
-                   help="打印支持的城市列表（可选关键词过滤，如 --list-cities 江）；"
-                        "支持全国城市，码表见 data/city_codes.json，运行时自动从 BOSS 同步")
-    p.add_argument("--setup-chrome", action="store_true",
-                   help="自动启动 Chrome CDP 调试模式")
-    p.add_argument("--copy-login-state", action="store_true",
-                   help="手动从主 Chrome 导入 Local State + Cookie 相关文件到独立 profile（默认、首次启动、重复启动都不复制）")
-    p.add_argument("--reset-chrome-profile", action="store_true",
-                   help="重建 BOSS 专用 Chrome profile，会清除此专用浏览器内的登录态")
-    p.add_argument("--no-wait-login", action="store_true",
-                   help="--setup-chrome 启动后不等待 BOSS 登录完成")
-    p.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT,
-                   help=f"--setup-chrome 等待登录完成的秒数 (默认 {DEFAULT_LOGIN_TIMEOUT})")
-    p.add_argument("--stop-chrome", action="store_true",
-                   help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
-    p.add_argument("--close-chrome", action="store_true",
-                   help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
+    # ---- 输出参数 ----
+    g_output = p.add_argument_group("输出参数")
+    g_output.add_argument("--output", default=None, help="列表数据输出路径")
+    g_output.add_argument("--detail-output", default=None, help="详情数据输出路径")
+    g_output.add_argument("--cdp-port", type=int, default=DEFAULT_CDP_PORT,
+                          help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
+    g_output.add_argument("--format", default="json", choices=["json", "csv"],
+                          help="输出格式")
+    g_output.add_argument("--merge", default=None,
+                          help="合并已有 JSON 文件 (按 job_id 去重)")
 
+    # ---- 详情抓取 ----
+    g_detail = p.add_argument_group("详情抓取")
+    g_detail.add_argument("--detail", action="store_true", default=True,
+                          help="抓取详情页 JD（默认开启）")
+    g_detail.add_argument("--no-detail", dest="detail", action="store_false",
+                          help="不抓取详情页")
+    g_detail.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
+    g_detail.add_argument("--keep-without-jd", action="store_true",
+                          help="保留无 JD 岗位（默认口径一：详情抓完后把 jd 并入列表并剔除无 JD 岗位）")
+    g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                          help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
+                               "并发越高成功率越低，含全局限速与错误率自适应降速）")
+    g_detail.add_argument("--analysis", action="store_true", help="输出分析报告")
+    g_detail.add_argument("--input", default=None,
+                          help="从已有 JSON 文件读取（跳过抓取）")
+    g_detail.add_argument("--allow-dom-fallback", action="store_true",
+                          help="API 无数据时允许降级 DOM 提取（薪资可能受字体反爬影响，默认关闭）")
+    g_detail.add_argument("--retry-job", action="append", default=[],
+                          metavar="JOB_ID",
+                          help="强制重试指定 job_id（可重复指定；无视 pending 重试上限，未记录的也会重抓）")
+
+    # ---- 工具命令 ----
+    g_tool = p.add_argument_group("工具命令")
+    # 动作型命令互斥：同时给多个是无意义输入，argparse 直接拒绝（exit 2）。
+    # --setup-chrome 的辅助 flag（--no-wait-login/--login-timeout 等）不在组内，可正常组合。
+    g_tool_excl = g_tool.add_mutually_exclusive_group()
+    g_tool_excl.add_argument("--check", action="store_true", help="运行环境诊断检查")
+    g_tool_excl.add_argument("--status", action="store_true",
+                             help="状态总览（运行态+缓存态，接管用；不发 BOSS 请求）")
+    g_tool_excl.add_argument("--verify", action="store_true",
+                             help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
+    g_tool_excl.add_argument("--list-results", action="store_true",
+                             help="列出结果目录中的历史抓取结果文件")
+    g_tool_excl.add_argument("--batch", default=None, metavar="CONFIG.json",
+                             help="批量抓取（默认列表+详情）：从配置文件（JSON 数组，每个元素一个任务："
+                                  "keyword/city/pages/sleep/detail/筛选字段）逐任务执行，任务间自动等待防风控；"
+                                  "--no-detail 或任务级 detail=false 可仅列表")
+    g_tool_excl.add_argument("--archive", nargs="?", const="1", default=None,
+                             metavar="KEEP",
+                             help="归档历史结果文件：每个类型保留最新 KEEP 个（默认 1），其余移入 archive/ 子目录；pending 活动文件不归档")
+    g_tool_excl.add_argument("--reset-lock", action="store_true",
+                             help="人工确认后清除并发锁的熔断状态（--max-concurrent 任务遇风控全停后重开前使用）")
+    g_tool_excl.add_argument("--smoke-test", action="store_true",
+                             help="用真实 Chrome/CDP 跑一次 BOSS 搜索 API smoke test（不写结果文件）")
+    g_tool_excl.add_argument("--list-cities", nargs="?", const="", default=None,
+                             metavar="关键词",
+                             help="打印支持的城市列表（可选关键词过滤，如 --list-cities 江）；"
+                                  "支持全国城市，码表见 data/city_codes.json，运行时自动从 BOSS 同步")
+    g_tool_excl.add_argument("--setup-chrome", action="store_true",
+                             help="自动启动 Chrome CDP 调试模式")
+    g_tool_excl.add_argument("--stop-chrome", action="store_true",
+                             help="关闭 BOSS 专用 CDP Chrome（按隔离 profile 精准匹配，不影响主 Chrome）")
+    g_tool_excl.add_argument("--close-chrome", action="store_true",
+                             help="抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态）")
+
+    # ---- Chrome 管理 ----
+    g_chrome = p.add_argument_group("Chrome 管理")
+    g_chrome.add_argument("--copy-login-state", action="store_true",
+                          help="手动从主 Chrome 导入 Local State + Cookie 相关文件到独立 profile（默认、首次启动、重复启动都不复制）")
+    g_chrome.add_argument("--reset-chrome-profile", action="store_true",
+                          help="重建 BOSS 专用 Chrome profile，会清除此专用浏览器内的登录态")
+    g_chrome.add_argument("--no-wait-login", action="store_true",
+                          help="--setup-chrome 启动后不等待 BOSS 登录完成")
+    g_chrome.add_argument("--login-timeout", type=int, default=DEFAULT_LOGIN_TIMEOUT,
+                          help=f"--setup-chrome 等待登录完成的秒数 (默认 {DEFAULT_LOGIN_TIMEOUT})")
+
+    # ---- 通用参数 ----
+    g_general = p.add_argument_group("通用参数")
+    g_general.add_argument("-v", "--verbose", action="count", default=0,
+                           help="输出 DEBUG 级别日志（可叠加 -vv；调试 CDP 消息、探测详情等）")
+    g_general.add_argument("-q", "--quiet", action="store_true",
+                           help="静默模式：日志降到 WARNING 级别（结果行仍输出 stdout）")
+
+    return p
+
+
+def _apply_verbosity(verbose, quiet):
+    """verbosity → logging 级别：默认 INFO / -v DEBUG / -q WARNING（quiet 优先）。
+
+    结果流（print/EXPORT 行）始终走 stdout，诊断日志走 logging（stderr），互不干扰。
+    """
+    if quiet:
+        logging.getLogger().setLevel(logging.WARNING)
+    elif verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+
+
+def run_cli():
+    p = build_parser()
     args = p.parse_args()
+    _apply_verbosity(args.verbose, args.quiet)
+    if args.verbose:
+        log.debug("已开启 DEBUG 日志")
+
+    # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
+    cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
+    cleanup_security_sidecars()  # 清理过期 securityId sidecar（P1 双通道）
+    cleanup_stale_tmp_files(os.path.dirname(SCRAPE_LOCK_PATH))
 
     # --check 模式
     if args.check:
         sys.exit(run_check(args.cdp_port))
 
+    # --status 模式（状态总览：运行态 + 缓存态，接管用；不发 BOSS 请求）
+    if args.status:
+        sys.exit(run_status(args.cdp_port))
+
+    # --verify 模式（只校验结果文件，不抓取、不依赖 Chrome）
+    if args.verify:
+        list_path = args.input
+        if not list_path:
+            list_path = latest_results_file("jobs")
+            if list_path:
+                print(f"未指定 --input，自动使用最新列表文件: {list_path}")
+            else:
+                print(f"未找到列表文件（--input 或 {DEFAULT_RESULT_DIR} 下的 boss_jobs_*.json）")
+                sys.exit(1)
+        sys.exit(run_verify(list_path, args.detail_output))
+
+    # --list-results 模式（列出历史结果文件）
+    if args.list_results:
+        sys.exit(run_list_results())
+
+    # --archive 模式（归档历史结果文件）
+    if args.archive is not None:
+        try:
+            keep = int(args.archive)
+        except ValueError:
+            p.error(f"--archive 参数必须是正整数: {args.archive}")
+        sys.exit(run_archive(keep_latest=keep))
+
+    # --batch 模式（批量抓取；默认列表 + 详情，--no-detail 可仅列表）
+    if args.batch:
+        if not require_runtime_dependencies("requests", "websocket"):
+            sys.exit(1)
+        sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
+                           max_concurrent=args.max_concurrent,
+                           detail=args.detail, detail_concurrency=args.concurrency,
+                           keep_without_jd=args.keep_without_jd))
+
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
 
-    # --list-cities 模式（无需 Chrome/网络依赖，本地静态码表兜底）
+    # --list-cities 模式（无需 Chrome/CDP，仅需 requests 拉取在线码表；拉取失败回退本地静态码表）
     if args.list_cities is not None:
+        if not require_runtime_dependencies("requests"):
+            sys.exit(1)
         list_cities(keyword=args.list_cities or None)
         sys.exit(0)
 
@@ -2453,16 +4800,24 @@ def main():
     if args.stop_chrome:
         sys.exit(run_stop_chrome())
 
+    # --reset-lock 模式（人工确认后清除并发锁熔断状态）
+    if args.reset_lock:
+        if clear_scrape_lock_risk():
+            print("✅ 并发锁熔断状态已清除，可重新开始抓取。")
+        else:
+            print("❌ 清除失败（锁文件异常）。")
+        sys.exit(0)
+
     if not require_runtime_dependencies("requests", "websocket"):
         sys.exit(1)
 
     # 抓取前校验城市，避免无效中文名被原样作为 city 参数继续请求。
+    # 城市无法解析是 CLI 误用 → parser.error（exit 2，与"1=运行期错误"语义区分）
     if not args.input:
         try:
             resolve_city(args.city)
         except CityResolutionError as e:
-            print(f"❌ {e}")
-            sys.exit(1)
+            p.error(str(e))
 
     # 页数限制
     if args.pages > MAX_PAGES:
@@ -2477,24 +4832,39 @@ def main():
             filters[key] = val
 
     # 加载或抓取列表
+    sidecar_owned = None  # 本次 run 自建的 securityId sidecar（成功结束即删）
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             list_data = json.load(f)
         print(f"从文件加载 {len(list_data.get('jobs',[]))} 条: {args.input}")
+        # 显式双通道：优先从 sidecar 复用 securityId 走 API 通道
+        _sidecar_map = load_security_sidecar(args.input)
+        if _sidecar_map:
+            list_data["security_map"] = _sidecar_map
+            print(f"ℹ️  已从 securityId sidecar 载入 {len(_sidecar_map)} 条（详情走 API 通道）")
+        elif args.detail:
+            print("⚠️  未找到 securityId sidecar，详情将走 DOM 慢通道"
+                  "（如需 API 通道，先重跑一次列表以生成 sidecar）")
     else:
         # 登录状态检测
         print("检测登录状态...")
         login_result = check_login_state(args.cdp_port)
         if login_result.status is LoginProbeStatus.UNAUTHENTICATED:
             print("❌ 未检测到 BOSS直聘登录状态。请先在 Chrome 中登录 zhipin.com。")
-            print(f"   可运行 --check 检查环境，或 --setup-chrome 启动 Chrome。")
+            print("   可运行 --check 检查环境，或 --setup-chrome 启动 Chrome。")
+            send_alert("登录失效",
+                       f"EXPORT_FAIL reason=login_failed status=UNAUTHENTICATED city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.RESTRICTED:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
             print("   请先在浏览器中完成验证或稍后再试，不要重复运行登录探测。")
+            send_alert("登录失效",
+                       f"EXPORT_FAIL reason=login_failed status=RESTRICTED city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.RESPONSE_ERROR:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
+            send_alert("登录失效",
+                       f"EXPORT_FAIL reason=login_failed status=RESPONSE_ERROR city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.EMPTY:
             print(f"⚠️  {describe_login_probe_result(login_result)}；继续执行实际职位搜索。\n")
@@ -2505,7 +4875,12 @@ def main():
             args.keyword, args.city, args.pages, filters, args.output,
             cdp_port=args.cdp_port, fmt=args.format,
             allow_dom_fallback=args.allow_dom_fallback,
+            max_jobs=args.max_jobs,
+            max_concurrent=args.max_concurrent,
         )
+        # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
+        sidecar_owned = write_security_sidecar(
+            list_data.get("output_path"), list_data.get("security_map"))
 
     # 合并外部文件
     merged_details = None
@@ -2533,20 +4908,72 @@ def main():
     # 抓详情
     details = None
     if args.detail and list_data.get("jobs"):
-        details = scrape_details(
-            list_data, args.max_details, args.detail_output,
-            cdp_port=args.cdp_port, fmt=args.format,
-        )
+        pending_ids = None
+        if args.retry_job:
+            # 用户强制重试白名单：无视 pending 重试上限，未记录的先加入重试
+            pending_ids = load_pending_ids(
+                args.detail_output or default_output_path("details"),
+                force_ids=args.retry_job)
+        # CDP 熔断冷却检查：冷却期内拒绝自动重开（防"熔断→立即重启→再熔断"循环）
+        cooldown = check_cdp_cooldown()
+        if cooldown is not None:
+            print(f"❌ CDP 会话熔断冷却中（剩余约 {cooldown}s），已停止详情抓取。")
+            print("   可运行 --stop-chrome 后重新 --setup-chrome，或等待冷却结束再继续。")
+            details = None
+        else:
+            details = scrape_details(
+                list_data, args.max_details, args.detail_output,
+                cdp_port=args.cdp_port, fmt=args.format,
+                concurrency=args.concurrency,
+                pending_ids=pending_ids,
+                # E 降级：验证码命中全停时，往实际落盘的列表文件追加降级原因。
+                # 修复（2026-09-22 审计）：--input 模式为只读，绝不把输入文件当输出
+                # 改写（否则风控回调会把用户文件追加 warnings 写坏）。
+                list_output_path=None if args.input else list_data.get("output_path"),
+                # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
+                # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
+                security_map=list_data.get("security_map"),
+            )
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
             details = merge_details_from_lists(merged_details, details)
-            os.makedirs(os.path.dirname(args.detail_output) or ".", exist_ok=True)
-            with open(args.detail_output, "w", encoding="utf-8") as f:
-                json.dump(details, f, ensure_ascii=False, indent=2)
+            _atomic_write_json(args.detail_output, details)
             print(f"合并详情已保存: {args.detail_output}")
             if args.format == "csv":
                 detail_csv = args.detail_output.rsplit(".", 1)[0] + ".csv"
                 write_detail_csv(detail_csv, details)
+
+        # 口径一：详情抓完后把 jd 并入列表导出并剔除无 JD 岗位（--keep-without-jd 可保留）
+        if details is not None:
+            export_path = list_data.get("output_path")
+            if not export_path and args.input and args.output:
+                export_path = args.output
+            # 显式双通道：据 security_map 覆盖度标记 detail_channel（api/dom/mixed）
+            _smap = list_data.get("security_map") or {}
+            _detail_jobs = list_data.get("jobs", [])
+            _with_sid = sum(1 for j in _detail_jobs
+                            if isinstance(j, dict) and j.get("job_id") in _smap)
+            if _smap and _with_sid == len(_detail_jobs):
+                _channel = "api"
+            elif _with_sid == 0:
+                _channel = "dom"
+            else:
+                _channel = "mixed"
+            if export_path:
+                merged_export = _merge_jd_into_export(
+                    export_path, details, base=list_data,
+                    keep_without_jd=args.keep_without_jd,
+                    extra_meta={"detail_channel": _channel})
+                if merged_export:
+                    kept, dropped = merged_export
+                    print(f"✅ 口径一：导出 {kept} 条（含 jd）"
+                          + (f"，剔除无 JD {dropped} 条" if dropped else "")
+                          + f"｜detail_channel={_channel}")
+            elif args.input:
+                print("ℹ️  --input 模式未指定 --output，跳过 jd 并入（原列表保持原样）")
+            # 本次 run 自建的 sidecar：成功结束即删（TTL 为兜底）
+            if sidecar_owned:
+                delete_security_sidecar(list_data.get("output_path"))
 
     # 分析
     if args.analysis:
@@ -2562,7 +4989,7 @@ def main():
         if stopped:
             print(f"\n🧹 已按 --close-chrome 关闭 BOSS 专用 Chrome 进程：{stopped} 个")
         else:
-            print(f"\nℹ️  --close-chrome 未发现运行中的 BOSS 专用 Chrome 进程")
+            print("\nℹ️  --close-chrome 未发现运行中的 BOSS 专用 Chrome 进程")
 
 
 if __name__ == "__main__":
