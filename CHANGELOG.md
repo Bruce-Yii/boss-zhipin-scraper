@@ -13,6 +13,7 @@
 ### 风控（P4a · 同行研究落地）
 - **code 全表 + `code 37` 二分**（`classify_boss_code`）：`token_expired`（会话/令牌过期）才刷新会话后重试一次；`env_risk / account_risk / security_block` **换 tab 无用 → 停手 + 冷却**。新增 9/17/19/31/35/36/38/121/122 归类，终结"换 tab 清不掉"的无效重试
 - 环境风控命中即进入冷却（复用 `mark_cdp_cooldown`），防"停手后立即重开再触"
+- **运行指纹（诊断）**：`run_cli` 抓取前写 `~/.boss-zhipin-scraper/runner_trace.jsonl`（`sys.argv` + pid + ppid + cwd + **父进程链命令**）——用于当场定位"来源不明的循环抓取"（如反复 `--keyword AI --city 上海` 的 rogue）
 - **P4c-1 预算硬帽**：新增 `--max-seconds N`（详情阶段墙钟上限，默认 0=不限）；超限**优雅停**并保留已抓（与既有 `--max-details` / `MAX_API_REQUESTS` 共同构成预算帽）
 - **API 通道改 burst-aware 串行节律**（`BurstThrottle`）：请求时刻**全局串行** + 高斯 1.5–3.0s + 5% 长暂停 2–5s + burst 惩罚（15s≥3 / 45s≥6），全局约 **0.44 req/s**（全行安全区）；`DETAIL_API_PACE_SECONDS` 1.0→2.25。替换旧式 `concurrency/PACE`（并发 3 ≈ 3 req/s，踩线触 `code 37`）。**取舍：慢一点换稳、产出完整**
 - 新增风控处置 runbook（`docs/projects/boss-zhipin-scraper/boss-zhipin-scraper-风控处置-runbook.md`）

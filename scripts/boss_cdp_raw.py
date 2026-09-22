@@ -44,7 +44,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -4951,6 +4951,69 @@ def _apply_verbosity(verbose, quiet):
         logging.getLogger().setLevel(logging.INFO)
 
 
+RUNNER_TRACE_PATH = os.path.expanduser("~/.boss-zhipin-scraper/runner_trace.jsonl")
+
+
+def _parent_chain(n=4):
+    """（尽力而为）返回父进程链 [(pid, name, cmdline), ...]；失败返回 []。
+
+    仅 Windows：一次 PowerShell 查询（Get-CimInstance Win32_Process）。
+    """
+    if not sys.platform.startswith("win"):
+        return []
+    ps = (
+        "$p=" + str(os.getppid()) + ";$out=@();"
+        "for($i=0;$i -lt " + str(n) + " -and $p -gt 0;$i++){"
+        "$pr=Get-CimInstance Win32_Process -Filter \"ProcessId=$p\" "
+        "-ErrorAction SilentlyContinue;"
+        "if(-not $pr){break};"
+        "$out+=[pscustomobject]@{pid=$pr.ProcessId;name=$pr.Name;cmd=$pr.CommandLine};"
+        "$p=$pr.ParentProcessId};"
+        "$out|ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=8,
+            encoding="utf-8", errors="replace")
+        if out.returncode != 0 or not (out.stdout or "").strip():
+            return []
+        data = json.loads(out.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        return [{"pid": d.get("pid"), "name": d.get("name"),
+                 "cmd": (d.get("cmd") or "")[:300]}
+                for d in data if isinstance(d, dict)]
+    except (OSError, ValueError, json.JSONDecodeError,
+            subprocess.SubprocessError):
+        return []
+
+
+def log_runner_trace(tag="start", extra=None):
+    """记录本次运行的"指纹"（谁起的、什么命令）→ 追加 runner_trace.jsonl。
+
+    用途：抓"来源不明的循环抓取"——下次它一跑，就能看到 argv + 父进程链，
+    当场指名道姓。**旁路诊断，永不抛异常**。
+    """
+    try:
+        rec = {
+            "ts_utc": datetime.now(UTC).isoformat(),
+            "tag": tag,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "cwd": os.getcwd(),
+            "argv": sys.argv[:12],
+            "parents": _parent_chain(),
+        }
+        if extra:
+            rec.update(extra)
+        os.makedirs(os.path.dirname(RUNNER_TRACE_PATH), exist_ok=True)
+        with open(RUNNER_TRACE_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def run_cli():
     p = build_parser()
     args = p.parse_args()
@@ -5075,6 +5138,8 @@ def run_cli():
             print("⚠️  未找到 securityId sidecar，详情将走 DOM 慢通道"
                   "（如需 API 通道，先重跑一次列表以生成 sidecar）")
     else:
+        # 运行指纹：记录 argv + 父进程链（抓"来源不明的循环抓取"，见 runner_trace.jsonl）
+        log_runner_trace("cli_scrape")
         # 登录状态检测
         print("检测登录状态...")
         login_result = check_login_state(args.cdp_port)

@@ -1856,6 +1856,22 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         self.assertIn(module.TargetCrashedError, module._cdp_exception_types())
 
+    def test_log_runner_trace_writes_fingerprint(self):
+        """运行指纹：argv/父进程链写入 runner_trace.jsonl（抓来源不明的循环抓取）。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            p = str(paths["cdp_profile"] / "runner_trace.jsonl")
+            with mock.patch.object(module, "RUNNER_TRACE_PATH", p), \
+                    mock.patch.object(module, "_parent_chain", return_value=[]):
+                module.log_runner_trace("t", extra={"why": "x"})
+                module.log_runner_trace("t2")
+            with open(p, encoding="utf-8") as f:
+                lines = [json.loads(ln) for ln in f if ln.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["tag"], "t")
+            self.assertEqual(lines[0]["why"], "x")
+            self.assertIn("argv", lines[0])
+
     def test_classify_boss_code(self):
         """code 全表 + code37 二分（token_expired vs env_risk）——同行研究关键结论。"""
         module = load_module()
