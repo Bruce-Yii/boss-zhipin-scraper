@@ -157,6 +157,93 @@ DEFAULT_PROFILE_DIR = get_default_profile_dir()
 
 DEFAULT_CDP_DATA_DIR = os.path.expanduser("~/.boss-zhipin-scraper/chrome-profile")
 DEFAULT_RESULT_DIR = os.path.expanduser("~/.boss-zhipin-scraper/job-result")
+
+# ============================================================
+# securityId 受限 sidecar（P1 双通道策略；红线例外，严格约束）
+# 仅 securityId（每岗短期接口令牌，**非登录凭据**）允许落盘，且：仓库外 +
+# 600 权限 + 短 TTL + run 结束即删 + 绝不进导出/日志/git。登录 cookie 绝不落盘。
+# ============================================================
+SECURITY_SIDECAR_DIR = os.path.expanduser("~/.boss-zhipin-scraper/.session")
+SECURITY_SIDECAR_TTL_SECONDS = 3600
+
+
+def security_sidecar_path(list_path):
+    """sidecar 路径：<SECURITY_SIDECAR_DIR>/<列表文件名>.security.json。"""
+    base = os.path.basename(list_path or "list.json")
+    return os.path.join(SECURITY_SIDECAR_DIR, base + ".security.json")
+
+
+def write_security_sidecar(list_path, security_map):
+    """把 securityId 映射落到受限 sidecar（仓库外/600/短 TTL）。
+
+    security_map 为空时不写（避免空文件）。返回 sidecar 路径或 None。
+    """
+    if not list_path or not security_map:
+        return None
+    path = security_sidecar_path(list_path)
+    try:
+        os.makedirs(SECURITY_SIDECAR_DIR, exist_ok=True)
+        _atomic_write_json(path, {
+            "security_map": {str(k): str(v) for k, v in security_map.items()},
+        })
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return path
+    except OSError:
+        log.warning("securityId sidecar 写入失败", exc_info=True)
+        return None
+
+
+def load_security_sidecar(list_path):
+    """读取 securityId sidecar；缺失/过期返回 {}（过期会顺手删除）。"""
+    if not list_path:
+        return {}
+    path = security_sidecar_path(list_path)
+    if not os.path.exists(path):
+        return {}
+    try:
+        if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
+            os.remove(path)
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        smap = data.get("security_map") if isinstance(data, dict) else None
+        if not isinstance(smap, dict):
+            return {}
+        return {str(k): str(v) for k, v in smap.items()}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+def delete_security_sidecar(list_path):
+    """删除指定列表对应的 sidecar（run 正常结束时调用）。"""
+    if not list_path:
+        return
+    path = security_sidecar_path(list_path)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def cleanup_security_sidecars():
+    """删除过期 sidecar（启动时调用）；返回删除数。"""
+    removed = 0
+    try:
+        for name in os.listdir(SECURITY_SIDECAR_DIR):
+            path = os.path.join(SECURITY_SIDECAR_DIR, name)
+            try:
+                if time.time() - os.path.getmtime(path) > SECURITY_SIDECAR_TTL_SECONDS:
+                    os.remove(path)
+                    removed += 1
+            except OSError:
+                pass
+    except OSError:
+        return removed
+    return removed
 DEFAULT_CITY_INPUT = "上海"
 LOGIN_PROBE_QUERY = "Java"
 LOGIN_PROBE_CITY = "101020100"

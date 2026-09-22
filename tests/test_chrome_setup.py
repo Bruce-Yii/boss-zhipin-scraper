@@ -1898,6 +1898,33 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertGreaterEqual(max(grants), 0.2,
                                 "并发取令牌应串行化，不应突发放行（锁外 sleep 回归）")
 
+    def test_security_sidecar_roundtrip_expiry_cleanup(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            list_path = str(paths["cdp_profile"] / "boss_jobs_x.json")
+            sidecar_dir = str(paths["cdp_profile"] / ".session")
+            with mock.patch.object(module, "SECURITY_SIDECAR_DIR", sidecar_dir):
+                self.assertIsNone(module.write_security_sidecar(list_path, {}),
+                                  "空 security_map 不应写 sidecar")
+                module.write_security_sidecar(list_path, {"j1": "sid-1"})
+                self.assertEqual(module.load_security_sidecar(list_path), {"j1": "sid-1"})
+                self.assertEqual(module.cleanup_security_sidecars(), 0, "未过期不应删除")
+                module.delete_security_sidecar(list_path)
+                self.assertEqual(module.load_security_sidecar(list_path), {},
+                                 "删除后应为空")
+                # 过期：读时删除
+                module.write_security_sidecar(list_path, {"j1": "sid-1"})
+                p = module.security_sidecar_path(list_path)
+                old = time.time() - module.SECURITY_SIDECAR_TTL_SECONDS - 5
+                os.utime(p, (old, old))
+                self.assertEqual(module.load_security_sidecar(list_path), {})
+                self.assertFalse(os.path.exists(p), "过期 sidecar 应被删除")
+                # 过期残留：cleanup 清理
+                module.write_security_sidecar(list_path, {"j1": "sid-1"})
+                os.utime(p, (old, old))
+                self.assertEqual(module.cleanup_security_sidecars(), 1)
+                self.assertFalse(os.path.exists(p))
+
     def test_adaptive_limiter_halves_rate_on_high_failure_window(self):
         module = load_module()
         limiter = module.AdaptiveRateLimiter(base_rate=4.0, window=60.0,
