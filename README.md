@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.13.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.13.1-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -304,7 +304,7 @@ boss-zhipin-scraper/
 2. 在 BOSS直聘页面内注入 JS，用同步 XHR 调用搜索 API
 3. API 返回明文 `salaryDesc`，绕过前端字体反爬
 4. 列表 API 保留 `securityId` / `lid` 等上下文，进入详情页时带上这些参数
-5. 每页抓完立即写入文件，按 `job_id` 去重
+5. 每页抓完立即写入文件，按 `job_id` 去重；翻页失效（本页内容与之前重复）提前结束，连续空页仅在页面确认风控时才判风控（防误停）
 
 默认不会使用 DOM 提取列表，因为 DOM 薪资可能受字体反爬影响。只有明确传 `--allow-dom-fallback` 时，API 无数据才会降级 DOM。
 

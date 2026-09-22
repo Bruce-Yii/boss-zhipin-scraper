@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.13.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.13.1-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -302,7 +302,7 @@ This is a Chrome-CDP-based BOSS Zhipin crawler. Core flow:
 2. Inject JS inside the BOSS Zhipin page that calls the search API via synchronous XHR
 3. The API returns plaintext `salaryDesc`, bypassing the front-end font obfuscation
 4. The list API preserves `securityId` / `lid` context, carried into the detail page
-5. Each page is written to disk immediately, deduped by `job_id`
+5. Each page is written to disk immediately, deduped by `job_id`; repeated pages (paging failure) end early, and consecutive empty pages are only treated as risk after the page is confirmed to be a risk/captcha page (avoids false stops)
 
 DOM extraction is not used for the list by default, since DOM salaries may be hit by font-based obfuscation. Only when `--allow-dom-fallback` is explicitly passed will it fall back to DOM when the API returns no data.
 
