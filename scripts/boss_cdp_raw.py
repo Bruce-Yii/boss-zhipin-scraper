@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.10.1"
+__version__ = "2.10.2"
 
 import argparse
 import csv
@@ -1729,28 +1729,36 @@ def wait_for_login(cdp_port=DEFAULT_CDP_PORT, timeout=DEFAULT_LOGIN_TIMEOUT, int
             query, city_code = LOGIN_PROBE_TARGETS[attempt % len(LOGIN_PROBE_TARGETS)]
             try:
                 result = probe_login_state(cdp, sid, query=query, city_code=city_code)
-            except RuntimeError as e:
-                print(f"\n❌ {e}")
-                return False
-
-            if result.status is LoginProbeStatus.AVAILABLE:
-                logged_in = True
-                print("\n✅ 已检测到 BOSS 登录态，且接口返回明文薪资")
-                return True
-            if result.status is LoginProbeStatus.RESTRICTED:
-                print(f"\n❌ {describe_login_probe_result(result)}，已停止登录探测")
-                print("   当前问题不是尚未登录；请先在浏览器中完成验证或稍后再试")
-                return False
-            if result.status is LoginProbeStatus.RESPONSE_ERROR:
-                if not result.retryable:
-                    print(f"\n❌ {describe_login_probe_result(result)}，已停止登录探测")
-                    return False
+            except _cdp_exception_types() as e:
+                # 瞬态异常不再裸崩（TimeoutError 是 OSError 子类、非 RuntimeError，
+                # 上游 #79 同源 bug）：计入 transient 重试，超限才停。
                 transient_errors += 1
+                log.warning("登录探测瞬态异常（%d/%d）: %s",
+                            transient_errors, LOGIN_PROBE_MAX_TRANSIENT_ERRORS, e)
                 if transient_errors > LOGIN_PROBE_MAX_TRANSIENT_ERRORS:
-                    print(f"\n❌ {describe_login_probe_result(result)}，连续异常次数过多")
+                    print(f"\n❌ 登录探测连续异常次数过多: {e}")
                     return False
-            else:
-                transient_errors = 0
+                result = None
+
+            if result is not None:
+                if result.status is LoginProbeStatus.AVAILABLE:
+                    logged_in = True
+                    print("\n✅ 已检测到 BOSS 登录态，且接口返回明文薪资")
+                    return True
+                if result.status is LoginProbeStatus.RESTRICTED:
+                    print(f"\n❌ {describe_login_probe_result(result)}，已停止登录探测")
+                    print("   当前问题不是尚未登录；请先在浏览器中完成验证或稍后再试")
+                    return False
+                if result.status is LoginProbeStatus.RESPONSE_ERROR:
+                    if not result.retryable:
+                        print(f"\n❌ {describe_login_probe_result(result)}，已停止登录探测")
+                        return False
+                    transient_errors += 1
+                    if transient_errors > LOGIN_PROBE_MAX_TRANSIENT_ERRORS:
+                        print(f"\n❌ {describe_login_probe_result(result)}，连续异常次数过多")
+                        return False
+                else:
+                    transient_errors = 0
 
             print(".", end="", flush=True)
             remaining = deadline - time.time()

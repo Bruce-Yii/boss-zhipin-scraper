@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.10.2 (2026-09-22)
+
+### 修复
+- **§1.2 `wait_for_login` 瞬态异常裸崩**（上游 #79 同源）：`TimeoutError` 是 `OSError` 子类而非 `RuntimeError`，原先 `except RuntimeError` 会让 CDP 事件洪流下的瞬态超时**直接带 traceback 退出** `--setup-chrome`。改为捕获 `_cdp_exception_types()` 并计入 transient 重试（超过 `LOGIN_PROBE_MAX_TRANSIENT_ERRORS` 才停）。测试 +1
+
 ## v2.10.1 (2026-09-22)
 
 ### 文档

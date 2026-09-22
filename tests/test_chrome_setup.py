@@ -3816,6 +3816,31 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(sleep.call_count, module.LOGIN_PROBE_MAX_TRANSIENT_ERRORS)
         self.assertIn("连续异常次数过多", stdout.getvalue())
 
+    def test_wait_for_login_retries_transient_exception_without_crash(self):
+        """瞬态异常（TimeoutError：OSError 子类、非 RuntimeError）不再裸崩，
+        计入 transient 重试；超限返回 False（§1.2 / 上游 #79 同源修复）。"""
+        module = load_module()
+        cdp = mock.Mock()
+        stdout = io.StringIO()
+        with mock.patch.object(module, "CDPSession", return_value=cdp), \
+                mock.patch.object(
+                    module,
+                    "create_page_session",
+                    return_value=("login-target", "login-session"),
+                ), \
+                mock.patch.object(
+                    module,
+                    "probe_login_state",
+                    side_effect=TimeoutError("CDP command timed out"),
+                ) as probe, \
+                mock.patch.object(module.time, "sleep") as sleep, \
+                redirect_stdout(stdout):
+            self.assertFalse(module.wait_for_login(cdp_port=9333, timeout=300))
+
+        self.assertEqual(probe.call_count, module.LOGIN_PROBE_MAX_TRANSIENT_ERRORS + 1)
+        self.assertEqual(sleep.call_count, module.LOGIN_PROBE_MAX_TRANSIENT_ERRORS)
+        self.assertIn("连续异常次数过多", stdout.getvalue())
+
     def test_find_latest_detail_file_uses_default_result_dir(self):
         module = load_module()
         with tempfile_profile() as paths:
