@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.15.3 (2026-09-23)
+
+### 测试卫生（"野进程"实为测试污染审计日志）
+- **测试不再写真实审计日志**：`tests/test_chrome_setup.py`  import 时把 `BOSS_AUDIT_PATH` 指到临时目录（`audit_path()` 运行时读环境变量；需显式路径的用例仍可用 `path=`/`patch.dict` 覆盖）。根因：`test_dod5_login_failure_exits_nonzero` 调 `main()` 未 mock `send_alert`，P4e 起 `send_alert` 无条件落审计 → 每次跑测试都往真实 `risk_events.jsonl` 写 `EXPORT_FAIL reason=login_failed`，曾被误判为来源不明的循环抓取（零真实请求、零产物）。
+- `test_dod5_login_failure_exits_nonzero` 补 mock `send_alert`（断言其行为是兄弟用例 `test_login_failure_sends_alert` 的职责）。
+- 隔离守卫扩展：`test_isolation_guard` 新增"跑完全套单测后真实 `risk_events.jsonl` 不得有写入"（快照 exists/size/mtime）。
+- 注：冷却单测的真锁文件从未被污染（`SCRAPE_LOCK_PATH` 均已重定向）；测试从未发出真实 BOSS 请求、从未写真实冷却锁。
+
 ## v2.15.2 (2026-09-23)
 
 ### 修复（关键：详情卡在第 5 条的根因）

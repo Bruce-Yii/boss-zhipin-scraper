@@ -1,3 +1,4 @@
+import atexit
 import contextlib
 import csv
 import importlib.util
@@ -22,6 +23,14 @@ from unittest import mock
 for _stream in (sys.stdout, sys.stderr):
     if _stream is not None and hasattr(_stream, "reconfigure"):
         _stream.reconfigure(encoding="utf-8", errors="replace")
+
+# 测试隔离（2026-09-23 事故）：审计日志默认写进临时目录，永不污染真实
+# ~/.boss-zhipin-scraper/risk_events.jsonl——此前全量测试的产物曾被误判为
+# "来源不明的循环抓取"。audit_path() 运行时读环境变量，需要显式路径的
+# 用例仍可用 path= 参数或 patch.dict 覆盖。
+_TEST_AUDIT_TMP = tempfile.TemporaryDirectory(prefix="boss-audit-test-")
+atexit.register(_TEST_AUDIT_TMP.cleanup)
+os.environ["BOSS_AUDIT_PATH"] = os.path.join(_TEST_AUDIT_TMP.name, "risk_events.jsonl")
 
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "boss_cdp_raw.py"
@@ -1800,6 +1809,7 @@ class ChromeSetupTests(unittest.TestCase):
                                   return_value=("上海", "101020100")), \
                 mock.patch.object(module, "check_login_state",
                                   return_value=UNAUTH), \
+                mock.patch.object(module, "send_alert"), \
                 mock.patch.object(module, "scrape_list") as scrape, \
                 redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as exit_context:
