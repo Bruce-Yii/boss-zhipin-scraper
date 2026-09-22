@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.15.0 (2026-09-23)
+
+### 新增
+- **右面板 JD 通道（`--detail-channel panel`）**（《DOM 与速度控制专题》§1.4 / 上游 #84）：不跳详情页，**复用停靠的真实搜索页**——点岗位卡片 → 读右侧面板 JD，**零新增请求**（同页内点击）；逐条串行（忽略 `--concurrency`）；`--detail-channel auto|api|dom|panel` 可选。新增 `_scrape_one_detail_via_panel` / `_scrape_details_via_panel` / `CLICK_CARD_JS` / `PANEL_READY_TIMEOUT`。
+- `--detail-channel dom` 可强制 DOM 通道（清空 security_map）。
+- 测试 +5（`PanelJdTests` + CLI `--detail-channel`）。
+
 ## v2.14.2 (2026-09-23)
 
 ### 健壮性（code9 限流退避 · 《DOM 与速度控制专题》§2.2-6 / 清单#10）

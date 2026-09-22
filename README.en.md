@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.14 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.15 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.14.2-orange.svg)
+![Version](https://img.shields.io/badge/version-2.15.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -171,6 +171,7 @@ python3 scripts/job_summary.py --top 15
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
 | `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors). **The API channel reuses a shared tab pool** and paces about 15s per worker (`DETAIL_API_PACE_SECONDS`), i.e. about N/15 requests per second at concurrency N |
+| `--detail-channel` | Detail channel: `auto` (default; API when securityId is present, else DOM) / `api` / `dom` / `panel` (reuse the search page, click a card and read the right panel's JD — zero extra requests, serial; upstream #84 idea) |
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--filter-inactive` | Drop long-inactive (zombie) jobs by HR activity (matches only "active N weeks/months/years ago"; does not drop this-week/this-month activity); off by default |
 | `--foreground-capture` | Use a foreground Target for list / login probe / detail DOM; for environments where Chrome on Linux/Xvfb cannot capture search responses with a background Target (stays background by default) |

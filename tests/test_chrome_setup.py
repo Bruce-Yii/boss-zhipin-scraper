@@ -5056,6 +5056,51 @@ class Code9BackoffTests(unittest.TestCase):
         self.assertEqual(ws.eval_js.call_count, module.RATE_LIMIT_MAX_RETRIES + 1)
 
 
+class PanelJdTests(unittest.TestCase):
+    """右面板 JD 通道（专题 §1.4 / 上游 #84）：点卡片 → 读面板。"""
+
+    def _job(self):
+        return {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/eid.html",
+                "encrypt_job_id": "eid", "title": "AI产品经理", "boss_name": "C"}
+
+    def test_click_card_js_clicks_by_key_then_title(self):
+        module = load_module()
+        self.assertIn("__KEY__", module.CLICK_CARD_JS)
+        self.assertIn("__TITLE__", module.CLICK_CARD_JS)
+        self.assertIn(".click()", module.CLICK_CARD_JS)
+
+    def test_panel_detail_success(self):
+        module = load_module()
+        ws = mock.Mock()
+        long_jd = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        # 顺序：点卡片(True) → 就绪(True) → 清弹窗(True) → 抽取(JSON)
+        ws.eval_js.side_effect = [True, True, True,
+                                  json.dumps({"jd": long_jd, "tags": [],
+                                              "page_text": "", "url": ""})]
+        with mock.patch.object(module.time, "sleep"):
+            r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
+        self.assertTrue(r["ok"])
+        self.assertIn("jd", r["detail"])
+
+    def test_panel_detail_card_not_found(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = False
+        r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "invalid_detail")
+        self.assertIn("未找到", r["message"])
+
+    def test_panel_detail_not_ready(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = True  # 点击成功，但就绪轮询一直 False
+        with mock.patch.object(module, "PANEL_READY_TIMEOUT", 0.0):
+            r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
+        self.assertFalse(r["ok"])
+        self.assertIn("未就绪", r["message"])
+
+
 class MultiKeywordTests(unittest.TestCase):
     """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
 
