@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.9.0 (2026-09-22)
+
+### 新增
+- **合规红线文档化 + 风险事件审计（P4e）**：
+  - 新增 `scripts/audit.py`（稳定纯逻辑，主文件 re-export）：风险事件 append-only JSONL 审计（`~/.boss-zhipin-scraper/risk_events.jsonl`，**仓库外/不进 git**）；UTC 秒级时间戳、5MB 滚动、**best-effort**（不阻塞主流程）、写入前 `_scrub_secrets` 脱敏
+  - `send_alert()`（风控/验证码全停、登录失效）与 `mark_cdp_cooldown()`（熔断冷却）接入审计；`BOSS_AUDIT_PATH` 可覆盖路径
+  - `CONTRIBUTING.md` 补齐合规工程化：能力声明（做/不做）、批量上限、个人信息边界、**拒收类 PR 明文红线**（绕过安全机制/提频/绕过人工确认/采凭据）、审计说明
+  - `AGENTS.md` 增加「合规与审计」节（新增风控/登录/熔断分支须同步落审计）
+- 测试 +5（`tests/test_chrome_setup.py::AuditTests`）
+
+### 文档
+- README（中英）告警推送节补充本地审计日志说明
+
 ## v2.8.0 (2026-09-22)
 
 ### 新增

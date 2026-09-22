@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.8.0"
+__version__ = "2.9.0"
 
 import argparse
 import csv
@@ -96,6 +96,16 @@ upsert_db_details = _db_store.upsert_details
 load_db_details = _db_store.load_details
 db_store_stats = _db_store.stats
 record_db_run = _db_store.record_run
+
+try:
+    from scripts import audit as _audit
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import audit as _audit
+
+# 风险事件审计（P4e）：主文件 re-export
+DEFAULT_AUDIT_PATH = _audit.DEFAULT_AUDIT_PATH
+audit_path = _audit.audit_path
+record_audit_event = _audit.record_event
 
 # ============================================================
 # 全局常量
@@ -1823,7 +1833,10 @@ def send_alert(title, text, timeout=10):
     """发送告警到规格侧 Worker 端点（requests POST，Bearer 鉴权）。
 
     幂等由端点保证（同内容去重）；失败仅记日志返回 False。
+
+    P4e：无论端点是否配置，都先落一条**本地审计**（风险/登录事件的统一入口）。
     """
+    record_audit_event("alert", title=title, text=text)
     cfg = load_alert_config()
     if not cfg["url"] or not cfg["token"]:
         return False
@@ -1963,7 +1976,10 @@ def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
 
     文件两行：首行冷却截止，次行恢复期截止（冷却结束后仍限速减半，
     渐变恢复而非跳回全速，防恢复瞬间再触发风控）。
+
+    P4e：同时落一条审计事件（冷却进入）。
     """
+    record_audit_event("cooldown", seconds=seconds)
     try:
         os.makedirs(os.path.dirname(SCRAPE_LOCK_PATH), exist_ok=True)
         tmp = _cdp_cooldown_path() + ".tmp"

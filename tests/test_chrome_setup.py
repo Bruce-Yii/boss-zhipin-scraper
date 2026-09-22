@@ -4790,6 +4790,56 @@ def _normalize_version(raw):
     return f"{major}.{minor}"
 
 
+class AuditTests(unittest.TestCase):
+    """P4e 风险事件审计：JSONL 追加 / 凭据脱敏 / best-effort / 接入告警与冷却。"""
+
+    def setUp(self):
+        self.module = load_module()
+        self.tmp = tempfile.TemporaryDirectory(prefix="audit-")
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "risk_events.jsonl")
+
+    def test_record_event_appends_jsonl_with_timestamp(self):
+        self.assertTrue(self.module.record_audit_event(
+            "alert", path=self.path, title="验证码全停",
+            text="EXPORT_FAIL reason=risk_blocked"))
+        events = self.module._audit.read_events(self.path)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "alert")
+        self.assertEqual(events[0]["title"], "验证码全停")
+        self.assertIn("ts", events[0])
+
+    def test_record_event_scrubs_credentials(self):
+        self.module.record_audit_event(
+            "alert", path=self.path, title="t",
+            text="cookie=SECRET123 token=abc securityId=xyz")
+        raw = pathlib.Path(self.path).read_text(encoding="utf-8")
+        self.assertNotIn("SECRET123", raw)
+        self.assertNotIn("token=abc", raw)
+        self.assertNotIn("securityId=xyz", raw)
+
+    def test_record_event_best_effort_on_bad_path(self):
+        bad = os.path.join(self.tmp.name, "nested", "\x00invalid", "x.jsonl")
+        self.assertFalse(self.module.record_audit_event("alert", path=bad, title="t"))
+
+    def test_send_alert_records_audit_even_without_endpoint(self):
+        """未配置端点时 send_alert 返回 False，但审计仍落盘（记录已发生）。"""
+        with mock.patch.dict(os.environ, {"BOSS_AUDIT_PATH": self.path}):
+            ok = self.module.send_alert("登录失效", "EXPORT_FAIL reason=login_failed")
+        self.assertFalse(ok)
+        events = self.module._audit.read_events(self.path)
+        self.assertTrue(any(e["event"] == "alert" for e in events))
+
+    def test_mark_cdp_cooldown_records_event(self):
+        with mock.patch.dict(os.environ, {"BOSS_AUDIT_PATH": self.path}), \
+                mock.patch.object(self.module, "SCRAPE_LOCK_PATH",
+                                  os.path.join(self.tmp.name, "scrape.lock")):
+            self.module.mark_cdp_cooldown(seconds=123)
+        events = self.module._audit.read_events(self.path)
+        self.assertEqual(events[-1]["event"], "cooldown")
+        self.assertEqual(events[-1]["seconds"], 123)
+
+
 class VersionConsistencyTests(unittest.TestCase):
     """校验版本号在 README / pyproject.toml / SKILL.md / 脚本四处保持一致。
 
