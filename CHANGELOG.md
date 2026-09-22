@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.14.0 (2026-09-22)
+
+### 性能（DOM 详情降级通道提速 · 《DOM 与速度控制专题》落地）
+- **就绪等待替代固定 sleep**：DOM 详情原路径为"导航后固定 `sleep 5-10s` + 3-7 次滚动（各 0.8-5s）+ 页间 10-25s" → 实测 **~38s/条**（同行独立详情页锚点 ~9.5s/条，慢 ~4×）。改为**轮询 JD 区就绪即返回**（新 `DETAIL_READY_JS`，上限 12s）+ **轻量滚动（1-2 次 / 0.3-0.9s）** + **页间 4-9s**（新 `DETAIL_DOM_GAP_SECONDS`）→ 预期 **~8-14s/条**。
+- **选择器兜底链**：JD 区 `…/.job-detail-body/.job-sec-text`；技能 `.job-keyword-list span/li`（专题 §1.1/§1.8 新版共识）。
+- **弹窗遮罩清理**：`div.dialog-wrap/.boss-layer/.boss-popup`（新 `REMOVE_DIALOG_JS`，Snseam 手法），防遮罩挡 JD。
+- **HR 活跃 ACT_RE 全系文案兜底**（专题 §1.5 / 清单#8）：footer 与 `.boss-active-time` 都缺时，按 `刚刚/今日/N日内/本周/N周内/N月内/半年前活跃` 兜底。
+- 测试 +6（`DomSpeedupTests`），356 全绿。
+
+> 说明：DOM 是**降级通道**（详情 API 命中风控时用）；提速数字为按移除的固定等待推算，实测待环境恢复后端到端复核。
+
 ## v2.13.1 (2026-09-22)
 
 ### 修复 / 健壮性（列表判停）
