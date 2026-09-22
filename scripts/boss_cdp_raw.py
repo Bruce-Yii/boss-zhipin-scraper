@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.14.1"
+__version__ = "2.14.2"
 
 import argparse
 import base64
@@ -315,6 +315,21 @@ BOSS_CODE_TABLE = {
 
 # 处置类别 → 是否"可直接重试"（仅 token_expired 值得刷新会话后重试一次）
 RETRYABLE_CATEGORIES = {"token_expired"}
+
+# code 9（限流 rate_limited）指数退避（专题 §2.2-6 / 清单#10，对标 boss-cli min(60,10×2^n)）
+RATE_LIMIT_BACKOFF_BASE_SECONDS = 10
+RATE_LIMIT_BACKOFF_MAX_SECONDS = 60
+RATE_LIMIT_MAX_RETRIES = 3
+
+
+def rate_limit_backoff(attempt):
+    """code9 限流的指数退避秒数：min(MAX, BASE × 2^attempt)（10 → 20 → 40 → 60）。"""
+    try:
+        attempt = max(int(attempt), 0)
+    except (TypeError, ValueError):
+        attempt = 0
+    return min(RATE_LIMIT_BACKOFF_MAX_SECONDS,
+               RATE_LIMIT_BACKOFF_BASE_SECONDS * (2 ** attempt))
 
 
 def classify_boss_code(code, msg=""):
@@ -4101,23 +4116,37 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
                 search_keyword or "", city_code or "", 1, {})}, sid)
             time.sleep(random.uniform(4, 8))
 
-        if limiter is not None:
-            limiter.acquire()
         api_url = build_detail_api_url(job, security_id, city_code=city_code)
         js = DETAIL_API_JS.replace("__API_URL__", api_url)
-        val = ws.eval_js(js, sid)
-        try:
-            fields = _parse_detail_api_value(val, job)
-        except DetailRiskError as exc:
-            # 风控码：退避/全停由上层按 category 二分处置（仅 token_expired 才重试）
-            return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "risk_timeout", "message": str(exc),
-                    "category": getattr(exc, "category", "env_risk")}
-        except DetailExtractionError as exc:
-            return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": str(exc)}
-        return {"ok": True, "detail": build_detail_record(job, fields),
-                "job_id": job_id, "reason": "", "message": ""}
+        # code9 限流：指数退避重试（10→20→40→60s），耗尽才交上层按 category 处置
+        for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+            if limiter is not None:
+                limiter.acquire()
+            val = ws.eval_js(js, sid)
+            try:
+                fields = _parse_detail_api_value(val, job)
+            except DetailRiskError as exc:
+                category = getattr(exc, "category", "env_risk")
+                if category == "rate_limited" and attempt < RATE_LIMIT_MAX_RETRIES:
+                    delay = rate_limit_backoff(attempt)
+                    print(f"  ⏳ 限流（code 9），{delay}s 后重试"
+                          f"（{attempt + 1}/{RATE_LIMIT_MAX_RETRIES}）...")
+                    if stop_event is not None:
+                        if stop_event.wait(delay):
+                            return {"ok": False, "detail": None, "job_id": job_id,
+                                    "reason": "stopped", "message": "已收到停止信号"}
+                    else:
+                        time.sleep(delay)
+                    continue
+                # 其他风控码 / 退避耗尽：交上层按 category 二分处置（仅 token_expired 才换 tab 重试）
+                return {"ok": False, "detail": None, "job_id": job_id,
+                        "reason": "risk_timeout", "message": str(exc),
+                        "category": category}
+            except DetailExtractionError as exc:
+                return {"ok": False, "detail": None, "job_id": job_id,
+                        "reason": "invalid_detail", "message": str(exc)}
+            return {"ok": True, "detail": build_detail_record(job, fields),
+                    "job_id": job_id, "reason": "", "message": ""}
     except _cdp_exception_types() as exc:
         return {"ok": False, "detail": None, "job_id": job_id,
                 "reason": "cdp_session", "message": str(exc)}
