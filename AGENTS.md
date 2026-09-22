@@ -68,6 +68,8 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 
 **先开 issue 再动手**：非平凡的改动（bug 修复、新功能、文档补充）按仓库 `CONTRIBUTING.md` 的规范，先在 Issues 开一条说明「改什么 / 为什么 / 怎么改」，讨论清楚后再起新分支提交。issue 正文要结构化（问题 / 现状 / 根因 / 建议 / 影响），并标注改动范围（哪些逻辑受影响、哪些不动）。
 
+**issue 分诊打标**：处理/关闭 issue 时按 `CONTRIBUTING.md` 的「Issue 标签约定」打标签；`wontfix` / `invalid` 关闭前必须留说明理由的回复。
+
 ## 合规与审计（P4e）
 
 - **红线**：不绕过平台安全机制、不调高默认频率/并发、不采集个人身份信息、不落 cookie/token、**不用代理池/换 IP**（代理实测致 `code 7/37`；IP 被封＝该账号全部会话作废、换 IP 无效只能重新登录）。详见 `CONTRIBUTING.md`「关于合规 / 拒收的 PR（明文红线）」。

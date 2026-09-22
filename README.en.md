@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.11.1-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -109,6 +109,14 @@ hermes skills install https://raw.githubusercontent.com/eatmoreduck/boss-zhipin-
 ```
 
 > Note: this depends on the hermes process being able to reach GitHub directly. If you hit a timeout or connection failure, use Option 1 or 2.
+
+### Option 4: One-line install via skills.sh (Claude Code and other Agent Skills-compatible agents)
+
+```bash
+npx skills add eatmoreduck/boss-zhipin-scraper
+```
+
+The skill is listed on [skills.sh](https://skills.sh). Any agent that supports the Agent Skills format (Claude Code, Codex, Gemini CLI, Cursor, etc.) can install it with this one command — SKILL.md, the scripts, and the city code table ship with the skill. Pick the target agent when the CLI asks.
 
 ### Verify the installation
 
@@ -360,4 +368,4 @@ MIT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=eatmoreduck/boss-zhipin-scraper&type=Date)](https://star-history.com/#eatmoreduck/boss-zhipin-scraper&Date)
+[![Star History Chart](https://api.star-history.com/chart?repos=eatmoreduck/boss-zhipin-scraper&type=date&legend=top-left&sealed_token=linAWksW9v7s0YEw83L89xbRzD4QWaJWxKrQHvkJBmx9xwMH8PseUKUQC9QAcRYaBFK1jBA_Mod4Vs8qH9A47spODANKwiVWieL3CxxQ3f9ZLqHYRwzTiA)](https://www.star-history.com/?type=date&repos=eatmoreduck%2Fboss-zhipin-scraper)

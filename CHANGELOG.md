@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.11.1 (2026-09-22)
+
+### 文档 / 工程
+- **对齐上游零风险项**（与上游 `eatmoreduck/boss-zhipin-scraper` 对齐，见提交 `f0428f3`/`2bc40f5`/`16cc992`/`848fbb4`/`f7260e9`）：
+  - 新增 GitHub Issue 模板（`bug_report.yml` / `feature_request.yml` / `question.yml`，直接采用上游 #77）
+  - `CONTRIBUTING.md` 新增「Issue 标签约定」（上游 #59）；`AGENTS.md` 补「issue 分诊打标」
+  - README（中英）新增「方式 4：skills.sh 一键安装」（上游 #82）；Star History 链接更新为上游新版
+
 ## v2.11.0 (2026-09-22)
 
 ### 新增

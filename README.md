@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.11.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.11.1-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -112,6 +112,14 @@ hermes skills install https://raw.githubusercontent.com/eatmoreduck/boss-zhipin-
 ```
 
 > 注意：此方式依赖 hermes 进程能直接访问 GitHub，如果遇到超时或连接失败，请使用方式 1 或 2。
+
+### 方式 4：skills.sh 一键安装（Claude Code 等 Agent Skills 兼容 agent）
+
+```bash
+npx skills add eatmoreduck/boss-zhipin-scraper
+```
+
+[skills.sh](https://skills.sh) 已收录本技能。任何支持 Agent Skills 格式的 agent（Claude Code、Codex、Gemini CLI、Cursor 等）都可以用这条命令安装，SKILL.md、脚本和城市码表随技能一起分发，按提示选择要安装到哪个 agent 即可。
 
 ### 验证安装
 
@@ -363,4 +371,4 @@ MIT
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=eatmoreduck/boss-zhipin-scraper&type=Date)](https://star-history.com/#eatmoreduck/boss-zhipin-scraper&Date)
+[![Star History Chart](https://api.star-history.com/chart?repos=eatmoreduck/boss-zhipin-scraper&type=date&legend=top-left&sealed_token=linAWksW9v7s0YEw83L89xbRzD4QWaJWxKrQHvkJBmx9xwMH8PseUKUQC9QAcRYaBFK1jBA_Mod4Vs8qH9A47spODANKwiVWieL3CxxQ3f9ZLqHYRwzTiA)](https://www.star-history.com/?type=date&repos=eatmoreduck%2Fboss-zhipin-scraper)
