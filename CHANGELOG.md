@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.14.2 (2026-09-23)
+
+### 健壮性（code9 限流退避 · 《DOM 与速度控制专题》§2.2-6 / 清单#10）
+- **code 9（限流）指数退避**：详情 API 通道遇 `code 9 rate_limited` 不再直接停手，改为**指数退避重试**（`min(60, 10×2^n)` = 10→20→40→60s，最多 3 次；对标同行 boss-cli）；退避耗尽才交上层按 category 处置。新增 `rate_limit_backoff()` 与常量 `RATE_LIMIT_BACKOFF_*`/`RATE_LIMIT_MAX_RETRIES`。
+- 测试 +3（`Code9BackoffTests`：退避序列 / 限流后重试成功 / 耗尽返回）。
+
 ## v2.14.1 (2026-09-22)
 
 ### 健壮性 / 排障（《DOM 与速度控制专题》小项）

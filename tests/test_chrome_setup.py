@@ -5012,6 +5012,50 @@ class TopicSmallItemsTests(unittest.TestCase):
         self.assertIn("new Event('scroll')", module.SCROLL_BOTTOM_JS)
 
 
+class Code9BackoffTests(unittest.TestCase):
+    """code9 限流指数退避（专题 §2.2-6）：退避序列 + API 详情退避重试。"""
+
+    def test_rate_limit_backoff_sequence(self):
+        module = load_module()
+        self.assertEqual(module.rate_limit_backoff(0), 10)
+        self.assertEqual(module.rate_limit_backoff(1), 20)
+        self.assertEqual(module.rate_limit_backoff(2), 40)
+        self.assertEqual(module.rate_limit_backoff(3), 60)
+        self.assertEqual(module.rate_limit_backoff(9), 60)   # 上限
+        self.assertEqual(module.rate_limit_backoff(-1), 10)  # 归零
+        self.assertEqual(module.rate_limit_backoff("x"), 10)  # 容错
+
+    def _job(self):
+        return {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html",
+                "title": "T", "boss_name": "C"}
+
+    def test_api_detail_retries_on_rate_limited_then_succeeds(self):
+        module = load_module()
+        ws = mock.Mock()
+        long_jd = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        ws.eval_js.side_effect = [
+            json.dumps({"code": 9, "msg": "访问频繁"}),
+            json.dumps({"code": 0, "jd": long_jd, "boss_active_status": "刚刚活跃"}),
+        ]
+        with mock.patch.object(module.time, "sleep"):
+            r = module._scrape_one_detail_via_api(
+                self._job(), 9333, security_id="s", api_session=(ws, "t", "s"))
+        self.assertTrue(r["ok"])
+        self.assertEqual(ws.eval_js.call_count, 2)
+
+    def test_api_detail_gives_up_after_rate_limit_retries(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps({"code": 9, "msg": "访问频繁"})
+        with mock.patch.object(module.time, "sleep"):
+            r = module._scrape_one_detail_via_api(
+                self._job(), 9333, security_id="s", api_session=(ws, "t", "s"))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "risk_timeout")
+        self.assertEqual(r["category"], "rate_limited")
+        self.assertEqual(ws.eval_js.call_count, module.RATE_LIMIT_MAX_RETRIES + 1)
+
+
 class MultiKeywordTests(unittest.TestCase):
     """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
 
