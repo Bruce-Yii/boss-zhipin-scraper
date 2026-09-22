@@ -1,7 +1,7 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.6.0
+version: 2.7.0
 author: eatmoreduck
 license: MIT
 platforms: [macos, linux, windows]
@@ -10,7 +10,7 @@ metadata:
     tags: [scraper, jobs, career, cdp, chrome, zhipin, boss直聘]
 ---
 
-# BOSS直聘职位抓取工具 v2.6
+# BOSS直聘职位抓取工具 v2.7
 
 通过 Chrome CDP 协议抓取 BOSS直聘 (zhipin.com) 职位数据，输出结构化 JSON/CSV（含明文薪资），并可对已抓取结果生成聚合摘要和求职材料优化提示词。
 
@@ -167,6 +167,7 @@ python3 "$SUMMARY_PATH" \
 | `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |
 | `--allow-dom-fallback` | 关闭 | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--merge FILE` | - | 合并已有 JSON（按 job_id 去重） |
+| `--db [PATH]` | 关闭 | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值用 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
 | `--cdp-port` | 45222 | CDP 端口 |
 | `--setup-chrome` | 关闭 | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 关闭 | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile；默认、首次启动、重复启动都不复制 |

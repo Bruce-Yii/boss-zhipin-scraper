@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.7.0 (2026-09-22)
+
+### 新增
+- **SQLite 增量存储 + 详情断点续抓（P4c-2）**：新增 `--db [PATH]`（可选，默认 `~/.boss-zhipin-scraper/boss.db`，**仓库外、不进 git**；零新依赖，仅标准库 `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 首次写入后不变、`updated_at` 每次覆盖）；列表/详情与 JSON/CSV **并存不替换**。库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓），并保证这些岗位仍带 JD 进入本 run 导出（避免"跳过即丢 JD"）。抽出稳定纯逻辑模块 `scripts/db_store.py`（主文件 re-export，模块边界同 `ratelimit`/`export_contract`）；入库前统一脱敏（cookie/token/securityId/BOSS 内部标识绝不落库，红线不变）。`--batch` 暂未接入（会明确提示本次忽略 `--db`）。测试 +11
+
+### 文档
+- README（中英）/ `SKILL.md` 补充 `--db` 参数与 SQLite 增量层说明
+
 ## v2.6.0 (2026-09-22)
 
 ### 性能（实测定界）

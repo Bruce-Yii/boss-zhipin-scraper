@@ -51,6 +51,13 @@ class CliContractTests(unittest.TestCase):
         r = self._run("--archive", "abc")
         self.assertEqual(r.returncode, 2)
 
+    def test_help_documents_db_flag(self):
+        """--db 出现在 --help（P4c-2 SQLite 增量层，默认库仓库外）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--db", r.stdout)
+        self.assertIn("boss.db", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
