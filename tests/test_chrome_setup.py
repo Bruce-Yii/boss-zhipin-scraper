@@ -1825,7 +1825,8 @@ class ChromeSetupTests(unittest.TestCase):
         from scripts import ratelimit as rl
         self.assertIs(module.TokenBucket, rl.TokenBucket)
         self.assertIs(module.AdaptiveRateLimiter, rl.AdaptiveRateLimiter)
-        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 1.0)
+        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 2.25)
+        self.assertIs(module.BurstThrottle, rl.BurstThrottle)
 
     def test_fetch_pages_parallel_returns_all_pages(self):
         module = load_module()
@@ -2302,9 +2303,10 @@ class ChromeSetupTests(unittest.TestCase):
         used = {id(s[0]) for s in seen_sessions}
         self.assertEqual(used, {id(w) for w in created}, "使用的会话应全部来自池")
 
-    def test_parallel_api_channel_paces_detail_requests(self):
-        """并发 API 通道：自建限速器基线应为 concurrency/PACE（每 worker 至少
-        PACE 秒），而非 DOM 路径的 concurrency*0.5/秒——防止详情接口被过快请求。"""
+    def test_parallel_api_channel_uses_burst_throttle(self):
+        """并发 API 通道：用 BurstThrottle（请求时刻串行 + 高斯 1.5-3.0s + burst
+        惩罚，全局 ~0.44 req/s），不再是旧式 concurrency/PACE 令牌桶（会踩线触
+        code 37）——2026-09-22 同行研究落地。"""
         module = load_module()
         jobs = self._sample_jobs(2)["jobs"]
 
@@ -2319,7 +2321,8 @@ class ChromeSetupTests(unittest.TestCase):
                                   return_value=("t", "s")), \
                 mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
                 mock.patch.object(module, "check_cdp_recovery", return_value=0), \
-                mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                mock.patch.object(module, "BurstThrottle") as bt_cls, \
+                mock.patch.object(module, "AdaptiveRateLimiter") as arl_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
@@ -2327,10 +2330,9 @@ class ChromeSetupTests(unittest.TestCase):
                 jobs, cdp_port=9222, concurrency=2,
                 security_map={j["job_id"]: "sec" for j in jobs},
                 city_code="101010100", keyword="AI产品经理")
-        api_base = limiter_cls.call_args.kwargs.get("base_rate")
-        self.assertAlmostEqual(
-            api_base, 2 / module.DETAIL_API_PACE_SECONDS,
-            msg="API 通道基线应为 concurrency/PACE（每 worker 至少 PACE 秒）")
+        self.assertTrue(bt_cls.called,
+                        "API 通道应使用 BurstThrottle（串行+burst-aware 安全节律）")
+        arl_cls.assert_not_called()
 
     def test_parallel_dom_path_keeps_permissive_baseline(self):
         """DOM 路径（无 security_map）：保持旧基线 concurrency*0.5/秒

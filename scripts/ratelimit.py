@@ -6,14 +6,85 @@
 保持 ``scripts.boss_cdp_raw.TokenBucket`` 等导入面不变。
 """
 
+import random
 import threading
 import time
+from collections import deque
 
-# 详情 API 通道每 worker 最小间隔（秒）。
-# **实测定界（2026-09-22 E3/E4）**：多 tab 轮换（每 tab 配额 5）下，间隔 0.5s
-# 连续 40 次仍 code 0、无验证码 → 取 1.0s 作保守值（2× 余量）。
-# 并发 N 时全局基线 N/1.0 次/秒；旧值 15.0 过保守约 15×（无实测依据）。
-DETAIL_API_PACE_SECONDS = 1.0
+# 详情 API 通道节律参考值（秒）。
+# **2026-09-22 同行研究修正**：全行安全区为 **~0.33–0.67 req/s（高斯 1.5–3.0s）**，
+# 且**请求时刻串行化**；我方此前 `1.0s/worker × 并发 3 ≈ 3 req/s` **踩线**，
+# 反复触发 `code 37 您的环境存在异常` → 全停 → 产出反而更少。
+# 改由 BurstThrottle（见下）承担 API 通道节律；此常量保留为串行参考中心值。
+DETAIL_API_PACE_SECONDS = 2.25
+
+
+class BurstThrottle:
+    """**串行化 + burst-aware** 请求节律（对标同行 boss-agent-cli throttle 模型）。
+
+    - 请求时刻**全局串行**（持锁跨 sleep）：并发 worker 也不再同时发请求
+    - 间隔 ~高斯(center, sigma)，裁剪到 [min_delay, max_delay]
+    - ~5% 概率叠加一次长暂停（2–5s）
+    - burst 惩罚：近 15s ≥3 次加 1.2–2.8s；近 45s ≥6 次加 4–7s
+    - slow_factor（熔断恢复期=2.0）整体放大间隔
+
+    目标全局速率 ≈ 1/center（默认 ~0.44 req/s），落在全行安全区。
+    """
+
+    def __init__(self, center=2.25, sigma=0.4, min_delay=1.5, max_delay=3.0,
+                 long_pause_prob=0.05, long_pause=(2.0, 5.0),
+                 short_window=15.0, short_threshold=3, short_penalty=(1.2, 2.8),
+                 long_window=45.0, long_threshold=6, long_penalty=(4.0, 7.0)):
+        self.center = center
+        self.sigma = sigma
+        self.min_delay = min_delay
+        self.max_delay = max_delay
+        self.long_pause_prob = long_pause_prob
+        self.long_pause = long_pause
+        self.short_window = short_window
+        self.short_threshold = short_threshold
+        self.short_penalty = short_penalty
+        self.long_window = long_window
+        self.long_threshold = long_threshold
+        self.long_penalty = long_penalty
+        self.slow_factor = 1.0
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self._times = deque()
+
+    def _base_delay(self):
+        d = random.gauss(self.center, self.sigma)
+        d = min(max(d, self.min_delay), self.max_delay)
+        if random.random() < self.long_pause_prob:
+            d += random.uniform(*self.long_pause)
+        return d
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            horizon = max(self.short_window, self.long_window)
+            while self._times and now - self._times[0] > horizon:
+                self._times.popleft()
+            n_short = sum(1 for t in self._times if now - t <= self.short_window)
+            n_long = sum(1 for t in self._times if now - t <= self.long_window)
+            delay = self._base_delay()
+            if n_long >= self.long_threshold:
+                delay += random.uniform(*self.long_penalty)
+            elif n_short >= self.short_threshold:
+                delay += random.uniform(*self.short_penalty)
+            delay *= self.slow_factor
+            wait = delay - (now - self._last)
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+            self._times.append(self._last)
+
+    # 与 AdaptiveRateLimiter 接口兼容（并行路径会调用；burst 模型用不到成功率）
+    def record_success(self):
+        pass
+
+    def record_failure(self):
+        pass
 
 
 class TokenBucket:

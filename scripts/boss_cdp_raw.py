@@ -64,6 +64,7 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
 
 TokenBucket = _ratelimit.TokenBucket
 AdaptiveRateLimiter = _ratelimit.AdaptiveRateLimiter
+BurstThrottle = _ratelimit.BurstThrottle
 DETAIL_API_PACE_SECONDS = _ratelimit.DETAIL_API_PACE_SECONDS
 
 try:
@@ -3623,6 +3624,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
     api_session = None
     detail_keyword = list_data.get("keyword", "") or ""
     detail_city_code = list_data.get("city_code", "") or ""
+    # API 通道 burst-aware 串行节律（全局 ~0.44 req/s）；DOM 通道不用
+    detail_throttle = BurstThrottle() if security_map else None
     if security_map:
         try:
             api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
@@ -3746,17 +3749,18 @@ def scrape_details(list_data, max_details=None, output_path=None,
                     pending[job_id] = pending.get(job_id, 0) + 1
                     save_pending_ids(output_path, pending)
 
-        # 详情页间隔：API 通道每 worker ≥ DETAIL_API_PACE_SECONDS（规格硬线，
-        # API 无渲染等待、限速器/间隔是唯一刹车）；DOM 通道沿用 10-25s。
-        if security_map:
-            gap = random.uniform(DETAIL_API_PACE_SECONDS, DETAIL_API_PACE_SECONDS * 1.6)
+        # 详情页间隔：API 通道用 burst-aware 串行节律（全局 ~0.44 req/s，全行
+        # 安全区）；DOM 通道沿用 10-25s。
+        if detail_throttle is not None:
+            print("  API 通道节律等待中...\n")
+            detail_throttle.acquire()
         else:
             gap = random.uniform(10, 25)
-        print(f"  等待 {gap:.0f}s 后抓下一个...\n")
+            print(f"  等待 {gap:.0f}s 后抓下一个...\n")
+            time.sleep(gap)
         progress = progress_line(idx + 1, len(jobs), serial_ok)
         if progress:
             print(progress)
-        time.sleep(gap)
 
     # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
     _close_api_tab(api_session)
@@ -3807,22 +3811,22 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
     pending = dict(pending_ids) if pending_ids is not None else {}
     if limiter is None:
         if security_map:
-            # 详情 API 通道：单次请求约 1s（无整页渲染等待），限速器是唯一刹车。
-            # 按"每 worker 至少 DETAIL_API_PACE_SECONDS 间隔"设基线
-            # （并发 N → 全局约 N/PACE 次/秒），与串行 10-25s 间隔同量级；
-            # 旧公式 concurrency*0.5/秒 是为 DOM 渲染路径设计的（其加载/滚动
-            # 20-30s 天然限速），对 API 通道过快（2026-09-22 审计修复）。
-            base_rate = max(concurrency / DETAIL_API_PACE_SECONDS, 0.07)
+            # 详情 API 通道：burst-aware **串行**节律（请求时刻全局串行 + 高斯
+            # 1.5-3.0s + 5% 长暂停 + burst 惩罚），全局 ~0.44 req/s，落在全行安全区。
+            # 2026-09-22 同行研究：旧式 `concurrency/PACE`（并发 3 ≈ 3 req/s）
+            # 踩线 → 反复触 code 37 → 全停，产出反而更少。
+            limiter = BurstThrottle()
         else:
             # DOM 路径：单条加载/滚动 20-30s 天然限速，令牌桶仅提供弱错峰
-            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时由
-            # AdaptiveRateLimiter 降半/暂停兜底。
-            base_rate = max(concurrency * 0.5, 0.5)
-        limiter = AdaptiveRateLimiter(base_rate=base_rate)
+            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时降半/暂停兜底。
+            limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
         # 熔断恢复期：冷却结束后渐变恢复，恢复期内限速减半（不跳回全速）
         recovery = check_cdp_recovery()
         if recovery > 0:
-            limiter.base_rate /= 2.0
+            if isinstance(limiter, BurstThrottle):
+                limiter.slow_factor = 2.0
+            else:
+                limiter.base_rate /= 2.0
             print(f"⚠️ 熔断恢复期（剩余约 {recovery:.0f}s），详情限速减半")
 
     # 过滤已抓/重复（与串行路径同一套去重逻辑）
