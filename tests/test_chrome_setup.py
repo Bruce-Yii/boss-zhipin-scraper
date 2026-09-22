@@ -1825,7 +1825,30 @@ class ChromeSetupTests(unittest.TestCase):
         from scripts import ratelimit as rl
         self.assertIs(module.TokenBucket, rl.TokenBucket)
         self.assertIs(module.AdaptiveRateLimiter, rl.AdaptiveRateLimiter)
-        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 15.0)
+        self.assertEqual(module.DETAIL_API_PACE_SECONDS, 1.0)
+
+    def test_fetch_pages_parallel_returns_all_pages(self):
+        module = load_module()
+        sess = [mock.Mock(), "t", "s", 0]
+        sess[0].eval_js.return_value = "{}"
+        with mock.patch.object(module, "_open_api_tab", return_value=sess), \
+                mock.patch.object(module, "_close_api_tab"), \
+                mock.patch.object(module, "parse_api_jobs_eval_value",
+                                  side_effect=lambda v: [{"job_id": "x"}]):
+            out = module._fetch_pages_parallel(9222, "k", "101", 3, {})
+        self.assertIsNotNone(out)
+        self.assertEqual([len(b) for b in out], [1, 1, 1])
+
+    def test_fetch_pages_parallel_falls_back_on_empty_page(self):
+        module = load_module()
+        sess = [mock.Mock(), "t", "s", 0]
+        sess[0].eval_js.return_value = "{}"
+        with mock.patch.object(module, "_open_api_tab", return_value=sess), \
+                mock.patch.object(module, "_close_api_tab"), \
+                mock.patch.object(module, "parse_api_jobs_eval_value",
+                                  return_value=[]):
+            out = module._fetch_pages_parallel(9222, "k", "101", 3, {})
+        self.assertIsNone(out, "任一页无数据应返回 None（调用方回退串行）")
 
     def test_export_contract_module_is_reexported(self):
         module = load_module()
@@ -2312,7 +2335,7 @@ class ChromeSetupTests(unittest.TestCase):
     def test_parallel_api_channel_rotates_tab_on_budget(self):
         """预算轮换：同一 tab 达 DETAIL_API_TAB_BUDGET 次后自动换新 tab（支撑批量）。"""
         module = load_module()
-        jobs = self._sample_jobs(9)["jobs"]  # 预算 4 → 4+4+1 = 3 个 tab
+        jobs = self._sample_jobs(9)["jobs"]  # 预算 5 → 5+4 = 2 个 tab
         tids = iter(f"tid-{i}" for i in range(10))
         created, navigations = [], []
 
@@ -2346,9 +2369,9 @@ class ChromeSetupTests(unittest.TestCase):
                 security_map={j["job_id"]: "sec" for j in jobs},
                 city_code="101010100", keyword="AI产品经理")
         self.assertEqual(len(results), 9)
-        self.assertEqual(len(created), 3,
-                         "9 条 / 预算 4 → 应轮换出 3 个 tab（初始 + 2 次轮换）")
-        self.assertEqual(len(navigations), 3, "每个 tab 只导航一次")
+        self.assertEqual(len(created), 2,
+                         "9 条 / 预算 5 → 应轮换出 2 个 tab（初始 + 1 次轮换）")
+        self.assertEqual(len(navigations), 2, "每个 tab 只导航一次")
 
     def test_parallel_api_channel_retries_after_risk_by_rotating_tab(self):
         """风控码疑似配额耗尽：换 tab 重试一次，成功则继续（不误判全停）。"""

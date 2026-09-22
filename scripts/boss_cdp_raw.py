@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 import argparse
 import csv
@@ -103,8 +103,8 @@ CDP_COOLDOWN_SECONDS = 300      # 熔断后冷却期：冷却内拒绝自动重�
 CDP_RECOVERY_SECONDS = 120      # 冷却结束后的渐变恢复期（限速减半，不跳回全速）
 DEFAULT_CONCURRENCY = 1         # 详情抓取默认并发度（1=串行，保持原行为）
 # DETAIL_API_PACE_SECONDS 已抽出到 scripts/ratelimit.py（见顶部导入兼容层）
-DETAIL_API_TAB_BUDGET = 4       # 详情 API 每 tab 预算：实测同一 tab 连续约 4-5 次后返回
-                                # code 37，换新 tab 立即重置（2026-09-22 实证）→ 主动轮换支撑批量
+DETAIL_API_TAB_BUDGET = 5       # 详情 API 每 tab 预算：实测同一 tab 第 6 次返回 code 37
+                                # （即可用 5 次，2026-09-22 E3 复核），换新 tab 立即重置 → 主动轮换
 MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出后放弃，避免短 JD 等永久失败浪费请求）
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 # FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
@@ -2156,9 +2156,84 @@ def load_existing_details(input_path=None, detail_output=None, result_dir=DEFAUL
 # ============================================================
 # 抓取列表
 # ============================================================
+def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
+                          workers=3):
+    """并发抓取多页列表：并发开 `workers` 个停靠 tab，再跨 tab 同发搜索 XHR。
+
+    实测（2026-09-22 E5）：3 页同发一次取全（无风控）；配合并发开 tab，
+    列表阶段从"串行 ~50s（含 12-22s 页间等待）"降到约 6-7s。
+    任一页无数据/异常 → 返回 None（调用方回退串行，保证稳健）。
+    返回：[[page1 jobs], [page2 jobs], ...]（长度 = pages）。
+    """
+    workers = max(1, min(int(workers), pages))
+    sessions = [None] * workers
+    open_errs = []
+
+    def _open(i):
+        try:
+            sessions[i] = _open_api_tab(cdp_port, keyword, city_code)
+        except _cdp_exception_types():
+            open_errs.append(i)
+
+    ots = [threading.Thread(target=_open, args=(i,)) for i in range(workers)]
+    for t in ots:
+        t.start()
+    for t in ots:
+        t.join()
+    if open_errs or any(s is None for s in sessions):
+        for s in sessions:
+            _close_api_tab(s)
+        return None
+
+    page_q = queue.Queue()
+    for p in range(1, pages + 1):
+        page_q.put(p)
+    out = {}
+    failed = []
+    lock = threading.Lock()
+
+    def _run(sess):
+        while True:
+            try:
+                pg = page_q.get_nowait()
+            except queue.Empty:
+                return
+            params = {"scene": "1", "query": keyword, "city": city_code,
+                      "page": pg, "pageSize": PAGE_SIZE}
+            for k, v in (filters or {}).items():
+                if v:
+                    params[k] = v
+            api_url = f"{API_JOB_LIST_PATH}?{urlencode(params)}"
+            js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
+            try:
+                val = sess[0].eval_js(js, sess[2])
+                jobs = parse_api_jobs_eval_value(val)
+            except _cdp_exception_types():
+                with lock:
+                    failed.append(pg)
+                return
+            if not jobs:
+                with lock:
+                    failed.append(pg)
+                return
+            with lock:
+                out[pg] = jobs
+
+    ts = [threading.Thread(target=_run, args=(s,)) for s in sessions]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    for s in sessions:
+        _close_api_tab(s)
+    if failed or len(out) != pages:
+        return None
+    return [out[p] for p in range(1, pages + 1)]
+
+
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                max_jobs=None, max_concurrent=1):
+                max_jobs=None, max_concurrent=1, pages_parallel=1):
     city_name, city_code = resolve_city(city_input)
     # 单进程互斥（规格 §3.6）：默认并发上限 1（现状）；--max-concurrent N 仅指令显式放开
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
@@ -2247,6 +2322,19 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 "type": "mouseMoved", "x": x, "y": y
             }, sid)
 
+    # 并行抓页（P3 速度）：多 tab 同发搜索 XHR。库层默认关闭（pages_parallel=1，
+    # 不影响既有测试/调用方）；CLI 默认开启。任一页失败即回退串行，保证稳健。
+    prefetched_pages = None
+    if pages_parallel > 1 and max_pages > 1 and not allow_dom_fallback:
+        prefetched_pages = _fetch_pages_parallel(
+            cdp_port, keyword, city_code, max_pages, filters,
+            workers=pages_parallel)
+        if prefetched_pages is None:
+            print("  ⚠️ 并行抓页未全部成功，回退串行模式")
+        else:
+            print(f"  ⚡ 并行抓页：{max_pages} 页 "
+                  f"{sum(len(b) for b in prefetched_pages)} 条")
+
     try:
         exhausted = False  # 本 run 是否翻到底（规格侧抽样感知下架判定依据：契约 v2 顶层字段）
         for pg in range(1, max_pages + 1):
@@ -2262,8 +2350,8 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             print(f"--- [{pg}/{max_pages} 页, {len(all_jobs)} 条已抓] ---")
             incr_request("list")
 
-            # 第一页：导航到搜索页建立 cookie/session
-            if pg == 1:
+            # 第一页：导航到搜索页建立 cookie/session（并行预取时已由预取 tab 建立）
+            if pg == 1 and prefetched_pages is None:
                 url = build_search_url(keyword, city_code, pg, filters)
                 cdp.send("Page.navigate", {"url": url}, sid)
                 time.sleep(random.uniform(6, 10))
@@ -2297,28 +2385,32 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             api_url = f"{API_JOB_LIST_PATH}?{urlencode(api_params)}"
 
             jobs = []
-            for attempt in range(API_ATTEMPT_LIMIT):
-                api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
-                val = cdp.eval_js(api_js, sid)
-                jobs = parse_api_jobs_eval_value(val)
-                if jobs:
-                    break
-                if attempt < API_ATTEMPT_LIMIT - 1:
-                    print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
-                    warnings.append(f"第{pg}页API未返回数据，已刷新重试")
-                    cdp.send("Page.navigate",
-                             {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
-                    # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
-                    # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
-                    time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
-                    is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
-                    if is_risk:
-                        print(f"⚠️ 刷新后 {reason}，等待人工处理...")
-                        if not wait_for_risk_clear(cdp, sid):
-                            print("风控未解除，停止抓取（保留已抓数据）。")
-                            warnings.append(f"刷新后风控未解除: {reason}")
-                            jobs = []
-                            break
+            if prefetched_pages is not None:
+                # 并行预取命中：直接用该页结果，跳过导航/重试/风控探测
+                jobs = prefetched_pages[pg - 1]
+            else:
+                for attempt in range(API_ATTEMPT_LIMIT):
+                    api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
+                    val = cdp.eval_js(api_js, sid)
+                    jobs = parse_api_jobs_eval_value(val)
+                    if jobs:
+                        break
+                    if attempt < API_ATTEMPT_LIMIT - 1:
+                        print(f"  ⚠️ API 第 {attempt + 1} 次未返回数据，刷新页面重试（凭证自愈）...")
+                        warnings.append(f"第{pg}页API未返回数据，已刷新重试")
+                        cdp.send("Page.navigate",
+                                 {"url": build_search_url(keyword, city_code, 1, filters)}, sid)
+                        # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
+                        # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
+                        time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
+                        is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                        if is_risk:
+                            print(f"⚠️ 刷新后 {reason}，等待人工处理...")
+                            if not wait_for_risk_clear(cdp, sid):
+                                print("风控未解除，停止抓取（保留已抓数据）。")
+                                warnings.append(f"刷新后风控未解除: {reason}")
+                                jobs = []
+                                break
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
             if should_use_dom_fallback(jobs, allow_dom_fallback):
@@ -2402,8 +2494,9 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 print(f"  已抓 {len(all_jobs)} 条 ≥ 目标 {max_jobs}，停止翻页")
                 break
 
-            if pg < max_pages:
+            if pg < max_pages and prefetched_pages is None:
                 # 并发 >1 时页间隔自动拉长（规格 §3.6 修订：12-22s → 20-30s）
+                # 注：并行预取时页已一次性取回，无需页间等待
                 if max_concurrent > 1:
                     d = random.uniform(20, 30)
                 else:
@@ -2794,7 +2887,8 @@ def _list_has_detail_risk(list_path):
 
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
-              detail=True, detail_concurrency=1, keep_without_jd=False):
+              detail=True, detail_concurrency=1, keep_without_jd=False,
+              pages_parallel=1):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -2836,6 +2930,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                 task["keyword"], task["city"], task["pages"], filters, None,
                 cdp_port=cdp_port, max_jobs=None,
                 max_concurrent=max_concurrent,
+                pages_parallel=pages_parallel,
             )
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
@@ -4613,6 +4708,9 @@ def build_parser():
     g_search.add_argument("--max-concurrent", type=int, default=1,
                           help="并发抓取任务数上限（默认 1=单任务互斥，规格 §3.6 硬防线；"
                                "指令显式指定（如 2-3）才放开；任一任务遇风控立即全停）")
+    g_search.add_argument("--pages-parallel", type=int, default=3,
+                          help="并行抓页数（默认 3；多 tab 同发搜索 XHR，迭代列表阶段"
+                               "约 50s→约 6s；0/1=关闭回退串行）")
 
     # ---- 筛选参数 ----
     g_filter = p.add_argument_group("筛选参数")
@@ -4774,7 +4872,8 @@ def run_cli():
         sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
                            max_concurrent=args.max_concurrent,
                            detail=args.detail, detail_concurrency=args.concurrency,
-                           keep_without_jd=args.keep_without_jd))
+                           keep_without_jd=args.keep_without_jd,
+                           pages_parallel=args.pages_parallel))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
@@ -4877,6 +4976,7 @@ def run_cli():
             allow_dom_fallback=args.allow_dom_fallback,
             max_jobs=args.max_jobs,
             max_concurrent=args.max_concurrent,
+            pages_parallel=args.pages_parallel,
         )
         # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
         sidecar_owned = write_security_sidecar(

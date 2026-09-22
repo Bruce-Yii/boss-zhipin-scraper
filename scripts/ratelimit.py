@@ -9,10 +9,11 @@
 import threading
 import time
 
-# 详情 API 通道每 worker 最小间隔（秒）：API 单次约 1s，
-# 无渲染等待，限速器是唯一刹车 → 并发 N 时全局基线 N/15 次/秒
-# （避免旧公式 concurrency*0.5/秒 对详情接口过快触发风控）
-DETAIL_API_PACE_SECONDS = 15.0
+# 详情 API 通道每 worker 最小间隔（秒）。
+# **实测定界（2026-09-22 E3/E4）**：多 tab 轮换（每 tab 配额 5）下，间隔 0.5s
+# 连续 40 次仍 code 0、无验证码 → 取 1.0s 作保守值（2× 余量）。
+# 并发 N 时全局基线 N/1.0 次/秒；旧值 15.0 过保守约 15×（无实测依据）。
+DETAIL_API_PACE_SECONDS = 1.0
 
 
 class TokenBucket:
