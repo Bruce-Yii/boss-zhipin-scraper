@@ -5,7 +5,7 @@
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.14.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.14.1-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -198,6 +198,7 @@ python3 scripts/job_summary.py --top 15
 | `--close-chrome` | 抓取正常结束后自动关闭专用 Chrome（默认不关；异常退出不触发，保留登录态） |
 | `-v, --verbose` | 输出 DEBUG 级别日志（可叠加 `-vv`；调试 CDP 消息、探测详情等） |
 | `-q, --quiet` | 静默模式：日志降到 WARNING 级别（结果行/EXPORT 行仍输出 stdout） |
+| `--debug-screenshots` | 失败时把页面截图存到 `~/.boss-zhipin-scraper/debug/`（排障用；默认关闭） |
 | `--output` | 列表输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
 | `--detail-output` | 详情输出路径（默认 `~/.boss-zhipin-scraper/job-result/`） |
 | `--cdp-port` | CDP 端口（默认 45222——固定高位端口，绕开 BOSS 安全 JS 扫描的 9222/9223/9229） |

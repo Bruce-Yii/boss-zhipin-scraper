@@ -77,6 +77,12 @@ class CliContractTests(unittest.TestCase):
         self.assertIn("--list-mode", r.stdout)
         self.assertIn("passive", r.stdout)
 
+    def test_help_documents_debug_screenshots_flag(self):
+        """--debug-screenshots 出现在 --help（专题 §3.6 失败截图，默认关闭）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--debug-screenshots", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

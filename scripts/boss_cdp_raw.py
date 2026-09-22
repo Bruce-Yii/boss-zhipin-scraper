@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.14.0"
+__version__ = "2.14.1"
 
 import argparse
 import base64
@@ -114,6 +114,12 @@ record_audit_event = _audit.record_event
 
 # CDP 默认端口（可通过 --cdp-port 覆盖）
 DEFAULT_CDP_PORT = 45222  # 固定高位端口：绕开 BOSS 安全 JS 扫描名单（9222/9223/9229 实测被扫）
+# CDP 候选端口（专题 §3.2 / Snseam 三级探测）：首选不可达时探测并提示
+CDP_CANDIDATE_PORTS = (9222, 9229, 19222)
+# 失败截图（专题 §3.6 / 清单#4）：排障用；默认关闭（--debug-screenshots 开）；仓库外
+DEBUG_SHOT_ENABLED = False
+DEFAULT_DEBUG_DIR = os.path.expanduser("~/.boss-zhipin-scraper/debug")
+DEBUG_DIR_ENV = "BOSS_DEBUG_DIR"
 
 # API 基础路径（便于统一修改）
 API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
@@ -1192,6 +1198,17 @@ REMOVE_DIALOG_JS = """
     for (var i = 0; i < sels.length; i++) {
         document.querySelectorAll(sels[i]).forEach(function(n){ n.remove(); });
     }
+    return true;
+})()
+"""
+
+# 滚动到底并**派发 scroll 事件**（专题 §1.6/§1.7：hidden/后台 tab 的原生滚动被 defer，
+# 不派发事件时页面不会触发无限滚动加载下一页）
+SCROLL_BOTTOM_JS = """
+(function(){
+    window.scrollTo(0, document.body.scrollHeight);
+    window.dispatchEvent(new Event('scroll'));
+    document.dispatchEvent(new Event('scroll'));
     return true;
 })()
 """
@@ -2763,7 +2780,7 @@ def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
         out = [map_api_jobs(first)]
         for _ in range(2, pages + 1):
             # 滚到底触发无限滚动加载下一页，继续旁听页面自身请求
-            ws.eval_js("window.scrollTo(0, document.body.scrollHeight); void 0;", sid)
+            ws.eval_js(SCROLL_BOTTOM_JS, sid)
             page_data = capture.wait_next_response(timeout=PROBE_CAPTURE_TIMEOUT)
             if not page_data:
                 log.warning("被动捕获：翻页未捕获到响应")
@@ -3908,6 +3925,40 @@ def _dismiss_dialogs(ws, sid):
         log.debug("dialog 清理失败", exc_info=True)
 
 
+def debug_screenshot_dir():
+    """失败截图目录（`BOSS_DEBUG_DIR` 可覆盖，供测试/多环境）；仓库外。"""
+    path = os.environ.get(DEBUG_DIR_ENV) or DEFAULT_DEBUG_DIR
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
+
+
+def capture_debug_screenshot(ws, sid, tag):
+    """CDP 截屏存本地（排障用，best-effort，绝不抛异常）。
+
+    仅当 `DEBUG_SHOT_ENABLED` 为真（CLI `--debug-screenshots`）时执行。
+    返回保存路径或 None。
+    """
+    if not DEBUG_SHOT_ENABLED or ws is None:
+        return None
+    try:
+        r = ws.send("Page.captureScreenshot", {"format": "png"}, sid)
+        data = (r.get("result") or {}).get("data")
+        if not data:
+            return None
+        name = f"err_{tag}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        path = os.path.join(debug_screenshot_dir(), name)
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(data))
+        print(f"  📷 已保存失败截图: {path}")
+        return path
+    except (OSError, ValueError, TypeError, *_cdp_exception_types()):
+        log.debug("失败截图保存失败", exc_info=True)
+        return None
+
+
 def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                        limiter=None, verbose=False, security_id=None,
                        api_session=None, city_code="", search_keyword=""):
@@ -3967,6 +4018,7 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入
         is_risk, risk_reason = classify_risk_page(probe_risk_page(ws, sid))
         if is_risk and not wait_for_risk_clear(ws, sid):
+            capture_debug_screenshot(ws, sid, "risk")
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "risk_timeout", "message": risk_reason}
 
@@ -3998,9 +4050,11 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             d["boss_active_status"] = fields["boss_active_status"]
             d["page_update_date"] = fields["page_update_date"]
         except DetailLoginRequiredError as exc:
+            capture_debug_screenshot(ws, sid, "login_required")
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "login_required", "message": str(exc)}
         except DetailExtractionError as exc:
+            capture_debug_screenshot(ws, sid, "invalid_detail")
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail", "message": str(exc)}
 
@@ -4929,6 +4983,29 @@ def run_status(cdp_port=DEFAULT_CDP_PORT, result_dir=DEFAULT_RESULT_DIR):
     return 0
 
 
+def probe_cdp_port(port, timeout=2):
+    """探测某端口是否有 CDP 服务（/json/version 可达且含 webSocketDebuggerUrl）。"""
+    if requests is None:
+        return False
+    try:
+        resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
+        return bool(resp.json().get("webSocketDebuggerUrl"))
+    except (requests.RequestException, ValueError, KeyError):
+        return False
+
+
+def detect_cdp_port(preferred=DEFAULT_CDP_PORT, candidates=CDP_CANDIDATE_PORTS, probe=None):
+    """返回第一个可达的 CDP 端口（preferred 优先，其后候选）；都不可达返回 None。
+
+    专题 §3.2（Snseam 三级端口探测）：用户可能用标准端口（9222/9229/19222）起了 Chrome。
+    """
+    probe = probe or probe_cdp_port
+    for port in (preferred, *candidates):
+        if probe(port):
+            return port
+    return None
+
+
 def run_check(cdp_port=DEFAULT_CDP_PORT):
     """运行环境诊断检查"""
     print("=" * 50)
@@ -4963,7 +5040,11 @@ def run_check(cdp_port=DEFAULT_CDP_PORT):
             print(f"  ✅ 通过 — CDP 服务: {browser}")
         except (requests.ConnectionError, requests.Timeout):
             print(f"  ❌ 失败 — 无法连接 127.0.0.1:{cdp_port}")
-            print(f"     请先启动 Chrome CDP: {sys.executable} {__file__} --setup-chrome")
+            found = detect_cdp_port(cdp_port, CDP_CANDIDATE_PORTS)
+            if found and found != cdp_port:
+                print(f"     发现其他端口有 CDP 服务: {found}（可用 --cdp-port {found}）")
+            else:
+                print(f"     请先启动 Chrome CDP: {sys.executable} {__file__} --setup-chrome")
             all_pass = False
         except (json.JSONDecodeError, KeyError) as e:
             print(f"  ❌ 失败 — CDP 响应异常: {e}")
@@ -5525,6 +5606,8 @@ def build_parser():
                            help="输出 DEBUG 级别日志（可叠加 -vv；调试 CDP 消息、探测详情等）")
     g_general.add_argument("-q", "--quiet", action="store_true",
                            help="静默模式：日志降到 WARNING 级别（结果行仍输出 stdout）")
+    g_general.add_argument("--debug-screenshots", action="store_true",
+                           help="失败时把页面截图存到 ~/.boss-zhipin-scraper/debug/（排障用；默认关闭）")
 
     return p
 
@@ -5554,6 +5637,10 @@ def run_cli():
     FOREGROUND_CAPTURE = bool(getattr(args, "foreground_capture", False))
     if FOREGROUND_CAPTURE:
         print("⚠️  已启用 --foreground-capture：自动化页面改用前台 Target（问题环境逃生口）")
+
+    # 失败截图（专题 §3.6）：默认关闭，--debug-screenshots 开启
+    global DEBUG_SHOT_ENABLED
+    DEBUG_SHOT_ENABLED = bool(getattr(args, "debug_screenshots", False))
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)

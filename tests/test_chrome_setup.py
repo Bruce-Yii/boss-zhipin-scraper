@@ -4969,6 +4969,49 @@ class DomSpeedupTests(unittest.TestCase):
         self.assertEqual(fields["boss_active_status"], "3周内活跃")
 
 
+class TopicSmallItemsTests(unittest.TestCase):
+    """专题剩余小项：失败截图 / CDP 三级端口探测 / 后台 tab dispatchEvent。"""
+
+    def test_capture_debug_screenshot_writes_file_when_enabled(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.send.return_value = {"result": {"data": "aGVsbG8="}}
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"BOSS_DEBUG_DIR": td}), \
+                mock.patch.object(module, "DEBUG_SHOT_ENABLED", True):
+            path = module.capture_debug_screenshot(ws, "s", "invalid_detail")
+            self.assertIsNotNone(path)
+            self.assertTrue(path.endswith(".png"))
+            self.assertTrue(os.path.exists(path))
+
+    def test_capture_debug_screenshot_disabled_returns_none(self):
+        module = load_module()
+        ws = mock.Mock()
+        with mock.patch.object(module, "DEBUG_SHOT_ENABLED", False):
+            self.assertIsNone(module.capture_debug_screenshot(ws, "s", "x"))
+        ws.send.assert_not_called()
+
+    def test_capture_debug_screenshot_best_effort_on_error(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.send.side_effect = RuntimeError("boom")
+        with mock.patch.object(module, "DEBUG_SHOT_ENABLED", True):
+            self.assertIsNone(module.capture_debug_screenshot(ws, "s", "x"))
+
+    def test_detect_cdp_port_prefers_then_falls_back(self):
+        module = load_module()
+        cands = (9222, 9229, 19222)
+        self.assertEqual(module.detect_cdp_port(45222, cands, probe=lambda p: p == 19222), 19222)
+        self.assertEqual(module.detect_cdp_port(45222, cands, probe=lambda p: p == 45222), 45222)
+        self.assertIsNone(module.detect_cdp_port(45222, cands, probe=lambda p: False))
+
+    def test_scroll_bottom_js_dispatches_scroll_event(self):
+        module = load_module()
+        self.assertIn("scrollTo", module.SCROLL_BOTTOM_JS)
+        self.assertIn("dispatchEvent", module.SCROLL_BOTTOM_JS)
+        self.assertIn("new Event('scroll')", module.SCROLL_BOTTOM_JS)
+
+
 class MultiKeywordTests(unittest.TestCase):
     """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
 

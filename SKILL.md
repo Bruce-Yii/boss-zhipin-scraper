@@ -1,7 +1,7 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.14.0
+version: 2.14.1
 author: eatmoreduck
 license: MIT
 platforms: [macos, linux, windows]
@@ -187,6 +187,7 @@ python3 "$SUMMARY_PATH" \
 | `--archive [KEEP]` | 1 | 归档历史结果：每类保留最新 KEEP 个，其余移入 archive/ |
 | `--batch CONFIG.json` | - | 批量抓取（默认列表+详情；任务级 `detail:false` 或 `--no-detail` 可仅列表） |
 | `--version` | - | 查看版本号 |
+| `--debug-screenshots` | 关闭 | 失败时把页面截图存到 `~/.boss-zhipin-scraper/debug/`（排障用） |
 
 ### 筛选参数
 
