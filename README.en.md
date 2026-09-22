@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.11 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.12 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.11.1-orange.svg)
+![Version](https://img.shields.io/badge/version-2.12.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -173,6 +173,8 @@ python3 scripts/job_summary.py --top 15
 | `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors). **The API channel reuses a shared tab pool** and paces about 15s per worker (`DETAIL_API_PACE_SECONDS`), i.e. about N/15 requests per second at concurrency N |
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--filter-inactive` | Drop long-inactive (zombie) jobs by HR activity (matches only "active N weeks/months/years ago"; does not drop this-week/this-month activity); off by default |
+| `--foreground-capture` | Use a foreground Target for list / login probe / detail DOM; for environments where Chrome on Linux/Xvfb cannot capture search responses with a background Target (stays background by default) |
+| `--list-mode xhr / passive` | List channel: `xhr` = inject XHR to the wapi (default, fast, pairs with `--pages-parallel`); `passive` = passively capture the page's own joblist responses via the Network domain (zero injected requests, removes the injected-XHR trigger for code 37, upstream #55; mutually exclusive with `--pages-parallel`, falls back to serial) |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
 | `--db [PATH]` | Enable the SQLite incremental store (WAL) + cross-run detail resume; without a value it uses the default DB `~/.boss-zhipin-scraper/boss.db` (outside the repo, never committed); JSON/CSV exports are unchanged |

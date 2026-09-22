@@ -70,6 +70,13 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("--foreground-capture", r.stdout)
 
+    def test_help_documents_list_mode_flag(self):
+        """--list-mode 出现在 --help（上游 #55 被动捕获，默认 xhr）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--list-mode", r.stdout)
+        self.assertIn("passive", r.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

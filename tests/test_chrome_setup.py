@@ -4857,6 +4857,161 @@ def _normalize_version(raw):
     return f"{major}.{minor}"
 
 
+class PassiveCaptureTests(unittest.TestCase):
+    """上游 #55 移植：Network 域被动捕获（--list-mode passive）+ Python 字段映射。"""
+
+    def test_map_api_job_field_parity(self):
+        """map_api_job 与 FETCH_API_JS_TEMPLATE 字段一一对应（同形状 job）。"""
+        module = load_module()
+        raw = {
+            "jobName": "AI产品经理", "salaryDesc": "25-35K",
+            "cityName": "杭州", "areaDistrict": "西湖区", "businessDistrict": "文三路",
+            "jobExperience": "3-5年", "jobDegree": "本科",
+            "brandName": "某公司", "bossTitle": "HR", "activeTimeDesc": "刚刚活跃",
+            "anonymous": 1, "jobValidStatus": 1, "iconFlagList": ["急", "新"], "iconWord": "急",
+            "proxyJob": 0, "proxyType": 0, "jobType": 0,
+            "brandScaleName": "100-499人", "brandStageName": "B轮", "brandIndustry": "互联网",
+            "jobLabels": ["A", "B"], "skills": ["Python", "LLM"],
+            "securityId": "SEC", "lid": "L1",
+            "encryptJobId": "EID", "encryptBossId": "EB", "encryptBrandId": "EBR",
+            "welfareList": ["五险一金"],
+        }
+        job = module.map_api_job(raw)
+        self.assertEqual(job["title"], "AI产品经理")
+        self.assertEqual(job["salary_source"], "api")
+        self.assertEqual(job["location"], "杭州·西湖区·文三路")
+        self.assertEqual(job["tags"], "3-5年 | 本科")
+        self.assertEqual(job["company_name"], "某公司")
+        self.assertEqual(job["boss_name"], "某公司")
+        self.assertEqual(job["boss_active_status"], "刚刚活跃")
+        self.assertEqual(job["icon_flags"], "急|新")
+        self.assertEqual(job["skills"], ["Python", "LLM"])
+        self.assertEqual(job["security_id"], "SEC")
+        self.assertEqual(job["job_link"], "https://www.zhipin.com/job_detail/EID.html")
+        self.assertEqual(job["company_link"], "https://www.zhipin.com/gongsi/EBR.html")
+        self.assertEqual(job["welfare"], "五险一金")
+        self.assertEqual(job["anonymous"], 1)
+
+    def test_map_api_job_empty_salary_and_degree_filter(self):
+        module = load_module()
+        job = module.map_api_job({"jobName": "A", "jobDegree": "不限"})
+        self.assertEqual(job["salary_source"], "api_empty")
+        self.assertEqual(job["tags"], "")
+
+    def test_map_api_jobs_extracts_and_skips_bad(self):
+        module = load_module()
+        self.assertEqual(module.map_api_jobs(None), [])
+        self.assertEqual(module.map_api_jobs({"zpData": {}}), [])
+        self.assertEqual(module.map_api_jobs({"zpData": {"jobList": "x"}}), [])
+        got = module.map_api_jobs({"zpData": {"jobList": [{"jobName": "A"}, "bad", None]}})
+        self.assertEqual([j["title"] for j in got], ["A"])
+
+    def test_network_capture_matches_joblist_and_skips_consumed(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.events = [
+            {"method": "Network.requestWillBeSent", "params": {
+                "requestId": "1",
+                "request": {"url": "https://x/wapi/zpgeek/search/joblist.json?a=1"}}},
+            {"method": "Network.requestWillBeSent", "params": {
+                "requestId": "2", "request": {"url": "https://x/other"}}},
+            {"method": "Network.loadingFinished", "params": {"requestId": "1"}},
+        ]
+        cap = module.NetworkJoblistCapture(cdp, "sid")
+        self.assertTrue(cap._is_joblist_url("https://x/wapi/zpgeek/search/joblist.json"))
+        self.assertFalse(cap._is_joblist_url("https://x/other"))
+        self.assertEqual(cap._next_completed(), "1")
+        cap._consumed.add("1")
+        self.assertIsNone(cap._next_completed())
+
+    def test_wait_next_response_parses_body_and_triggers(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.events = [
+            {"method": "Network.requestWillBeSent", "params": {
+                "requestId": "1",
+                "request": {"url": "/wapi/zpgeek/search/joblist.json"}}},
+            {"method": "Network.loadingFinished", "params": {"requestId": "1"}},
+        ]
+        cdp.send.return_value = {
+            "result": {"body": json.dumps({"zpData": {"jobList": []}}), "base64Encoded": False}}
+        cap = module.NetworkJoblistCapture(cdp, "sid")
+        trigger = mock.Mock()
+        data = cap.wait_next_response(timeout=1, trigger=trigger)
+        self.assertEqual(data, {"zpData": {"jobList": []}})
+        trigger.assert_called_once()
+        cdp.drain_events.assert_not_called()
+
+    def test_wait_next_response_timeout_returns_none(self):
+        module = load_module()
+        cdp = mock.Mock()
+        cdp.events = []
+        cap = module.NetworkJoblistCapture(cdp, "sid")
+        self.assertIsNone(cap.wait_next_response(timeout=0.01))
+        cdp.drain_events.assert_called()
+
+    def test_drain_events_buffers_method_messages(self):
+        module = load_module()
+        sess = object.__new__(module.CDPSession)
+        sess.events = []
+        sess._dead = False
+        sess.ws = mock.Mock()
+        calls = {"n": 0}
+
+        def recv():
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return json.dumps({"method": "Network.loadingFinished", "params": {}})
+            raise TimeoutError("recv timeout")
+
+        sess.ws.recv.side_effect = recv
+        sess.drain_events(0.05)
+        self.assertTrue(any(e.get("method") == "Network.loadingFinished"
+                            for e in sess.events))
+        sess.ws.settimeout.assert_called()
+
+    def test_ws_timeout_exception_fallback(self):
+        module = load_module()
+        # 测试环境 websocket 为 Mock → 回退 TimeoutError
+        self.assertIs(module._ws_timeout_exception(), TimeoutError)
+
+    def test_fetch_pages_passive_returns_mapped_pages(self):
+        module = load_module()
+        first = {"zpData": {"jobList": [{"jobName": "A", "encryptJobId": "e1",
+                                         "cityName": "杭州", "salaryDesc": "20-30K"}]}}
+        second = {"zpData": {"jobList": [{"jobName": "B", "encryptJobId": "e2"}]}}
+        capture = mock.Mock()
+        capture.wait_next_response.side_effect = [first, second]
+        ws = mock.Mock()
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid", "sid")), \
+                mock.patch.object(module, "NetworkJoblistCapture",
+                                  return_value=capture), \
+                mock.patch.object(module, "classify_login_probe_response",
+                                  return_value=module.LoginProbeResult(
+                                      module.LoginProbeStatus.AVAILABLE)), \
+                mock.patch.object(module.time, "sleep"):
+            pages = module._fetch_pages_passive(9333, "AI", "101020100", 2, {})
+        self.assertEqual(len(pages), 2)
+        self.assertEqual(pages[0][0]["title"], "A")
+        self.assertEqual(pages[1][0]["title"], "B")
+        capture.enable.assert_called_once()
+
+    def test_fetch_pages_passive_returns_none_when_no_capture(self):
+        module = load_module()
+        capture = mock.Mock()
+        capture.wait_next_response.return_value = None
+        ws = mock.Mock()
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid", "sid")), \
+                mock.patch.object(module, "NetworkJoblistCapture",
+                                  return_value=capture), \
+                mock.patch.object(module.time, "sleep"):
+            self.assertIsNone(module._fetch_pages_passive(9333, "AI", "101020100", 1, {}))
+
+
 class AuditTests(unittest.TestCase):
     """P4e 风险事件审计：JSONL 追加 / 凭据脱敏 / best-effort / 接入告警与冷却。"""
 
