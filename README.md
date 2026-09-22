@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.8（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.9（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.8.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.9.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -205,6 +205,8 @@ python3 scripts/job_summary.py --top 15
 ### 告警推送
 
 异常时通过 Worker 端点推送告警（飞书卡片等下游通道由端点侧配置）：风控/验证码全停（`EXPORT_FAIL reason=risk_blocked`）、**登录失效**（`EXPORT_FAIL reason=login_failed`）、详情验证码全停（`warnings: detail_risk_blocked`）。
+
+关键风险事件（风控/验证码全停、登录失效、熔断冷却）同时写入本地审计日志 `~/.boss-zhipin-scraper/risk_events.jsonl`（JSONL、仓库外、不含凭据；`BOSS_AUDIT_PATH` 可改路径），便于事后复盘与对外可解释。
 
 - 配置：项目根目录 `.env`（gitignore 排除，不入仓库）——`ALERT_WEBHOOK_URL=<端点地址>`、`ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - 未配置或网络失败时静默跳过，不影响抓取主流程（失败仅记日志）

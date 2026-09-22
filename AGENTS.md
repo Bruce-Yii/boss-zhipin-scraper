@@ -67,3 +67,8 @@ SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 默认分支 `master`，fork/分支工作流：从 `master` 拉新分支（`fix/...`、`feat/...`）→ 改代码补测试 → push → PR。一个 PR 只做一件事。
 
 **先开 issue 再动手**：非平凡的改动（bug 修复、新功能、文档补充）按仓库 `CONTRIBUTING.md` 的规范，先在 Issues 开一条说明「改什么 / 为什么 / 怎么改」，讨论清楚后再起新分支提交。issue 正文要结构化（问题 / 现状 / 根因 / 建议 / 影响），并标注改动范围（哪些逻辑受影响、哪些不动）。
+
+## 合规与审计（P4e）
+
+- **红线**：不绕过平台安全机制、不调高默认频率/并发、不采集个人身份信息、不落 cookie/token（详见 `CONTRIBUTING.md`「关于合规 / 拒收的 PR（明文红线）」）。
+- **审计**：`send_alert()` 与 `mark_cdp_cooldown()` 会把风险事件写入 `~/.boss-zhipin-scraper/risk_events.jsonl`（append-only JSONL，仓库外、不含凭据；`BOSS_AUDIT_PATH` 可覆盖，供测试）。新增"风控/登录/熔断"分支时请同步落审计（`record_audit_event`）。
