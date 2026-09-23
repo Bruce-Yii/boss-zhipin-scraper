@@ -4256,6 +4256,36 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("*hm.baidu.com*", patterns)
         self.assertIn("*apm-fe.zhipin.com*", patterns)
         self.assertIn("*logapi.zhipin.com*", patterns)
+        # #78：XHR 审计补齐的埋点域 + UI 装饰
+        self.assertIn("*shink.zhipin.com*", patterns)
+        self.assertIn("*wapi/zpApm/*", patterns)
+        self.assertIn("*wapi/zpgeek/collection/popup/window*", patterns)
+        # 关键接口绝不在拦截名单（防误伤登录态/详情数据）
+        for must_keep in ("zppassport", "getStatus", "city.json"):
+            self.assertFalse(any(must_keep in p for p in patterns),
+                             f"关键接口不得拦截: {must_keep}")
+
+    def test_batch_cooldown_disabled_by_default(self):
+        """#78：COOL_EVERY=0 → 不冷却。"""
+        module = load_module()
+        with mock.patch.object(module, "COOL_EVERY", 0), \
+                mock.patch.object(module.time, "sleep") as sleep_mock:
+            self.assertFalse(module._batch_cooldown_if_needed(250))
+        sleep_mock.assert_not_called()
+
+    def test_batch_cooldown_triggers_every_n(self):
+        """#78：每 N 条触发一次批次冷却。"""
+        module = load_module()
+        with mock.patch.object(module, "COOL_EVERY", 3), \
+                mock.patch.object(module, "COOL_SECONDS", 10), \
+                mock.patch.object(module, "COOL_RESTART_CHROME", False), \
+                mock.patch.object(module.time, "sleep") as sleep_mock:
+            self.assertFalse(module._batch_cooldown_if_needed(1))
+            self.assertFalse(module._batch_cooldown_if_needed(2))
+            module._batch_cooldown_if_needed(3)
+            module._batch_cooldown_if_needed(6)
+        self.assertEqual(sleep_mock.call_count, 2)
+        sleep_mock.assert_any_call(10)
 
     def test_apply_asset_blocking_best_effort(self):
         """资源拦截（#53）：CDP 失败仅记日志返回 False，不抛异常。"""

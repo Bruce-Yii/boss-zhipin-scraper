@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.18.1"
+__version__ = "2.18.2"
 
 import argparse
 import base64
@@ -120,6 +120,13 @@ CDP_CANDIDATE_PORTS = (9222, 9229, 19222)
 DEBUG_SHOT_ENABLED = False
 DEFAULT_DEBUG_DIR = os.path.expanduser("~/.boss-zhipin-scraper/debug")
 DEBUG_DIR_ENV = "BOSS_DEBUG_DIR"
+# 批次冷却（#78）：每完成 N 条详情主动冷却 M 秒（默认关闭）。大批量场景
+# （墙在累计 ~700 条）主动冷却比被风控停更安全——被停会写环境标记。
+# 可选冷却时重启 Chrome（清内存防性能衰减：实测连跑千条后 2s/条退化到 8s/条，
+# 重启即恢复）。
+COOL_EVERY = 0
+COOL_SECONDS = 240
+COOL_RESTART_CHROME = False
 # DOM 资源拦截（DOM 链路优化 C-lite / #53）：默认关闭（--dom-block-assets 开）。
 # 只拦 media+font、**保 image**——"从不拉图的浏览器"请求瀑布无真人形态（行为
 # 指纹，Playwright 社区共识）；字体拦截不影响 innerText（取码点非字形）。
@@ -128,8 +135,21 @@ DOM_BLOCK_URL_PATTERNS = [
     "*.mp4", "*.webm", "*.mp3", "*.ogg", "*.wav",
     "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
     # 追踪/监控上报（#67：详情页资源审计实测——每页约 11 个纯追踪请求，
-    # 拦掉零内容风险；未知第一方端点 t/shink 不动）
+    # 拦掉零内容风险）
     "*hm.baidu.com*", "*apm-fe.zhipin.com*", "*logapi.zhipin.com*",
+    # #78 详情页 XHR 审计（25 个 XHR）：补齐埋点域 + UI 装饰请求。
+    # 埋点：shink（dapCommon beacon）、zpApm actionLog
+    "*shink.zhipin.com*", "*wapi/zpApm/*",
+    # UI 装饰（弹窗/横幅/引导/竞品推荐）——拦掉页面更干净，也不影响 JD
+    "*wapi/zpgeek/collection/popup/window*",
+    "*wapi/zpgeek/jobdetail/popupguides/*",
+    "*wapi/zpgeek/webtopbanner/*",
+    "*wapi/zpgeek/agreement/update/tip.json*",
+    "*wapi/zpuser/wap/getSecurityGuideV1*",
+    "*wapi/zpgeek/resume/parser/querybar.json*",
+    "*wapi/zpchat/notify/setting/get*",
+    "*wapi/zpitem/geek/vip/info*",
+    "*wapi/zpitem/web/competitive/*",
 ]
 
 # API 基础路径（便于统一修改）
@@ -2589,6 +2609,41 @@ def _cdp_cooldown_path():
     return os.path.join(os.path.dirname(SCRAPE_LOCK_PATH), "cdp.cooldown")
 
 
+def _restart_scraper_chrome(cdp_port=DEFAULT_CDP_PORT):
+    """冷却期重启专用 Chrome（清内存防性能衰减，#78）。best-effort。"""
+    try:
+        for d in (chrome_user_data_dirs_for_cdp_port(cdp_port) or []):
+            stop_cdp_chrome(d)
+    except Exception:
+        log.warning("冷却期停止 Chrome 失败", exc_info=True)
+    time.sleep(3)
+    try:
+        return run_setup_chrome(cdp_port=cdp_port, wait_login=False) == 0
+    except Exception:
+        log.warning("冷却期重启 Chrome 失败", exc_info=True)
+        return False
+
+
+def _batch_cooldown_if_needed(done_count):
+    """每 ``COOL_EVERY`` 条主动批次冷却（可选重启 Chrome，#78）。
+
+    返回: bool —— True 表示刚冷却过（调用方可能需要重建失效会话）。
+    """
+    if not COOL_EVERY or COOL_EVERY <= 0 or done_count <= 0:
+        return False
+    if done_count % COOL_EVERY != 0:
+        return False
+    print(f"\n🧊 批次冷却：已完成 {done_count} 条，暂停 {COOL_SECONDS}s"
+          + ("（含 Chrome 重启）" if COOL_RESTART_CHROME else "") + "...")
+    restarted = False
+    if COOL_RESTART_CHROME:
+        restarted = _restart_scraper_chrome()
+        print(f"🧊 Chrome 重启：{'成功' if restarted else '失败（继续用旧会话）'}")
+    time.sleep(COOL_SECONDS)
+    print("🧊 冷却结束，继续\n")
+    return restarted
+
+
 def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
     """熔断时记录冷却截止时间戳（原子写）。
 
@@ -4768,15 +4823,18 @@ def scrape_details(list_data, max_details=None, output_path=None,
         else:
             job_id_mode = "security"
 
-        # auto 兜底懒开共享 tab：首个需要 encrypt 的岗位时停靠（此前开 tab 失败
-        # 则不再重试，encrypt 请求回退逐岗自建会话）
-        if (job_id_mode == "encrypt" and api_session is None
-                and not api_tab_failed):
+        # 共享 API tab 懒开/重建（#58 encrypt 兜底；#78 扩展：security 模式
+        # 坏档/Chrome 重启后同样重建）。开 tab 失败则不重试，回退逐岗自建。
+        if (api_session is None and not api_tab_failed
+                and (job_id_mode == "encrypt" or job_security)):
             try:
                 api_session = _open_api_tab(cdp_port, detail_keyword, detail_city_code)
-                print("  🧷 encryptJobId 通道启用（停靠 API tab）")
+                if job_id_mode == "encrypt":
+                    print("  🧷 encryptJobId 通道启用（停靠 API tab）")
+                else:
+                    print("  🧷 已重建共享 API tab")
             except _cdp_exception_types():
-                log.warning("encryptJobId 通道停靠失败，回退逐岗自建会话",
+                log.warning("API tab 停靠/重建失败，回退逐岗自建会话",
                             exc_info=True)
                 api_tab_failed = True
                 api_session = None
@@ -4865,6 +4923,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
             if dom_session is not None:
                 _close_api_tab(dom_session)
                 dom_session = None
+            # 共享 API tab 同样可能坏（#78：Chrome 重启/崩溃后）→ 关闭置空；
+            # 下一岗由重开逻辑重建（security/encrypt 模式）
+            if api_session is not None:
+                _close_api_tab(api_session)
+                api_session = None
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 print("❌ 连续 CDP 会话失败，判定浏览器会话异常，停止详情抓取。")
                 mark_cdp_cooldown()  # 熔断冷却：冷却内拒绝自动重开
@@ -4911,6 +4974,14 @@ def scrape_details(list_data, max_details=None, output_path=None,
         progress = progress_line(idx + 1, len(jobs), serial_ok)
         if progress:
             print(progress)
+
+        # 批次冷却（#78）：每 COOL_EVERY 条主动冷却（+可选 Chrome 重启）；
+        # 重启后共享会话失效 → 置空待下岗位重建
+        if _batch_cooldown_if_needed(serial_done):
+            api_session = None
+            dom_session = None
+            dom_tab_failed = False
+            api_tab_failed = False
 
     # 关闭详情 API 共享会话（复用 tab 释放；API 通道专用，DOM 路径无此对象）
     _close_api_tab(api_session)
@@ -5076,6 +5147,12 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             # 面板零新增请求（同页内点击），仅轻度节奏间隔
             if idx + 1 < len(jobs):
                 time.sleep(random.uniform(*DETAIL_DOM_GAP_SECONDS))
+            # 批次冷却（#78）：面板模式仅冷却（不重启，保持停靠页）
+            if COOL_EVERY and done % COOL_EVERY == 0:
+                print(f"\n🧊 批次冷却：已完成 {done} 条，"
+                      f"暂停 {COOL_SECONDS}s...")
+                time.sleep(COOL_SECONDS)
+                print("🧊 冷却结束，继续\n")
         if done:
             print(run_summary(time.time() - start_time, done, ok, reasons))
             if panel_hit or dom_fallback:
@@ -5343,6 +5420,12 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     print(progress)
                 if output_path and completed % write_every == 0:
                     persist()
+                # 批次冷却（#78）：并行模式仅冷却（不重启，避免池重建）
+                if COOL_EVERY and completed % COOL_EVERY == 0:
+                    print(f"\n🧊 批次冷却：已完成 {completed} 条，"
+                          f"暂停 {COOL_SECONDS}s...")
+                    time.sleep(COOL_SECONDS)
+                    print("🧊 冷却结束，继续\n")
             fill_window()
         if completed:
             print(run_summary(time.time() - start_time,
@@ -6298,6 +6381,15 @@ def build_parser():
     g_detail.add_argument("--dom-gap", default=None, metavar="MIN,MAX",
                           help="DOM 族详情岗位间隔秒数（串行 DOM 与右面板共用；"
                                "默认 4,9。实验参数（#31）：默认值变更需实测边界拍板）")
+    g_detail.add_argument("--cool-every", type=int, default=0, metavar="N",
+                          help="每完成 N 条详情主动批次冷却（默认 0=关闭；"
+                               "大批量建议 250——主动冷却比被风控停更安全，"
+                               "被停会写环境标记）")
+    g_detail.add_argument("--cool-seconds", type=int, default=240, metavar="M",
+                          help="批次冷却时长秒数（默认 240）")
+    g_detail.add_argument("--cool-restart-chrome", action="store_true",
+                          help="批次冷却时顺带重启专用 Chrome（清内存防性能衰减；"
+                               "实测连跑千条后速度退化，重启即恢复）")
     g_detail.add_argument("--analysis", action="store_true", help="输出分析报告")
     g_detail.add_argument("--input", default=None,
                           help="从已有 JSON 文件读取（跳过抓取）")
@@ -6402,6 +6494,15 @@ def run_cli():
     DOM_BLOCK_ASSETS_ENABLED = bool(getattr(args, "dom_block_assets", False))
     if DOM_BLOCK_ASSETS_ENABLED:
         print("🚫 已启用 --dom-block-assets：DOM 详情页将拦截 media/font 资源（保图片）")
+
+    # 批次冷却（#78）：主动冷却（+可选 Chrome 重启）
+    global COOL_EVERY, COOL_SECONDS, COOL_RESTART_CHROME
+    COOL_EVERY = max(0, int(getattr(args, "cool_every", 0) or 0))
+    COOL_SECONDS = max(1, int(getattr(args, "cool_seconds", 240) or 240))
+    COOL_RESTART_CHROME = bool(getattr(args, "cool_restart_chrome", False))
+    if COOL_EVERY:
+        print(f"🧊 批次冷却已启用：每 {COOL_EVERY} 条停 {COOL_SECONDS}s"
+              + ("（含 Chrome 重启）" if COOL_RESTART_CHROME else ""))
 
     # DOM 岗位间隔覆盖（#55）：默认不变（DETAIL_DOM_GAP_SECONDS 4-9s）；
     # --dom-gap 为 #31 节律实验参数（串行 DOM 与右面板共用）
