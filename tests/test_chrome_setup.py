@@ -164,38 +164,78 @@ class ChromeSetupTests(unittest.TestCase):
     def test_classify_risk_page_clean_page_is_not_risk(self):
         module = load_module()
         probe = {"url": "https://www.zhipin.com/job_detail/x.html",
-                 "title": "职位详情", "hasSlider": False, "hasLoginWall": False}
-        self.assertEqual(module.classify_risk_page(probe), (False, ""))
+                 "title": "职位详情", "hasSlider": False, "hasLoginWall": False,
+                 "cardCount": 1, "rateLimited": False}
+        self.assertEqual(module.classify_risk_page(probe), (False, "", ""))
 
     def test_classify_risk_page_detects_verify_url(self):
         module = load_module()
         probe = {"url": "https://www.zhipin.com/security-check/security.html",
-                 "title": "BOSS直聘", "hasSlider": False, "hasLoginWall": False}
-        is_risk, reason = module.classify_risk_page(probe)
+                 "title": "BOSS直聘", "hasSlider": False, "hasLoginWall": False,
+                 "cardCount": 0, "rateLimited": False}
+        is_risk, reason, category = module.classify_risk_page(probe)
         self.assertTrue(is_risk)
         self.assertIn("验证", reason)
+        self.assertEqual(category, "captcha")
 
     def test_classify_risk_page_detects_slider_element(self):
         module = load_module()
         probe = {"url": "https://www.zhipin.com/", "title": "",
-                 "hasSlider": True, "hasLoginWall": False}
-        is_risk, reason = module.classify_risk_page(probe)
+                 "hasSlider": True, "hasLoginWall": False,
+                 "cardCount": 0, "rateLimited": False}
+        is_risk, reason, category = module.classify_risk_page(probe)
         self.assertTrue(is_risk)
         self.assertIn("滑块", reason)
+        self.assertEqual(category, "captcha")
 
     def test_classify_risk_page_detects_login_wall(self):
         module = load_module()
         probe = {"url": "https://www.zhipin.com/", "title": "",
-                 "hasSlider": False, "hasLoginWall": True}
-        is_risk, reason = module.classify_risk_page(probe)
+                 "hasSlider": False, "hasLoginWall": True,
+                 "cardCount": 3, "rateLimited": False}
+        is_risk, reason, category = module.classify_risk_page(probe)
         self.assertTrue(is_risk)
         self.assertIn("登录墙", reason)
+        self.assertEqual(category, "login")
 
     def test_classify_risk_page_tolerates_bad_input(self):
         module = load_module()
-        self.assertEqual(module.classify_risk_page(None), (False, ""))
-        self.assertEqual(module.classify_risk_page({}), (False, ""))
-        self.assertEqual(module.classify_risk_page("not-a-dict"), (False, ""))
+        self.assertEqual(module.classify_risk_page(None), (False, "", ""))
+        self.assertEqual(module.classify_risk_page({}), (False, "", ""))
+        self.assertEqual(module.classify_risk_page("not-a-dict"), (False, "", ""))
+
+    def test_classify_risk_page_empty_page_is_exempt(self):
+        """#69（Ccelia）：cardCount=0 的空页面无内容证据 → 标题/登录墙不判。"""
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/web/geek/jobs", "title": "安全验证",
+                 "hasSlider": False, "hasLoginWall": False,
+                 "cardCount": 0, "rateLimited": False}
+        self.assertEqual(module.classify_risk_page(probe), (False, "", ""))
+        probe2 = {"url": "https://www.zhipin.com/", "title": "",
+                  "hasSlider": False, "hasLoginWall": True,
+                  "cardCount": 0, "rateLimited": False}
+        self.assertEqual(module.classify_risk_page(probe2), (False, "", ""))
+
+    def test_classify_risk_page_strong_signals_ignore_empty_exemption(self):
+        """#69：URL/滑块是强结构证据，空页面也不豁免（fail-closed）。"""
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/verify/x", "title": "",
+                 "hasSlider": False, "hasLoginWall": False,
+                 "cardCount": 0, "rateLimited": False}
+        is_risk, _reason, category = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertEqual(category, "captcha")
+
+    def test_classify_risk_page_rate_limit_category(self):
+        """#69：频率受限正文独立分类（不走 120s 人工等待）。"""
+        module = load_module()
+        probe = {"url": "https://www.zhipin.com/web/geek/jobs", "title": "BOSS直聘",
+                 "hasSlider": False, "hasLoginWall": False,
+                 "cardCount": 5, "rateLimited": True}
+        is_risk, reason, category = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertEqual(category, "rate_limit")
+        self.assertIn("冷却", reason)
 
     def test_probe_risk_page_returns_empty_on_eval_failure(self):
         module = load_module()
@@ -2256,8 +2296,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "create_page_session",
                                   return_value=("tid-1", "sid-1")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
-                mock.patch.object(module, "classify_risk_page",
-                                  return_value=(False, "")), \
+                mock.patch.object(module, "classify_risk_page", return_value=(False, "", "")), \
                 mock.patch.object(module.time, "sleep"), \
                 mock.patch.object(module.random, "uniform", return_value=1.0), \
                 mock.patch.object(module.random, "randint", return_value=3), \
@@ -2306,7 +2345,7 @@ class ChromeSetupTests(unittest.TestCase):
                                   return_value=("tid-1", "sid-1")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
                 mock.patch.object(module, "classify_risk_page",
-                                  return_value=(True, "滑块验证")), \
+                                  return_value=(True, "滑块验证", "captcha")), \
                 mock.patch.object(module, "wait_for_risk_clear",
                                   return_value=False), \
                 mock.patch.object(module.time, "sleep"), \
@@ -2316,6 +2355,29 @@ class ChromeSetupTests(unittest.TestCase):
             result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "risk_timeout")
+
+    def test_scrape_one_detail_rate_limit_skips_manual_wait(self):
+        """#69：频率受限直接冷却停手，不烧 120s 人工等待。"""
+        module = load_module()
+        ws = mock.Mock()
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module, "_wait_for_detail_ready",
+                                  return_value=True), \
+                mock.patch.object(module, "_dismiss_dialogs"), \
+                mock.patch.object(module, "probe_risk_page", return_value={
+                    "url": "https://www.zhipin.com/web/geek/jobs",
+                    "title": "BOSS直聘", "hasSlider": False,
+                    "hasLoginWall": False, "cardCount": 5,
+                    "rateLimited": True}), \
+                mock.patch.object(module, "wait_for_risk_clear",
+                                  side_effect=AssertionError("频率受限不应人工等待")), \
+                mock.patch.object(module.time, "sleep"):
+            result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "risk_timeout")
+        self.assertEqual(result["category"], "rate_limited")
 
     def test_scrape_one_detail_reports_invalid_detail(self):
         module = load_module()
@@ -2327,8 +2389,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "create_page_session",
                                   return_value=("tid-1", "sid-1")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
-                mock.patch.object(module, "classify_risk_page",
-                                  return_value=(False, "")), \
+                mock.patch.object(module, "classify_risk_page", return_value=(False, "", "")), \
                 mock.patch.object(module.time, "sleep"), \
                 mock.patch.object(module.random, "uniform", return_value=1.0), \
                 mock.patch.object(module.random, "randint", return_value=3), \
@@ -2347,8 +2408,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "create_page_session",
                                   return_value=("tid-1", "sid-1")), \
                 mock.patch.object(module, "probe_risk_page", return_value={}), \
-                mock.patch.object(module, "classify_risk_page",
-                                  return_value=(False, "")), \
+                mock.patch.object(module, "classify_risk_page", return_value=(False, "", "")), \
                 mock.patch.object(module.time, "sleep"), \
                 mock.patch.object(module.random, "uniform", return_value=1.0), \
                 mock.patch.object(module.random, "randint", return_value=3), \
