@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.6"
+__version__ = "2.16.7"
 
 import argparse
 import base64
@@ -2828,6 +2828,37 @@ def close_orphan_dock_tabs(cdp_port=DEFAULT_CDP_PORT, keep=2, threshold=8):
         return 0
     closed = 0
     for t in docks[keep:]:
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{cdp_port}/json/close/{t.get('id')}",
+                timeout=5).read()
+            closed += 1
+        except (OSError, ValueError):
+            pass
+    return closed
+
+
+def close_orphan_detail_tabs(cdp_port=DEFAULT_CDP_PORT):
+    """清扫残留的详情页 tab（#63：进程被杀时 finally 未执行，详情 tab 堆积）。
+
+    正常结束的 run 不留详情 tab，故启动时见到的**全部是残留**，直接全关
+    （与停靠页 keep 策略不同）；只关 URL 含 ``/job_detail/`` 的 page target，
+    搜索页/新标签页/验证页（``_security_check``，用户可能正在手滑）不动。
+    CDP 不可达/失败静默返回 0。
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{cdp_port}/json/list", timeout=5) as resp:
+            targets = json.load(resp)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return 0
+    orphans = [t for t in targets
+               if t.get("type") == "page"
+               and "/job_detail/" in (t.get("url") or "")
+               and "_security_check" not in (t.get("url") or "")]
+    closed = 0
+    for t in orphans:
         try:
             urllib.request.urlopen(
                 f"http://127.0.0.1:{cdp_port}/json/close/{t.get('id')}",
@@ -5898,6 +5929,7 @@ def main():
         # 崩溃兜底：清扫本次异常退出遗留的停靠 tab（防越积越多）
         try:
             close_orphan_dock_tabs()
+            close_orphan_detail_tabs()
         except Exception:
             pass
         sys.exit(1)
@@ -6300,6 +6332,10 @@ def run_cli():
         swept = close_orphan_dock_tabs(args.cdp_port)
         if swept:
             print(f"🧹 已清扫 {swept} 个残留停靠 tab")
+        # #63：详情 tab 残留（进程被杀时 finally 未执行）——正常 run 不留详情 tab
+        swept_detail = close_orphan_detail_tabs(args.cdp_port)
+        if swept_detail:
+            print(f"🧹 已清扫 {swept_detail} 个残留详情 tab")
         keywords = split_keywords(args.keyword) or [args.keyword]
         if len(keywords) == 1:
             list_data = scrape_list(

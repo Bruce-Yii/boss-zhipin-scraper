@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.16.7 (2026-09-23)
+
+### 修复（tab 残留堆积 / #63）
+- **启动清扫残留详情 tab**：新增 `close_orphan_detail_tabs()`（同文件 urllib `/json/list` + `/json/close/{id}` 模式）；只关 URL 含 `/job_detail/` 的 page target，正常 run 不留详情 tab 故全关；**搜索页/新标签页/验证页（`_security_check`）不动**；CDP 不可达静默 0。接入启动清扫与崩溃兜底两处（`🧹 已清扫 N 个残留详情 tab`）。
+
 ## v2.16.6 (2026-09-23)
 
 ### 新增（#31 排期准备 · 实验旋钮 / #61）
