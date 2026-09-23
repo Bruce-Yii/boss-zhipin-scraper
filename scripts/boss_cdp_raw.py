@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.18.2"
+__version__ = "2.18.3"
 
 import argparse
 import base64
@@ -125,7 +125,7 @@ DEBUG_DIR_ENV = "BOSS_DEBUG_DIR"
 # 可选冷却时重启 Chrome（清内存防性能衰减：实测连跑千条后 2s/条退化到 8s/条，
 # 重启即恢复）。
 COOL_EVERY = 0
-COOL_SECONDS = 240
+COOL_SECONDS = 60
 COOL_RESTART_CHROME = False
 # DOM 资源拦截（DOM 链路优化 C-lite / #53）：默认关闭（--dom-block-assets 开）。
 # 只拦 media+font、**保 image**——"从不拉图的浏览器"请求瀑布无真人形态（行为
@@ -6385,8 +6385,8 @@ def build_parser():
                           help="每完成 N 条详情主动批次冷却（默认 0=关闭；"
                                "大批量建议 250——主动冷却比被风控停更安全，"
                                "被停会写环境标记）")
-    g_detail.add_argument("--cool-seconds", type=int, default=240, metavar="M",
-                          help="批次冷却时长秒数（默认 240）")
+    g_detail.add_argument("--cool-seconds", type=int, default=60, metavar="M",
+                          help="批次冷却时长秒数（默认 60）")
     g_detail.add_argument("--cool-restart-chrome", action="store_true",
                           help="批次冷却时顺带重启专用 Chrome（清内存防性能衰减；"
                                "实测连跑千条后速度退化，重启即恢复）")
@@ -6498,7 +6498,7 @@ def run_cli():
     # 批次冷却（#78）：主动冷却（+可选 Chrome 重启）
     global COOL_EVERY, COOL_SECONDS, COOL_RESTART_CHROME
     COOL_EVERY = max(0, int(getattr(args, "cool_every", 0) or 0))
-    COOL_SECONDS = max(1, int(getattr(args, "cool_seconds", 240) or 240))
+    COOL_SECONDS = max(1, int(getattr(args, "cool_seconds", 60) or 60))
     COOL_RESTART_CHROME = bool(getattr(args, "cool_restart_chrome", False))
     if COOL_EVERY:
         print(f"🧊 批次冷却已启用：每 {COOL_EVERY} 条停 {COOL_SECONDS}s"
