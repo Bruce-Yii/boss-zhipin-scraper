@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.17.4"
+__version__ = "2.18.0"
 
 import argparse
 import base64
@@ -1290,71 +1290,138 @@ PARALLEL_START_STAGGER_SECONDS = 1.0
 # encrypt 兜底连续未命中停试阈值（#58；真机实测 invalid_params 概率高时
 # 每岗白付 1 XHR + 节律等待，3 次足够判定）
 ENCRYPT_MISS_DISABLE_THRESHOLD = 3
-# 点击搜索页上指定岗位卡片：返回可点击坐标（#65 可信点击用）。
-# BOSS 面板切换疑似只响应可信鼠标事件——JS .click()（非可信）点中也不切面板。
-# 匹配优先级：encryptJobId/链接 → 全标题 → 标题前 12 字（列表卡截断兜底）。
-PANEL_CLICK_POINT_JS = r"""
+# ============================================================
+# 面板通道 Vue hook（#75：面板切换由 Vue 方法驱动，不响应 DOM 事件）
+# 用户真机验证（2026-09-24 03:34）：clickJobCardAction 调用后 0ms 匹配，
+# jobDetail 为 API 结构化数据（postDescription/activeTimeDesc 等），
+# 零新增请求、零 DOM 解析、无 innerText 反爬。
+# ============================================================
+
+# Vue hook：找组件 → 按 encryptJobId 找岗位 → 调 clickJobCardAction
+PANEL_VUE_CLICK_JS = r"""
 (function(){
-    var key = __KEY__, title = __TITLE__;
-    var t12 = title ? title.substring(0, 12) : '';
-    function point(el){
-        try { el.scrollIntoView({block: 'center'}); } catch (e) {}
-        var r = el.getBoundingClientRect();
-        if (!r || r.width <= 0 || r.height <= 0) return null;
-        return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+    var eid = __ENCRYPT_ID__;
+    var wrap = document.querySelector('#wrap');
+    if (!wrap || !wrap.__vue__) {
+        return JSON.stringify({ok: false, why: 'no_vue'});
     }
-    var links = document.querySelectorAll('a.job-name, .job-card-box a, a[href*="/job_detail/"]');
-    for (var i = 0; i < links.length; i++) {
-        var h = links[i].getAttribute('href') || links[i].href || '';
-        if (key && h.indexOf(key) !== -1) { return JSON.stringify({ok: true, p: point(links[i])}); }
+    var vm = wrap.__vue__;
+    var pageJobs = null;
+    for (var i = 0; i < vm.$children.length; i++) {
+        if (vm.$children[i].jobList && vm.$children[i].jobList.length > 0) {
+            pageJobs = vm.$children[i];
+            break;
+        }
     }
-    var cards = document.querySelectorAll('li.job-card-box, .job-card-wrap');
-    for (var j = 0; j < cards.length; j++) {
-        var ct = (cards[j].innerText || '').replace(/\s+/g, ' ');
-        if ((title && ct.indexOf(title) !== -1) || (t12 && ct.indexOf(t12) !== -1)) { return JSON.stringify({ok: true, p: point(cards[j])}); }
+    if (!pageJobs) {
+        return JSON.stringify({ok: false, why: 'no_jobList'});
     }
-    return JSON.stringify({ok: false});
+    var jobitem = null;
+    for (var j = 0; j < pageJobs.jobList.length; j++) {
+        var item = pageJobs.jobList[j];
+        var jobId = item.encryptJobId || (item.jobitem || {}).encryptJobId || '';
+        if (eid && jobId === eid) {
+            jobitem = item.jobitem || item;
+            break;
+        }
+    }
+    if (!jobitem) {
+        return JSON.stringify({ok: false, why: 'job_not_found'});
+    }
+    try {
+        pageJobs.clickJobCardAction(jobitem);
+        return JSON.stringify({ok: true, lid: jobitem.lid || ''});
+    } catch (e) {
+        return JSON.stringify({ok: false, why: 'call_failed: ' + String(e)});
+    }
+})()
+"""
+
+# Vue hook：轮询 jobDetail.lid 匹配 → 读结构化字段
+PANEL_VUE_STATE_JS = r"""
+(function(){
+    var targetLid = __TARGET_LID__;
+    var wrap = document.querySelector('#wrap');
+    if (!wrap || !wrap.__vue__) {
+        return JSON.stringify({ok: false, why: 'no_vue'});
+    }
+    var vm = wrap.__vue__;
+    var pageJobs = null;
+    for (var i = 0; i < vm.$children.length; i++) {
+        if (vm.$children[i].jobList && vm.$children[i].jobList.length > 0) {
+            pageJobs = vm.$children[i];
+            break;
+        }
+    }
+    if (!pageJobs || !pageJobs.jobDetail) {
+        return JSON.stringify({ok: false, why: 'no_detail'});
+    }
+    var d = pageJobs.jobDetail;
+    if (targetLid && d.lid !== targetLid) {
+        return JSON.stringify({ok: false, why: 'lid_mismatch', got: d.lid || ''});
+    }
+    var info = d.jobInfo || {};
+    var boss = d.bossInfo || {};
+    var brand = d.brandComInfo || {};
+    return JSON.stringify({
+        ok: true,
+        lid: d.lid || '',
+        jd: info.postDescription || '',
+        job_status_desc: info.jobStatusDesc || '',
+        salary: info.salaryDesc || '',
+        address: info.address || '',
+        location_name: info.locationName || '',
+        boss_active_status: boss.activeTimeDesc || '',
+        boss_name: boss.name || boss.bossName || '',
+        brand_active_time: brand.activeTime || '',
+        brand_introduce: brand.introduce || '',
+        brand_stage_name: brand.stageName || '',
+        brand_scale_name: brand.scaleName || '',
+        brand_industry_name: brand.industryName || ''
+    });
 })()
 """
 
 
-def _trusted_click_card(ws, sid, job):
-    """CDP 可信点击岗位卡片（#65）：取坐标 → Input.dispatchMouseEvent 三连。
+def _panel_vue_click(ws, sid, job):
+    """Vue hook 点击岗位卡片（#75）：调 BOSS 自己的 clickJobCardAction。
 
-    真浏览器同款（Snseam/ufownl 思路）：可信事件才能触发 BOSS 面板切换。
     Returns:
-        bool: True=已派发点击；False=未找到卡片/坐标非法/CDP 异常。
+        str: 目标岗位的 lid（用于后续轮询匹配）；空串=失败。
     """
-    key = str(job.get("encrypt_job_id") or job.get("job_link") or "")
-    title = str(job.get("title") or "")
-    if not key and not title:
-        return False
-    js = (PANEL_CLICK_POINT_JS.replace("__KEY__", json.dumps(key))
-          .replace("__TITLE__", json.dumps(title)))
+    eid = _detail_encrypt_job_id(job)
+    if not eid:
+        return ""
+    js = PANEL_VUE_CLICK_JS.replace("__ENCRYPT_ID__", json.dumps(eid))
     try:
         val = ws.eval_js(js, sid)
         info = json.loads(val) if isinstance(val, str) else {}
     except _cdp_exception_types():
-        return False
+        return ""
     if not info.get("ok"):
-        return False
-    p = info.get("p") or {}
-    try:
-        x, y = float(p.get("x")), float(p.get("y"))
-    except (TypeError, ValueError):
-        return False
-    try:
-        ws.send("Input.dispatchMouseEvent",
-                {"type": "mouseMoved", "x": x, "y": y}, sid)
-        ws.send("Input.dispatchMouseEvent",
-                {"type": "mousePressed", "x": x, "y": y,
-                 "button": "left", "clickCount": 1}, sid)
-        ws.send("Input.dispatchMouseEvent",
-                {"type": "mouseReleased", "x": x, "y": y,
-                 "button": "left", "clickCount": 1}, sid)
-        return True
-    except _cdp_exception_types():
-        return False
+        return ""
+    return str(info.get("lid") or "")
+
+
+def _panel_vue_wait_and_read(ws, sid, target_lid, timeout=None, poll=0.2):
+    """轮询 Vue state 直到 jobDetail.lid 匹配目标，读结构化字段。
+
+    Returns:
+        dict: 结构化字段（jd/boss_active_status/salary 等）；空 dict=超时/失败。
+    """
+    timeout = timeout if timeout is not None else PANEL_READY_TIMEOUT
+    js = PANEL_VUE_STATE_JS.replace("__TARGET_LID__", json.dumps(target_lid))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            val = ws.eval_js(js, sid)
+            state = json.loads(val) if isinstance(val, str) else {}
+        except _cdp_exception_types():
+            return {}
+        if state.get("ok"):
+            return state
+        time.sleep(poll)
+    return {}
 
 # 右面板"目标岗位"状态探测（#57：面板存在≠内容正确，必须等面板切换到目标岗位）
 # 返回 {ready, title_ok, comp_ok, jd_len, head}——head 为面板文本前 120 字（去空白），
@@ -4868,51 +4935,43 @@ def scrape_details(list_data, max_details=None, output_path=None,
 
 
 def _scrape_one_detail_via_panel(job, ws, sid):
-    """右面板通道：在当前停靠搜索页点该岗位卡片，读右侧面板 JD（不跳页、零新增请求）。
+    """右面板通道（Vue hook，#75）：调 BOSS 自己的 clickJobCardAction 切面板，
+    读 API 结构化数据（jobDetail.jobInfo.postDescription 等）。
+
+    零新增请求（页面自己发 detail 请求）、零 DOM 解析、无 innerText 反爬。
 
     Args:
-        job: 列表 job dict（用 encrypt_job_id/job_link/title 定位卡片）
+        job: 列表 job dict（用 encrypt_job_id 定位 Vue jobList 中的岗位）
         ws, sid: 停靠的真实搜索页会话
     """
     job_id = job.get("job_id", "")
-    key = str(job.get("encrypt_job_id") or job.get("job_link") or "")
-    title = str(job.get("title") or "")
-    company = str(job.get("boss_name") or "")
-    if not key and not title:
-        return {"ok": False, "detail": None, "job_id": job_id,
-                "reason": "invalid_detail", "message": "缺少定位卡片的关键字",
-                "channel": "panel"}
     try:
-        # #57：点击前记录面板文本指纹——面板"存在"不等于"内容已切到目标岗位"
-        # （初始首卡面板本就有内容，旧逻辑立即通过 → 读到旧面板）
-        # #65：JS .click() 非可信，面板不切换——改 CDP 可信点击
-        snapshot_head = _panel_job_head(ws, sid, title)
-        if not _trusted_click_card(ws, sid, job):
-            return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": "搜索页未找到该岗位卡片",
-                    "channel": "panel"}
-        if not _wait_for_panel_job(ws, sid, title=title, company=company,
-                                   snapshot_head=snapshot_head):
+        # Vue hook 点击（#75）：调 BOSS 方法切面板，拿到目标 lid
+        target_lid = _panel_vue_click(ws, sid, job)
+        if not target_lid:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail",
-                    "message": "右面板未切换到目标岗位（内容仍为上一岗位）",
+                    "message": "Vue hook 未找到该岗位（jobList 无匹配 encryptJobId）",
                     "channel": "panel"}
-        _dismiss_dialogs(ws, sid)
-        val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
-        d = json.loads(val) if isinstance(val, str) else {}
-        if not isinstance(d, dict):
-            d = {}
-        try:
-            fields = extract_detail_fields(d)
-        except DetailLoginRequiredError as exc:
+        # 轮询 Vue state 等 lid 匹配，读结构化字段
+        state = _panel_vue_wait_and_read(ws, sid, target_lid)
+        if not state:
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "login_required", "message": str(exc),
+                    "reason": "invalid_detail",
+                    "message": "Vue jobDetail 超时未匹配目标岗位",
                     "channel": "panel"}
-        except DetailExtractionError as exc:
+        jd = str(state.get("jd") or "")
+        if len(jd) < MIN_DETAIL_TEXT_LENGTH:
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": str(exc),
+                    "reason": "invalid_detail",
+                    "message": f"JD 过短: {len(jd)} < {MIN_DETAIL_TEXT_LENGTH}",
                     "channel": "panel"}
-        d.update(fields)
+        d = {
+            "jd": _normalize_detail_whitespace(strip_jd_noise(jd)),
+            "boss_active_status": str(state.get("boss_active_status") or ""),
+            "page_update_date": "",
+            "job_status_desc": str(state.get("job_status_desc") or ""),
+        }
         return {"ok": True, "detail": build_detail_record(job, d),
                 "job_id": job_id, "reason": "", "message": "",
                 "channel": "panel"}

@@ -5822,129 +5822,123 @@ class Code9BackoffTests(unittest.TestCase):
 
 
 class PanelJdTests(unittest.TestCase):
-    """右面板 JD 通道（专题 §1.4 / 上游 #84）：点卡片 → 读面板。"""
+    """右面板通道（Vue hook，#75）：调 clickJobCardAction → 读 API 结构化数据。"""
 
     def _job(self):
         return {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/eid.html",
                 "encrypt_job_id": "eid", "title": "AI产品经理", "boss_name": "C"}
 
-    def test_panel_click_point_js_template(self):
-        """#65：坐标模板（可信点击用）——scrollIntoView＋取中心点＋标题前缀兜底。"""
+    def test_panel_vue_click_js_template(self):
+        """#75：Vue 点击模板——找组件/找岗位/调方法。"""
         module = load_module()
-        self.assertIn("__KEY__", module.PANEL_CLICK_POINT_JS)
-        self.assertIn("__TITLE__", module.PANEL_CLICK_POINT_JS)
-        self.assertIn("getBoundingClientRect", module.PANEL_CLICK_POINT_JS)
-        self.assertIn("scrollIntoView", module.PANEL_CLICK_POINT_JS)
-        self.assertIn("substring(0, 12)", module.PANEL_CLICK_POINT_JS)
-        self.assertNotIn(".click()", module.PANEL_CLICK_POINT_JS)
+        self.assertIn("__ENCRYPT_ID__", module.PANEL_VUE_CLICK_JS)
+        self.assertIn("clickJobCardAction", module.PANEL_VUE_CLICK_JS)
+        self.assertIn("__vue__", module.PANEL_VUE_CLICK_JS)
+        self.assertIn("jobList", module.PANEL_VUE_CLICK_JS)
 
-    def test_trusted_click_card_dispatches_mouse_sequence(self):
-        """#65：坐标有效 → mouseMoved/Pressed/Released 三连派发。"""
+    def test_panel_vue_state_js_template(self):
+        """#75：Vue state 模板——轮询 lid 匹配/读结构化字段。"""
+        module = load_module()
+        self.assertIn("__TARGET_LID__", module.PANEL_VUE_STATE_JS)
+        self.assertIn("postDescription", module.PANEL_VUE_STATE_JS)
+        self.assertIn("activeTimeDesc", module.PANEL_VUE_STATE_JS)
+        self.assertIn("jobDetail", module.PANEL_VUE_STATE_JS)
+
+    def test_panel_vue_click_success(self):
+        """#75：Vue 点击成功 → 返回目标 lid。"""
         module = load_module()
         ws = mock.Mock()
-        ws.eval_js.return_value = json.dumps(
-            {"ok": True, "p": {"x": 100, "y": 200}})
-        self.assertTrue(module._trusted_click_card(ws, "s", self._job()))
-        types = [c[0][1]["type"] for c in ws.send.call_args_list]
-        self.assertEqual(types, ["mouseMoved", "mousePressed", "mouseReleased"])
-        btn = ws.send.call_args_list[1][0][1]
-        self.assertEqual((btn["x"], btn["y"]), (100.0, 200.0))
-        self.assertEqual(btn["button"], "left")
+        ws.eval_js.return_value = json.dumps({"ok": True, "lid": "test-lid"})
+        lid = module._panel_vue_click(ws, "s", self._job())
+        self.assertEqual(lid, "test-lid")
 
-    def test_trusted_click_card_not_found(self):
+    def test_panel_vue_click_not_found(self):
+        """#75：jobList 无匹配 → 空串。"""
         module = load_module()
         ws = mock.Mock()
-        ws.eval_js.return_value = json.dumps({"ok": False})
-        self.assertFalse(module._trusted_click_card(ws, "s", self._job()))
-        ws.send.assert_not_called()
-
-    def test_trusted_click_card_bad_coords(self):
-        module = load_module()
-        ws = mock.Mock()
-        for bad in (json.dumps({"ok": True, "p": None}),
-                    json.dumps({"ok": True, "p": {"x": "na"}})):
+        for bad in (json.dumps({"ok": False, "why": "no_vue"}),
+                    json.dumps({"ok": False, "why": "job_not_found"})):
             ws.eval_js.return_value = bad
-            self.assertFalse(module._trusted_click_card(ws, "s", self._job()))
+            self.assertEqual(module._panel_vue_click(ws, "s", self._job()), "")
 
-    def test_trusted_click_card_cdp_exception(self):
+    def test_panel_vue_click_cdp_exception(self):
         module = load_module()
         ws = mock.Mock()
         ws.eval_js.side_effect = TimeoutError("cdp died")
-        self.assertFalse(module._trusted_click_card(ws, "s", self._job()))
+        self.assertEqual(module._panel_vue_click(ws, "s", self._job()), "")
+
+    def test_panel_vue_wait_and_read_success(self):
+        """#75：lid 匹配 → 返回结构化字段。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps({
+            "ok": True, "lid": "test-lid", "jd": "职位描述\n" + "x" * 200,
+            "boss_active_status": "刚刚活跃", "salary": "9-13K"})
+        state = module._panel_vue_wait_and_read(ws, "s", "test-lid")
+        self.assertTrue(state["ok"])
+        self.assertGreater(len(state["jd"]), 100)
+
+    def test_panel_vue_wait_and_read_timeout(self):
+        """#75：lid 不匹配 → 超时返回空 dict。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"ok": False, "why": "lid_mismatch"})
+        with mock.patch.object(module, "PANEL_READY_TIMEOUT", 0.0):
+            state = module._panel_vue_wait_and_read(ws, "s", "test-lid")
+        self.assertEqual(state, {})
 
     def test_panel_detail_success(self):
+        """#75：Vue hook 全链成功 → ok=True + jd。"""
         module = load_module()
         ws = mock.Mock()
         long_jd = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
-        ws.eval_js.return_value = json.dumps(
-            {"jd": long_jd, "tags": [], "page_text": "", "url": ""})
-        with mock.patch.object(module, "_trusted_click_card",
-                               return_value=True), \
-                mock.patch.object(module, "_wait_for_panel_job",
-                                  return_value=True), \
-                mock.patch.object(module.time, "sleep"):
+        with mock.patch.object(module, "_panel_vue_click",
+                               return_value="test-lid"), \
+                mock.patch.object(module, "_panel_vue_wait_and_read",
+                                  return_value={"ok": True, "jd": long_jd,
+                                                "boss_active_status": "刚刚活跃"}):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertTrue(r["ok"])
         self.assertIn("jd", r["detail"])
+        self.assertEqual(r["channel"], "panel")
 
     def test_panel_detail_click_not_found(self):
-        """#65：可信点击未找到卡片 → invalid_detail。"""
+        """#75：Vue hook 未找到岗位 → invalid_detail。"""
         module = load_module()
         ws = mock.Mock()
-        with mock.patch.object(module, "_trusted_click_card",
-                               return_value=False):
+        with mock.patch.object(module, "_panel_vue_click",
+                               return_value=""):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertFalse(r["ok"])
         self.assertEqual(r["reason"], "invalid_detail")
         self.assertIn("未找到", r["message"])
 
-    def test_panel_detail_not_ready(self):
-        """#57：面板存在但内容未切到目标岗位 → invalid_detail（旧 bug：读旧面板）。"""
+    def test_panel_detail_wait_timeout(self):
+        """#75：Vue state 超时 → invalid_detail。"""
         module = load_module()
         ws = mock.Mock()
-        with mock.patch.object(module, "_trusted_click_card",
-                               return_value=True), \
-                mock.patch.object(module, "_wait_for_panel_job",
-                                  return_value=False):
+        with mock.patch.object(module, "_panel_vue_click",
+                               return_value="test-lid"), \
+                mock.patch.object(module, "_panel_vue_wait_and_read",
+                                  return_value={}):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertFalse(r["ok"])
         self.assertEqual(r["reason"], "invalid_detail")
-        self.assertIn("未切换到目标岗位", r["message"])
+        self.assertIn("超时", r["message"])
 
-    def test_wait_for_panel_job_accepts_identity_match(self):
+    def test_panel_detail_jd_too_short(self):
+        """#75：JD 过短 → invalid_detail（质量守卫）。"""
         module = load_module()
         ws = mock.Mock()
-        ws.eval_js.return_value = json.dumps(
-            {"ready": True, "title_ok": True, "comp_ok": True,
-             "jd_len": 200, "head": "HDR"})
-        self.assertTrue(module._wait_for_panel_job(
-            ws, "s", title="AI产品经理", company="C", snapshot_head="OLD"))
-
-    def test_wait_for_panel_job_head_change_fallback(self):
-        """#57：标题匹配失败时，面板指纹变化（点击生效）也放行。"""
-        module = load_module()
-        ws = mock.Mock()
-        ws.eval_js.return_value = json.dumps(
-            {"ready": True, "title_ok": False, "comp_ok": False,
-             "jd_len": 200, "head": "NEW-JD"})
-        self.assertTrue(module._wait_for_panel_job(
-            ws, "s", snapshot_head="OLD-JD"))
-
-    def test_wait_for_panel_job_times_out_without_change(self):
-        module = load_module()
-        ws = mock.Mock()
-        ws.eval_js.return_value = json.dumps(
-            {"ready": True, "title_ok": False, "comp_ok": False,
-             "jd_len": 200, "head": "SAME"})
-        with mock.patch.object(module, "PANEL_READY_TIMEOUT", 0.0):
-            self.assertFalse(module._wait_for_panel_job(
-                ws, "s", snapshot_head="SAME"))
-
-    def test_wait_for_panel_job_cdp_exception_returns_false(self):
-        module = load_module()
-        ws = mock.Mock()
-        ws.eval_js.side_effect = TimeoutError("cdp died")
-        self.assertFalse(module._wait_for_panel_job(ws, "s"))
+        with mock.patch.object(module, "_panel_vue_click",
+                               return_value="test-lid"), \
+                mock.patch.object(module, "_panel_vue_wait_and_read",
+                                  return_value={"ok": True, "jd": "太短"}):
+            r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "invalid_detail")
+        self.assertIn("过短", r["message"])
 
 
 class MultiKeywordTests(unittest.TestCase):
