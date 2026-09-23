@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.3"
+__version__ = "2.16.4"
 
 import argparse
 import base64
@@ -1259,6 +1259,9 @@ SCROLL_BOTTOM_JS = """
 
 # 右面板 JD 通道（专题 §1.4 / 上游 #84）：面板就绪等待上限（秒）
 PANEL_READY_TIMEOUT = 10.0
+# encrypt 兜底连续未命中停试阈值（#58；真机实测 invalid_params 概率高时
+# 每岗白付 1 XHR + 节律等待，3 次足够判定）
+ENCRYPT_MISS_DISABLE_THRESHOLD = 3
 # 点击搜索页上指定岗位卡片（优先按 encryptJobId/链接匹配，退化按标题文本）
 CLICK_CARD_JS = r"""
 (function(){
@@ -4158,7 +4161,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         if is_risk and not wait_for_risk_clear(ws, sid):
             capture_debug_screenshot(ws, sid, "risk")
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "risk_timeout", "message": risk_reason}
+                    "reason": "risk_timeout", "message": risk_reason,
+                    "channel": "dom"}
 
         # 轻量滚动（提速：1-2 次、0.3-0.9s；就绪等待已保证内容渲染，滚动仅作拟人）
         scroll_count = random.randint(1, 2)
@@ -4167,7 +4171,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         for _ in range(scroll_count):
             if stop_event is not None and stop_event.is_set():
                 return {"ok": False, "detail": None, "job_id": job_id,
-                        "reason": "stopped", "message": "已收到停止信号"}
+                        "reason": "stopped", "message": "已收到停止信号",
+                        "channel": "dom"}
             delta = random.randint(200, 500)
             ws.eval_js(f"window.scrollBy(0,{delta})", sid)
             time.sleep(random.uniform(0.3, 0.9))
@@ -4190,17 +4195,20 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         except DetailLoginRequiredError as exc:
             capture_debug_screenshot(ws, sid, "login_required")
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "login_required", "message": str(exc)}
+                    "reason": "login_required", "message": str(exc),
+                    "channel": "dom"}
         except DetailExtractionError as exc:
             capture_debug_screenshot(ws, sid, "invalid_detail")
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": str(exc)}
+                    "reason": "invalid_detail", "message": str(exc),
+                    "channel": "dom"}
 
         return {"ok": True, "detail": build_detail_record(job, d),
-                "job_id": job_id, "reason": "", "message": ""}
+                "job_id": job_id, "reason": "", "message": "",
+                "channel": "dom"}
     except _cdp_exception_types() as exc:
         return {"ok": False, "detail": None, "job_id": job_id,
-                "reason": "cdp_session", "message": str(exc)}
+                "reason": "cdp_session", "message": str(exc), "channel": "dom"}
     finally:
         # 共享 DOM tab（#51）生命周期归调用方，单岗不得关闭
         if not shared_dom and ws is not None:
@@ -4224,6 +4232,8 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
     id_mode="encrypt" 时 URL 仅带 jobId（encryptJobId 兜底通道）。
     """
     job_id = job.get("job_id", "")
+    # 通道标记（#58）：供上层区分 api/encrypt 成功（计入 tab 预算）与 DOM 兜底
+    channel = "encrypt" if id_mode == "encrypt" else "api"
     shared = api_session is not None
     ws = None
     tid = None
@@ -4260,22 +4270,25 @@ def _scrape_one_detail_via_api(job, cdp_port, stop_event=None, limiter=None,
                     if stop_event is not None:
                         if stop_event.wait(delay):
                             return {"ok": False, "detail": None, "job_id": job_id,
-                                    "reason": "stopped", "message": "已收到停止信号"}
+                                    "reason": "stopped", "message": "已收到停止信号",
+                                    "channel": channel}
                     else:
                         time.sleep(delay)
                     continue
                 # 其他风控码 / 退避耗尽：交上层按 category 二分处置（仅 token_expired 才换 tab 重试）
                 return {"ok": False, "detail": None, "job_id": job_id,
                         "reason": "risk_timeout", "message": str(exc),
-                        "category": category}
+                        "category": category, "channel": channel}
             except DetailExtractionError as exc:
                 return {"ok": False, "detail": None, "job_id": job_id,
-                        "reason": "invalid_detail", "message": str(exc)}
+                        "reason": "invalid_detail", "message": str(exc),
+                        "channel": channel}
             return {"ok": True, "detail": build_detail_record(job, fields),
-                    "job_id": job_id, "reason": "", "message": ""}
+                    "job_id": job_id, "reason": "", "message": "",
+                    "channel": channel}
     except _cdp_exception_types() as exc:
         return {"ok": False, "detail": None, "job_id": job_id,
-                "reason": "cdp_session", "message": str(exc)}
+                "reason": "cdp_session", "message": str(exc), "channel": channel}
     finally:
         if not shared and ws is not None:
             try:
@@ -4459,6 +4472,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
             log.warning("共享 DOM tab 建立失败，回退逐岗自建会话", exc_info=True)
             dom_tab_failed = True
 
+    # encrypt 兜底停试（#58）：连续 invalid_params 计数（仅 auto 通道生效）
+    encrypt_misses = 0
+    encrypt_disabled = False
+
     for idx, job in enumerate(jobs):
         if max_seconds and time.time() - start_time >= max_seconds:
             print(f"⏱️ 已达 --max-seconds={max_seconds}s 预算，优雅停止详情"
@@ -4496,10 +4513,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 api_session = None
 
         # 逐岗通道：强制 encrypt 全走 encryptJobId；auto 缺凭证岗位走 encryptJobId
-        # 兜底；其余（有 securityId / 严格 api / dom）走 securityId 语义
+        # 兜底（连续未命中 3 次后本 run 停试，#58）；其余走 securityId 语义
         if detail_channel == "encrypt":
             job_id_mode = "encrypt"
-        elif detail_channel == "auto" and not job_security:
+        elif (detail_channel == "auto" and not job_security
+                and not encrypt_disabled):
             job_id_mode = "encrypt"
         else:
             job_id_mode = "security"
@@ -4552,8 +4570,21 @@ def scrape_details(list_data, max_details=None, output_path=None,
                                             search_keyword=detail_keyword,
                                             id_mode=job_id_mode,
                                             dom_session=dom_session)
-        if result["ok"] and api_session is not None:
+        # tab 预算计数（#58）：仅 API/encrypt 通道的成功计入（DOM 兜底成功
+        # 不占 API tab 配额——否则每 4 岗触发一次无谓轮换）
+        if (result["ok"] and api_session is not None
+                and result.get("channel") in ("api", "encrypt")):
             api_session[3] += 1
+        # encrypt 兜底连续未命中（最终走 DOM）→ auto 通道本 run 停试（#58：
+        # 真机实测 invalid_params 概率 100%，每岗白付 1 XHR + 节律等待）
+        if (job_id_mode == "encrypt" and result.get("channel") == "dom"
+                and detail_channel == "auto"):
+            encrypt_misses += 1
+            if encrypt_misses >= ENCRYPT_MISS_DISABLE_THRESHOLD:
+                if not encrypt_disabled:
+                    print(f"  ℹ️  encryptJobId 通道连续 {encrypt_misses} 次未命中，"
+                          "本 run 内停试（后续缺凭证岗位直接走 DOM）")
+                encrypt_disabled = True
         reason = result["reason"]
 
         if result["ok"]:
@@ -4669,16 +4700,19 @@ def _scrape_one_detail_via_panel(job, ws, sid):
     title = str(job.get("title") or "")
     if not key and not title:
         return {"ok": False, "detail": None, "job_id": job_id,
-                "reason": "invalid_detail", "message": "缺少定位卡片的关键字"}
+                "reason": "invalid_detail", "message": "缺少定位卡片的关键字",
+                "channel": "panel"}
     try:
         js = (CLICK_CARD_JS.replace("__KEY__", json.dumps(key))
               .replace("__TITLE__", json.dumps(title)))
         if not ws.eval_js(js, sid):
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": "搜索页未找到该岗位卡片"}
+                    "reason": "invalid_detail", "message": "搜索页未找到该岗位卡片",
+                    "channel": "panel"}
         if not _wait_for_detail_ready(ws, sid, timeout=PANEL_READY_TIMEOUT):
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": "右面板未就绪"}
+                    "reason": "invalid_detail", "message": "右面板未就绪",
+                    "channel": "panel"}
         _dismiss_dialogs(ws, sid)
         val = ws.eval_js(EXTRACT_DETAIL_JS, sid)
         d = json.loads(val) if isinstance(val, str) else {}
@@ -4688,16 +4722,19 @@ def _scrape_one_detail_via_panel(job, ws, sid):
             fields = extract_detail_fields(d)
         except DetailLoginRequiredError as exc:
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "login_required", "message": str(exc)}
+                    "reason": "login_required", "message": str(exc),
+                    "channel": "panel"}
         except DetailExtractionError as exc:
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": str(exc)}
+                    "reason": "invalid_detail", "message": str(exc),
+                    "channel": "panel"}
         d.update(fields)
         return {"ok": True, "detail": build_detail_record(job, d),
-                "job_id": job_id, "reason": "", "message": ""}
+                "job_id": job_id, "reason": "", "message": "",
+                "channel": "panel"}
     except _cdp_exception_types() as exc:
         return {"ok": False, "detail": None, "job_id": job_id,
-                "reason": "cdp_session", "message": str(exc)}
+                "reason": "cdp_session", "message": str(exc), "channel": "panel"}
 
 
 def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
@@ -4936,7 +4973,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                             job, cdp_port, stop_event, limiter,
                             security_id=job_security, api_session=session,
                             city_code=city_code, search_keyword=keyword)
-                if result["ok"] and session is not None:
+                # tab 预算计数（#58 同款）：仅 API/encrypt 成功计入
+                if (result["ok"] and session is not None
+                        and result.get("channel") in ("api", "encrypt")):
                     session[3] += 1
                 return job, result
             finally:

@@ -2466,7 +2466,8 @@ class ChromeSetupTests(unittest.TestCase):
                      security_id=None, api_session=None, city_code="",
                      search_keyword=""):
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
-                    "job_id": job["job_id"], "reason": "", "message": ""}
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "api"}
 
         with mock.patch.object(module, "CDPSession", side_effect=fake_cdp), \
                 mock.patch.object(module, "create_page_session",
@@ -3941,6 +3942,86 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         sent = [c[0][0] for c in ws.send.call_args_list]
         self.assertNotIn("Network.setBlockedURLs", sent)
+        self.assertEqual(result.get("channel"), "dom")
+
+    def test_dom_fallback_success_does_not_consume_api_tab_budget(self):
+        """#58：DOM 兜底成功不占 API tab 预算（不触发无谓轮换）。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job_detail/x{i}.html",
+                 "boss_name": "C"} for i in range(6)]
+        modes = []
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            modes.append(id_mode)
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "dom"}
+
+        tab = [mock.Mock(), "t", "s", 0]
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_api_tab",
+                                      return_value=tab), \
+                    mock.patch.object(module, "_rotate_api_tab") as rotate_mock, \
+                    mock.patch.object(module, "_close_api_tab"), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module.scrape_details(
+                    {"jobs": jobs, "security_map": {}, "keyword": "AI",
+                     "city_code": "101"},
+                    output_path=out, cdp_port=9222, concurrency=1)
+        rotate_mock.assert_not_called()
+        # encrypt 连续未命中 3 次 → auto 停试：前 3 岗 encrypt，后 3 岗 security
+        self.assertEqual(modes[:3], ["encrypt", "encrypt", "encrypt"])
+        self.assertEqual(modes[3:], ["security", "security", "security"])
+
+    def test_api_channel_success_consumes_tab_budget_and_rotates(self):
+        """#58：api 通道成功计入预算，第 5 岗前轮换（预算 4）。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job_detail/x{i}.html",
+                 "boss_name": "C"} for i in range(5)]
+        smap = {j["job_id"]: "sec" for j in jobs}
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "api"}
+
+        tab = [mock.Mock(), "t", "s", 0]
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_api_tab",
+                                      return_value=tab), \
+                    mock.patch.object(module, "_rotate_api_tab",
+                                      return_value=True) as rotate_mock, \
+                    mock.patch.object(module, "_close_api_tab"), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module.scrape_details(
+                    {"jobs": jobs, "security_map": smap, "keyword": "AI",
+                     "city_code": "101"},
+                    output_path=out, cdp_port=9222, concurrency=1)
+        rotate_mock.assert_called_once()
 
     def test_parse_dom_gap_valid(self):
         """--dom-gap 解析（#55）：合法值 → (min, max) 浮点对。"""
@@ -5354,6 +5435,26 @@ class Code9BackoffTests(unittest.TestCase):
         self.assertEqual(r["reason"], "risk_timeout")
         self.assertEqual(r["category"], "rate_limited")
         self.assertEqual(ws.eval_js.call_count, module.RATE_LIMIT_MAX_RETRIES + 1)
+
+    def test_api_detail_result_carries_channel_field(self):
+        """#58：via_api 返回值带 channel（api/encrypt），供 tab 预算计数区分。"""
+        module = load_module()
+        long_jd = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"code": 0, "jd": long_jd, "boss_active_status": "刚刚活跃"})
+        r = module._scrape_one_detail_via_api(
+            self._job(), 9333, security_id="s", api_session=(ws, "t", "s"))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["channel"], "api")
+        ws2 = mock.Mock()
+        ws2.eval_js.return_value = json.dumps(
+            {"code": 0, "jd": long_jd, "boss_active_status": "刚刚活跃"})
+        r2 = module._scrape_one_detail_via_api(
+            self._job(), 9333, security_id="", api_session=(ws2, "t", "s"),
+            id_mode="encrypt")
+        self.assertTrue(r2["ok"])
+        self.assertEqual(r2["channel"], "encrypt")
 
 
 class PanelJdTests(unittest.TestCase):
