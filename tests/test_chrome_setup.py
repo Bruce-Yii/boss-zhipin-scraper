@@ -1473,6 +1473,64 @@ class ChromeSetupTests(unittest.TestCase):
                                  "guard 用完应删除")
                 self.assertTrue(os.path.exists(lock), "锁文件保留")
 
+    # ----- 详情 tab 残留清扫（#63）-----
+
+    def _sweep_targets(self):
+        return [
+            {"id": "d1", "type": "page",
+             "url": "https://www.zhipin.com/job_detail/abc.html"},
+            {"id": "d2", "type": "page",
+             "url": "https://www.zhipin.com/job_detail/xyz.html?lid=1"},
+            {"id": "s1", "type": "page",
+             "url": "https://www.zhipin.com/web/geek/jobs?query=AI"},
+            {"id": "n1", "type": "page", "url": "chrome://newtab/"},
+            {"id": "v1", "type": "page",
+             "url": "https://www.zhipin.com/job_detail/abc.html?_security_check=1"},
+            {"id": "w1", "type": "browser_ui", "url": ""},
+        ]
+
+    def test_close_orphan_detail_tabs_closes_only_detail_pages(self):
+        """#63：只关普通 job_detail 页；搜索页/新标签/验证页不动。"""
+        module = load_module()
+        import urllib.request
+        closed = []
+        body = json.dumps(self._sweep_targets()).encode("utf-8")
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return body
+
+        def fake_urlopen(url, timeout=None):
+            if url.endswith("/json/list"):
+                return FakeResp()
+            closed.append(url)
+            return FakeResp()
+
+        with mock.patch.object(urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            n = module.close_orphan_detail_tabs(45222)
+        self.assertEqual(n, 2)
+        self.assertTrue(any("/json/close/d1" in u for u in closed))
+        self.assertTrue(any("/json/close/d2" in u for u in closed))
+        self.assertFalse(any("v1" in u for u in closed),
+                         "验证页（_security_check）不动")
+        self.assertFalse(any("s1" in u or "n1" in u or "w1" in u
+                             for u in closed))
+
+    def test_close_orphan_detail_tabs_cdp_unreachable_returns_zero(self):
+        """#63：CDP 不可达静默返回 0。"""
+        module = load_module()
+        import urllib.request
+        with mock.patch.object(urllib.request, "urlopen",
+                               side_effect=OSError("down")):
+            self.assertEqual(module.close_orphan_detail_tabs(45222), 0)
+
     # ----- CDP 熔断冷却（#5）-----
 
     def test_cdp_cooldown_mark_and_check(self):
