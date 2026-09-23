@@ -1,5 +1,12 @@
 # Changelog
 
+## v2.18.0 (2026-09-24)
+
+### 重写（面板通道 Vue hook 复活 / #75，三次 DOM 点击失败后的正解）
+- **根因**：面板切换由 Vue 内部方法 `clickJobCardAction` 驱动，不响应 DOM 事件（JS click / CDP 可信三连 / hover 均无效，三次真机 0/10）。
+- **新实现**：`_panel_vue_click`（找 `#wrap.__vue__` → `$children.find(c=>c.jobList)` → 按 encryptJobId 找岗位 → 调 `clickJobCardAction`）+ `_panel_vue_wait_and_read`（轮询 `jobDetail.lid` 匹配 → 读 API 结构化字段：`postDescription`/`activeTimeDesc`/`salaryDesc` 等）。
+- **优势**：零新增请求（页面自己发 detail）、零 DOM 解析（无 innerText 反爬）、无字体解码、API 结构化数据。用户真机验证 0ms 匹配（2026-09-24 03:34）。
+
 ## v2.17.4 (2026-09-23)
 
 ### 优化（并行 DOM tab 池化 / #73）
