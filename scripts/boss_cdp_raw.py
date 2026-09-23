@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.7"
+__version__ = "2.17.0"
 
 import argparse
 import base64
@@ -1262,25 +1262,71 @@ PANEL_READY_TIMEOUT = 10.0
 # encrypt 兜底连续未命中停试阈值（#58；真机实测 invalid_params 概率高时
 # 每岗白付 1 XHR + 节律等待，3 次足够判定）
 ENCRYPT_MISS_DISABLE_THRESHOLD = 3
-# 点击搜索页上指定岗位卡片（优先按 encryptJobId/链接匹配，退化按标题文本）
-# #57：标题可能截断，按标题前 12 字做前缀兜底匹配（列表卡常截断带…）
-CLICK_CARD_JS = r"""
+# 点击搜索页上指定岗位卡片：返回可点击坐标（#65 可信点击用）。
+# BOSS 面板切换疑似只响应可信鼠标事件——JS .click()（非可信）点中也不切面板。
+# 匹配优先级：encryptJobId/链接 → 全标题 → 标题前 12 字（列表卡截断兜底）。
+PANEL_CLICK_POINT_JS = r"""
 (function(){
     var key = __KEY__, title = __TITLE__;
     var t12 = title ? title.substring(0, 12) : '';
+    function point(el){
+        try { el.scrollIntoView({block: 'center'}); } catch (e) {}
+        var r = el.getBoundingClientRect();
+        if (!r || r.width <= 0 || r.height <= 0) return null;
+        return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+    }
     var links = document.querySelectorAll('a.job-name, .job-card-box a, a[href*="/job_detail/"]');
     for (var i = 0; i < links.length; i++) {
         var h = links[i].getAttribute('href') || links[i].href || '';
-        if (key && h.indexOf(key) !== -1) { links[i].click(); return true; }
+        if (key && h.indexOf(key) !== -1) { return JSON.stringify({ok: true, p: point(links[i])}); }
     }
     var cards = document.querySelectorAll('li.job-card-box, .job-card-wrap');
     for (var j = 0; j < cards.length; j++) {
         var ct = (cards[j].innerText || '').replace(/\s+/g, ' ');
-        if ((title && ct.indexOf(title) !== -1) || (t12 && ct.indexOf(t12) !== -1)) { cards[j].click(); return true; }
+        if ((title && ct.indexOf(title) !== -1) || (t12 && ct.indexOf(t12) !== -1)) { return JSON.stringify({ok: true, p: point(cards[j])}); }
     }
-    return false;
+    return JSON.stringify({ok: false});
 })()
 """
+
+
+def _trusted_click_card(ws, sid, job):
+    """CDP 可信点击岗位卡片（#65）：取坐标 → Input.dispatchMouseEvent 三连。
+
+    真浏览器同款（Snseam/ufownl 思路）：可信事件才能触发 BOSS 面板切换。
+    Returns:
+        bool: True=已派发点击；False=未找到卡片/坐标非法/CDP 异常。
+    """
+    key = str(job.get("encrypt_job_id") or job.get("job_link") or "")
+    title = str(job.get("title") or "")
+    if not key and not title:
+        return False
+    js = (PANEL_CLICK_POINT_JS.replace("__KEY__", json.dumps(key))
+          .replace("__TITLE__", json.dumps(title)))
+    try:
+        val = ws.eval_js(js, sid)
+        info = json.loads(val) if isinstance(val, str) else {}
+    except _cdp_exception_types():
+        return False
+    if not info.get("ok"):
+        return False
+    p = info.get("p") or {}
+    try:
+        x, y = float(p.get("x")), float(p.get("y"))
+    except (TypeError, ValueError):
+        return False
+    try:
+        ws.send("Input.dispatchMouseEvent",
+                {"type": "mouseMoved", "x": x, "y": y}, sid)
+        ws.send("Input.dispatchMouseEvent",
+                {"type": "mousePressed", "x": x, "y": y,
+                 "button": "left", "clickCount": 1}, sid)
+        ws.send("Input.dispatchMouseEvent",
+                {"type": "mouseReleased", "x": x, "y": y,
+                 "button": "left", "clickCount": 1}, sid)
+        return True
+    except _cdp_exception_types():
+        return False
 
 # 右面板"目标岗位"状态探测（#57：面板存在≠内容正确，必须等面板切换到目标岗位）
 # 返回 {ready, title_ok, comp_ok, jd_len, head}——head 为面板文本前 120 字（去空白），
@@ -4798,10 +4844,9 @@ def _scrape_one_detail_via_panel(job, ws, sid):
     try:
         # #57：点击前记录面板文本指纹——面板"存在"不等于"内容已切到目标岗位"
         # （初始首卡面板本就有内容，旧逻辑立即通过 → 读到旧面板）
+        # #65：JS .click() 非可信，面板不切换——改 CDP 可信点击
         snapshot_head = _panel_job_head(ws, sid, title)
-        js = (CLICK_CARD_JS.replace("__KEY__", json.dumps(key))
-              .replace("__TITLE__", json.dumps(title)))
-        if not ws.eval_js(js, sid):
+        if not _trusted_click_card(ws, sid, job):
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail", "message": "搜索页未找到该岗位卡片",
                     "channel": "panel"}

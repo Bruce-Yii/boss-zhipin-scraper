@@ -5568,39 +5568,72 @@ class PanelJdTests(unittest.TestCase):
         return {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/eid.html",
                 "encrypt_job_id": "eid", "title": "AI产品经理", "boss_name": "C"}
 
-    def test_click_card_js_clicks_by_key_then_title(self):
+    def test_panel_click_point_js_template(self):
+        """#65：坐标模板（可信点击用）——scrollIntoView＋取中心点＋标题前缀兜底。"""
         module = load_module()
-        self.assertIn("__KEY__", module.CLICK_CARD_JS)
-        self.assertIn("__TITLE__", module.CLICK_CARD_JS)
-        self.assertIn(".click()", module.CLICK_CARD_JS)
-        # #57：长标题截断时按前 12 字前缀匹配
-        self.assertIn("substring(0, 12)", module.CLICK_CARD_JS)
+        self.assertIn("__KEY__", module.PANEL_CLICK_POINT_JS)
+        self.assertIn("__TITLE__", module.PANEL_CLICK_POINT_JS)
+        self.assertIn("getBoundingClientRect", module.PANEL_CLICK_POINT_JS)
+        self.assertIn("scrollIntoView", module.PANEL_CLICK_POINT_JS)
+        self.assertIn("substring(0, 12)", module.PANEL_CLICK_POINT_JS)
+        self.assertNotIn(".click()", module.PANEL_CLICK_POINT_JS)
+
+    def test_trusted_click_card_dispatches_mouse_sequence(self):
+        """#65：坐标有效 → mouseMoved/Pressed/Released 三连派发。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"ok": True, "p": {"x": 100, "y": 200}})
+        self.assertTrue(module._trusted_click_card(ws, "s", self._job()))
+        types = [c[0][1]["type"] for c in ws.send.call_args_list]
+        self.assertEqual(types, ["mouseMoved", "mousePressed", "mouseReleased"])
+        btn = ws.send.call_args_list[1][0][1]
+        self.assertEqual((btn["x"], btn["y"]), (100.0, 200.0))
+        self.assertEqual(btn["button"], "left")
+
+    def test_trusted_click_card_not_found(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps({"ok": False})
+        self.assertFalse(module._trusted_click_card(ws, "s", self._job()))
+        ws.send.assert_not_called()
+
+    def test_trusted_click_card_bad_coords(self):
+        module = load_module()
+        ws = mock.Mock()
+        for bad in (json.dumps({"ok": True, "p": None}),
+                    json.dumps({"ok": True, "p": {"x": "na"}})):
+            ws.eval_js.return_value = bad
+            self.assertFalse(module._trusted_click_card(ws, "s", self._job()))
+
+    def test_trusted_click_card_cdp_exception(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.side_effect = TimeoutError("cdp died")
+        self.assertFalse(module._trusted_click_card(ws, "s", self._job()))
 
     def test_panel_detail_success(self):
         module = load_module()
         ws = mock.Mock()
         long_jd = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
-        # #57 新调用序列：快照 → 点击 → 身份等待 → 清弹窗 → 抽取
-        state = json.dumps({"ready": True, "title_ok": True, "comp_ok": True,
-                           "jd_len": 200, "head": "PANEL-HDR"})
-        ws.eval_js.side_effect = [
-            json.dumps({"ready": False}),  # 点击前快照（无面板）
-            True,                          # 点击卡片
-            state,                         # 面板身份等待（标题+公司命中）
-            True,                          # 清弹窗
-            json.dumps({"jd": long_jd, "tags": [],
-                        "page_text": "", "url": ""}),
-        ]
-        with mock.patch.object(module.time, "sleep"):
+        ws.eval_js.return_value = json.dumps(
+            {"jd": long_jd, "tags": [], "page_text": "", "url": ""})
+        with mock.patch.object(module, "_trusted_click_card",
+                               return_value=True), \
+                mock.patch.object(module, "_wait_for_panel_job",
+                                  return_value=True), \
+                mock.patch.object(module.time, "sleep"):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertTrue(r["ok"])
         self.assertIn("jd", r["detail"])
 
-    def test_panel_detail_card_not_found(self):
+    def test_panel_detail_click_not_found(self):
+        """#65：可信点击未找到卡片 → invalid_detail。"""
         module = load_module()
         ws = mock.Mock()
-        ws.eval_js.return_value = False
-        r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
+        with mock.patch.object(module, "_trusted_click_card",
+                               return_value=False):
+            r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertFalse(r["ok"])
         self.assertEqual(r["reason"], "invalid_detail")
         self.assertIn("未找到", r["message"])
@@ -5609,13 +5642,10 @@ class PanelJdTests(unittest.TestCase):
         """#57：面板存在但内容未切到目标岗位 → invalid_detail（旧 bug：读旧面板）。"""
         module = load_module()
         ws = mock.Mock()
-        # 超时 0：等待循环不执行 → 仅快照+点击被消费
-        ws.eval_js.side_effect = [
-            json.dumps({"ready": True, "title_ok": False, "comp_ok": False,
-                        "jd_len": 300, "head": "STALE"}),  # 快照：旧面板指纹
-            True,  # 点击
-        ]
-        with mock.patch.object(module, "PANEL_READY_TIMEOUT", 0.0):
+        with mock.patch.object(module, "_trusted_click_card",
+                               return_value=True), \
+                mock.patch.object(module, "_wait_for_panel_job",
+                                  return_value=False):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertFalse(r["ok"])
         self.assertEqual(r["reason"], "invalid_detail")

@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.17.0 (2026-09-23)
+
+### 修复（面板点击不切换面板 / #65，真机 0/10）
+- **CDP 可信点击卡片**：`CLICK_CARD_JS`（JS `.click()` 非可信事件，BOSS 面板切换疑似忽略）改为 `PANEL_CLICK_POINT_JS` 取卡片中心坐标（scrollIntoView + getBoundingClientRect，标题前 12 字前缀兜底保留）+ `_trusted_click_card` 经 `Input.dispatchMouseEvent` 派发 mouseMoved/Pressed/Released 三连（真浏览器同款）；坐标非法/CDP 异常返回 False。
+- 面板身份等待（#57）与失败语义不变；真机对照仍待账号冷却后复测。
+
 ## v2.16.7 (2026-09-23)
 
 ### 修复（tab 残留堆积 / #63）
