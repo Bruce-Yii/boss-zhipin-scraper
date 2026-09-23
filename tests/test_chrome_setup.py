@@ -1914,6 +1914,52 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(module.DETAIL_API_PACE_SECONDS, 2.25)
         self.assertIs(module.BurstThrottle, rl.BurstThrottle)
 
+    def test_burst_throttle_env_knob_overrides_params(self):
+        """#61：环境变量覆盖 center/min/max 与 short/long 阈值（#31 档位入口）。"""
+        module = load_module()
+        env = {"BOSS_BURST_CENTER": "5.0",
+               "BOSS_BURST_MIN_DELAY": "5.0",
+               "BOSS_BURST_MAX_DELAY": "5.0",
+               "BOSS_BURST_SHORT_THRESHOLD": "12",
+               "BOSS_BURST_LONG_THRESHOLD": "32"}
+        with mock.patch.dict(os.environ, env, clear=False):
+            bt = module.BurstThrottle()
+        self.assertEqual(bt.center, 5.0)
+        self.assertEqual(bt.min_delay, 5.0)
+        self.assertEqual(bt.max_delay, 5.0)
+        self.assertEqual(bt.short_threshold, 12)
+        self.assertEqual(bt.long_threshold, 32)
+
+    def test_burst_throttle_env_knob_ignores_invalid(self):
+        """#61：非法/越界环境值回退默认；min>max 回退默认（不静默交换）。"""
+        module = load_module()
+        bad = {"BOSS_BURST_CENTER": "abc",
+               "BOSS_BURST_MIN_DELAY": "-1",
+               "BOSS_BURST_SHORT_THRESHOLD": "0",
+               "BOSS_BURST_LONG_THRESHOLD": ""}
+        with mock.patch.dict(os.environ, bad, clear=False):
+            bt = module.BurstThrottle()
+        self.assertEqual(bt.center, 2.25)
+        self.assertEqual(bt.min_delay, 1.5)
+        self.assertEqual(bt.short_threshold, 3)
+        self.assertEqual(bt.long_threshold, 6)
+        with mock.patch.dict(os.environ,
+                             {"BOSS_BURST_MIN_DELAY": "9.0",
+                              "BOSS_BURST_MAX_DELAY": "3.0"}, clear=False):
+            bt2 = module.BurstThrottle()
+        self.assertEqual((bt2.min_delay, bt2.max_delay), (1.5, 3.0))
+
+    def test_burst_throttle_defaults_unchanged_without_env(self):
+        """#61：无环境变量时默认值零变化（节律红线守卫）。"""
+        module = load_module()
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("BOSS_BURST_")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            bt = module.BurstThrottle()
+        self.assertEqual((bt.center, bt.min_delay, bt.max_delay),
+                         (2.25, 1.5, 3.0))
+        self.assertEqual((bt.short_threshold, bt.long_threshold), (3, 6))
+
     def test_fetch_pages_parallel_returns_all_pages(self):
         module = load_module()
         sess = [mock.Mock(), "t", "s", 0]
