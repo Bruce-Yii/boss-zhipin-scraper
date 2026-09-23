@@ -6,6 +6,7 @@
 保持 ``scripts.boss_cdp_raw.TokenBucket`` 等导入面不变。
 """
 
+import os
 import random
 import threading
 import time
@@ -18,6 +19,37 @@ from collections import deque
 # 改由 BurstThrottle（见下）承担 API 通道节律；此常量保留为串行参考中心值。
 DETAIL_API_PACE_SECONDS = 2.25
 
+# BurstThrottle 实验旋钮（#61 / #31 档位实验）：环境变量覆盖构造参数。
+# **默认值零变化**（节律红线：默认调整须实测边界 + 用户拍板）；仅供实验调用
+# （如 0.44 档：BOSS_BURST_CENTER=2.25；0.33 档：CENTER/MIN/MAX=3.0；
+#  0.20 档：CENTER/MIN/MAX=5.0；采集端 burst 阈值：SHORT=12/LONG=32）。
+BURST_ENV_VARS = {
+    "center": ("BOSS_BURST_CENTER", float),
+    "min_delay": ("BOSS_BURST_MIN_DELAY", float),
+    "max_delay": ("BOSS_BURST_MAX_DELAY", float),
+    "short_threshold": ("BOSS_BURST_SHORT_THRESHOLD", int),
+    "long_threshold": ("BOSS_BURST_LONG_THRESHOLD", int),
+}
+
+
+def _burst_env_override(name, default):
+    """读环境变量覆盖 BurstThrottle 构造参数；缺省/非法/越界时回退默认。"""
+    env_name, cast = BURST_ENV_VARS[name]
+    raw = os.environ.get(env_name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        return default
+    if name in ("center", "min_delay", "max_delay"):
+        if not (value > 0):
+            return default
+    else:
+        if not (value >= 1):
+            return default
+    return value
+
 
 class BurstThrottle:
     """**串行化 + burst-aware** 请求节律（对标同行 boss-agent-cli throttle 模型）。
@@ -29,12 +61,25 @@ class BurstThrottle:
     - slow_factor（熔断恢复期=2.0）整体放大间隔
 
     目标全局速率 ≈ 1/center（默认 ~0.44 req/s），落在全行安全区。
+
+    #61 实验旋钮：``BOSS_BURST_*`` 环境变量可覆盖 center/min_delay/max_delay
+    与 short/long 阈值（缺省/非法/越界 → 回退传入值；默认零变化）。
     """
 
     def __init__(self, center=2.25, sigma=0.4, min_delay=1.5, max_delay=3.0,
                  long_pause_prob=0.05, long_pause=(2.0, 5.0),
                  short_window=15.0, short_threshold=3, short_penalty=(1.2, 2.8),
                  long_window=45.0, long_threshold=6, long_penalty=(4.0, 7.0)):
+        # #61 实验旋钮：环境变量覆盖（缺省/非法/越界 → 回退传入值；默认零变化）
+        dfl_min, dfl_max = min_delay, max_delay
+        center = _burst_env_override("center", center)
+        min_delay = _burst_env_override("min_delay", min_delay)
+        max_delay = _burst_env_override("max_delay", max_delay)
+        short_threshold = _burst_env_override("short_threshold", short_threshold)
+        long_threshold = _burst_env_override("long_threshold", long_threshold)
+        if min_delay > max_delay:
+            # 环境配错时回退默认（静默交换会误导实验读数）
+            min_delay, max_delay = dfl_min, dfl_max
         self.center = center
         self.sigma = sigma
         self.min_delay = min_delay
