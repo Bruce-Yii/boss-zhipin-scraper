@@ -815,6 +815,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids",
                                   return_value=set()), \
                 mock.patch.object(module.time, "sleep"), \
@@ -846,6 +848,8 @@ class ChromeSetupTests(unittest.TestCase):
                                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_pending_ids",
                                       return_value={}), \
                     mock.patch.object(module.time, "sleep"), \
@@ -2460,7 +2464,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def worker(job, cdp_port, stop_event=None, limiter=None,
               security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             if stop_event is not None and stop_event.is_set():
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
                         "reason": "stopped", "message": ""}
@@ -2488,6 +2492,8 @@ class ChromeSetupTests(unittest.TestCase):
                                new=self._fake_parallel_worker(state, set())), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, pending_out = module._scrape_details_parallel(
@@ -2525,7 +2531,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             seen_sessions.append(api_session)
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": ""}
@@ -2536,6 +2542,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, pending_out = module._scrape_details_parallel(
@@ -2562,7 +2570,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": ""}
 
@@ -2574,6 +2582,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "BurstThrottle") as bt_cls, \
                 mock.patch.object(module, "AdaptiveRateLimiter") as arl_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             module._scrape_details_parallel(
@@ -2592,7 +2602,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": ""}
 
@@ -2600,6 +2610,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "check_cdp_recovery", return_value=0), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             module._scrape_details_parallel(
@@ -2615,7 +2627,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                     security_id=None, api_session=None, city_code="",
-                    search_keyword=""):
+                    search_keyword="", dom_session=None):
             submitted.append(job["job_id"])
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": "",
@@ -2625,6 +2637,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "AdaptiveRateLimiter"), \
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids",
                                   return_value=set()), \
                 mock.patch.object(module.time, "sleep") as sleep_mock:
@@ -2635,6 +2649,124 @@ class ChromeSetupTests(unittest.TestCase):
         # window = concurrency*2 = 4：首波 4 次提交各间隔一次，后续补提交不再间隔
         self.assertEqual(len(staggers), 4)
         self.assertEqual(len(submitted), 6)
+
+    def test_parallel_dom_jobs_share_pooled_tabs(self):
+        """#73：DOM 岗复用槽位 tab（2 槽 6 岗只开 2 个 tab），结束统一关闭。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job_detail/x{i}.html",
+                 "boss_name": "C"} for i in range(6)]
+        seen = []
+        tabs = [[mock.Mock(), f"t{i}", f"s{i}", 0] for i in range(2)]
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            seen.append(dom_session)
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "dom"}
+
+        with tempfile_profile() as paths:
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_dom_tab",
+                                      side_effect=tabs) as open_mock, \
+                    mock.patch.object(module, "_close_api_tab") as close_mock, \
+                    mock.patch.object(module, "AdaptiveRateLimiter"), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module._scrape_details_parallel(
+                    jobs, cdp_port=9222, concurrency=2,
+                    output_path=str(paths["cdp_profile"] / "details.json"))
+        self.assertEqual(open_mock.call_count, 2, "2 槽只开 2 个 tab")
+        self.assertEqual(len(seen), 6)
+        self.assertTrue(all(s in tabs for s in seen),
+                        "6 岗应复用池内 tab")
+        self.assertEqual(sum(t[3] for t in tabs), 6, "导航计数应累加")
+        closed = [c[0][0] for c in close_mock.call_args_list
+                  if c[0] and c[0][0] is not None]
+        self.assertEqual(len(closed), 2, "结束统一关闭 2 个 tab")
+
+    def test_parallel_dom_broken_tab_discarded_and_rebuilt(self):
+        """#73：坏档 tab 丢弃，下岗重建（不跨岗复用坏会话）。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job_detail/x{i}.html",
+                 "boss_name": "C"} for i in range(3)]
+        calls = {"n": 0}
+        tabs = [[mock.Mock(), f"t{i}", f"s{i}", 0] for i in range(3)]
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"ok": False, "detail": None, "job_id": job["job_id"],
+                        "reason": "cdp_session", "message": "ws died"}
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "dom"}
+
+        with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_dom_tab",
+                                      side_effect=tabs) as open_mock, \
+                    mock.patch.object(module, "_close_api_tab"), \
+                    mock.patch.object(module, "AdaptiveRateLimiter"), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module._scrape_details_parallel(
+                    jobs, cdp_port=9222, concurrency=1, output_path=out)
+        # 首岗坏档丢弃 1 个 + 重建：第 1 岗开 tab0（坏→关），后 2 岗开 tab1 复用
+        self.assertEqual(open_mock.call_count, 2)
+
+    def test_parallel_no_dom_pool_when_full_api_coverage(self):
+        """#73：全 API 覆盖时不建 DOM 池（不浪费 tab）。"""
+        module = load_module()
+        jobs = [{"job_id": f"j{i}", "title": f"T{i}",
+                 "job_link": f"https://www.zhipin.com/job_detail/x{i}.html",
+                 "boss_name": "C"} for i in range(3)]
+        smap = {j["job_id"]: "sec" for j in jobs}
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword="", id_mode="security", dom_session=None):
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "title": job["title"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "api"}
+
+        with tempfile_profile() as paths:
+            with mock.patch.object(module, "_scrape_one_detail",
+                                   new=fake_one), \
+                    mock.patch.object(module, "_open_dom_tab") as open_mock, \
+                    mock.patch.object(module, "_open_api_tab",
+                                      return_value=[mock.Mock(), "t", "s", 0]), \
+                    mock.patch.object(module, "_close_api_tab"), \
+                    mock.patch.object(module, "AdaptiveRateLimiter"), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module, "load_pending_ids",
+                                      return_value={}), \
+                    mock.patch.object(module.time, "sleep"):
+                module._scrape_details_parallel(
+                    jobs, cdp_port=9222, concurrency=2, security_map=smap,
+                    output_path=str(paths["cdp_profile"] / "details.json"))
+        open_mock.assert_not_called()
 
     def test_parallel_api_channel_rotates_tab_on_budget(self):
         """预算轮换：同一 tab 达 DETAIL_API_TAB_BUDGET 次后自动换新 tab（支撑批量）。"""
@@ -2657,7 +2789,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
                     "job_id": job["job_id"], "reason": "", "message": "",
                     "channel": "api"}
@@ -2668,6 +2800,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, _ = module._scrape_details_parallel(
@@ -2699,7 +2833,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             calls["n"] += 1
             if calls["n"] == 1:
                 return {"ok": False, "detail": None, "job_id": job["job_id"],
@@ -2715,6 +2849,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "_note_detail_risk_blocked") as risk_note, \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, _ = module._scrape_details_parallel(
@@ -2737,7 +2873,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "code=37 您的环境存在异常",
                     "category": "env_risk"}
@@ -2751,6 +2887,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "_rotate_api_tab") as rot, \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             module._scrape_details_parallel(
@@ -2772,6 +2910,8 @@ class ChromeSetupTests(unittest.TestCase):
                                    fail_reason="cdp_session")), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, pending_out = module._scrape_details_parallel(
@@ -2792,6 +2932,8 @@ class ChromeSetupTests(unittest.TestCase):
                                    fail_reason="invalid_detail")), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, pending_out = module._scrape_details_parallel(
@@ -2806,7 +2948,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def always_fail(job, cdp_port, stop_event=None, limiter=None,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "cdp_session", "message": "boom"}
 
@@ -2817,6 +2959,8 @@ class ChromeSetupTests(unittest.TestCase):
                                       / "scrape.lock")), \
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids", return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids", return_value=set()), \
                 mock.patch.object(module.time, "sleep"):
             results, pending_out = module._scrape_details_parallel(
@@ -2834,7 +2978,7 @@ class ChromeSetupTests(unittest.TestCase):
 
         def always_fail(job, cdp_port, stop_event=None, limiter=None,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "cdp_session", "message": "boom"}
@@ -2847,6 +2991,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids",
                                   return_value={}), \
                 mock.patch.object(module.time, "sleep"):
@@ -2867,6 +3013,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "incr_request") as incr_mock, \
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids",
                                   return_value={}), \
                 mock.patch.object(module.time, "sleep"):
@@ -2886,10 +3034,14 @@ class ChromeSetupTests(unittest.TestCase):
             with mock.patch.object(module, "_scrape_one_detail",
                                    new=self._fake_parallel_worker(state, set())), \
                     mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
+                    mock.patch.object(module, "_open_dom_tab",
+                                      return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "_atomic_write_json",
                                       wraps=module._atomic_write_json) as atomic, \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_pending_ids",
                                       return_value=set()), \
                     mock.patch.object(module.time, "sleep"):
@@ -2913,6 +3065,8 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                 mock.patch.object(module, "load_existing_detail_ids",
                                   return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                 mock.patch.object(module, "load_pending_ids",
                                   return_value=set()), \
                 mock.patch.object(module.time, "sleep"), \
@@ -2950,6 +3104,8 @@ class ChromeSetupTests(unittest.TestCase):
                                    new=fake_parallel), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_pending_ids",
                                       return_value=set()), \
                     mock.patch.object(module.time, "sleep"):
@@ -2977,6 +3133,8 @@ class ChromeSetupTests(unittest.TestCase):
                                       side_effect=TimeoutError("cdp down")), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_pending_ids",
                                       return_value={}), \
                     mock.patch.object(module.time, "sleep"):
@@ -4025,8 +4183,9 @@ class ChromeSetupTests(unittest.TestCase):
                                       detail_channel="dom")
         open_mock.assert_called_once()
         self.assertEqual(len(seen_sessions), 3)
-        self.assertTrue(all(s is tab for s in seen_sessions),
-                        "三岗应共用同一 DOM tab")
+        # 池化：1 槽位 → 全程 1 个 tab 复用
+        self.assertEqual(len({id(s) for s in seen_sessions}), 1)
+        self.assertTrue(all(s is tab for s in seen_sessions))
         closed = [c[0][0] for c in close_mock.call_args_list
                   if c[0] and c[0][0] is not None]
         self.assertEqual(closed, [tab], "结束应统一关闭共享 DOM tab（且仅它）")
@@ -4170,6 +4329,8 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module, "_close_api_tab"), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_pending_ids",
                                       return_value={}), \
                     mock.patch.object(module.time, "sleep"):
@@ -4211,6 +4372,8 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module, "_close_api_tab"), \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                     mock.patch.object(module, "load_pending_ids",
                                       return_value={}), \
                     mock.patch.object(module.time, "sleep"):
@@ -5118,6 +5281,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
                  mock.patch.object(module, "send_alert"), \
                  mock.patch.object(module, "load_existing_detail_ids",
                                    return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
                  mock.patch.object(module, "load_pending_ids",
                                    return_value={}), \
                  mock.patch.object(module.time, "sleep"), \
@@ -5144,7 +5309,7 @@ class BestPracticesBatch3Tests(unittest.TestCase):
 
         def fake_worker(job, cdp_port, stop_event=None, limiter=None, verbose=False,
                      security_id=None, api_session=None, city_code="",
-                     search_keyword=""):
+                     search_keyword="", dom_session=None):
             calls.append(job["job_id"])
             return {"ok": False, "detail": None, "job_id": job["job_id"],
                     "reason": "risk_timeout", "message": "验证码命中"}
@@ -5154,6 +5319,8 @@ class BestPracticesBatch3Tests(unittest.TestCase):
              mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
              mock.patch.object(module, "load_existing_detail_ids",
                                return_value=set()), \
+ mock.patch.object(module, "_open_dom_tab",
+                       return_value=[mock.Mock(), "t", "s", 0]), \
              mock.patch.object(module, "load_pending_ids", return_value={}), \
              mock.patch.object(module.time, "sleep"), \
              mock.patch("sys.stdout",
