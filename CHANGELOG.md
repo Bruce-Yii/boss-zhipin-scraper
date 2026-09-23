@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.16.2 (2026-09-23)
+
+### 新增（DOM 链路优化 · 优化点 C-lite / #53）
+- **`--dom-block-assets`（默认关闭）**：DOM 详情页拦截 media/font 资源（`Network.setBlockedURLs` URL 模式：mp4/webm/mp3/ogg/wav/woff/woff2/ttf/otf/eot），**保图片**——"从不拉图的浏览器"请求瀑布无真人形态（行为指纹，Playwright 社区共识），故只砍视频/字体字节。应用于共享 DOM tab（`_open_dom_tab`）与逐岗自建 DOM 会话；API/encrypt/panel 通道不受影响。`innerText` 提取取码点非字形，字体拦截不影响文本；best-effort（启用失败按原样加载）。
+- **默认关闭原因**：真机验证 JD 渲染完整性（含"字体阻塞 JS"边缘情况：个别页面 `document.fonts.ready` 等待）后再评估翻转默认。
+
 ## v2.16.1 (2026-09-23)
 
 ### 优化（DOM 链路优化方案 · 优化点 B / #51）

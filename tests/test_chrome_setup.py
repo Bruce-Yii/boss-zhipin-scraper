@@ -3884,6 +3884,64 @@ class ChromeSetupTests(unittest.TestCase):
         close_mock.assert_any_call(tab1)
         close_mock.assert_any_call(tab2)
 
+    def test_apply_asset_blocking_sends_cdp_commands(self):
+        """资源拦截（#53）：Network.enable + setBlockedURLs（media/font 模式表）。"""
+        module = load_module()
+        ws = mock.Mock()
+        ok = module._apply_asset_blocking(ws, "sid-1")
+        self.assertTrue(ok)
+        sent = {c[0][0]: c[0][1] for c in ws.send.call_args_list}
+        self.assertIn("Network.enable", sent)
+        self.assertEqual(sent["Network.setBlockedURLs"],
+                         {"urls": module.DOM_BLOCK_URL_PATTERNS})
+        patterns = module.DOM_BLOCK_URL_PATTERNS
+        self.assertIn("*.mp4", patterns)
+        self.assertIn("*.woff2", patterns)
+        self.assertNotIn("*.png", patterns, "不得拦截图片（行为指纹）")
+        self.assertNotIn("*.jpg", patterns, "不得拦截图片（行为指纹）")
+
+    def test_apply_asset_blocking_best_effort(self):
+        """资源拦截（#53）：CDP 失败仅记日志返回 False，不抛异常。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.send.side_effect = TimeoutError("cdp died")
+        self.assertFalse(module._apply_asset_blocking(ws, "sid-1"))
+
+    def test_open_dom_tab_applies_blocking_when_enabled(self):
+        """共享 DOM tab（#53）：开关开 → 开 tab 即启用拦截。"""
+        module = load_module()
+        ws = mock.Mock()
+        with mock.patch.object(module, "DOM_BLOCK_ASSETS_ENABLED", True), \
+                mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")):
+            session = module._open_dom_tab(9222)
+        sent = [c[0][0] for c in ws.send.call_args_list]
+        self.assertIn("Network.setBlockedURLs", sent)
+        self.assertEqual(session[:3], [ws, "tid-1", "sid-1"])
+
+    def test_scrape_one_detail_self_build_applies_blocking_when_enabled(self):
+        """逐岗自建 DOM 会话（#53）：开关开 → 会话建立后启用拦截。"""
+        module = load_module()
+        with mock.patch.object(module, "DOM_BLOCK_ASSETS_ENABLED", True), \
+                self._mock_detail_page(module, "Build AI agents " * 20) as (ws, _url):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222)
+        self.assertTrue(result["ok"])
+        sent = [c[0][0] for c in ws.send.call_args_list]
+        self.assertIn("Network.setBlockedURLs", sent)
+
+    def test_dom_blocking_off_by_default(self):
+        """默认关闭：不发送任何 setBlockedURLs（页面按原样加载）。"""
+        module = load_module()
+        with mock.patch.object(module, "DOM_BLOCK_ASSETS_ENABLED", False), \
+                self._mock_detail_page(module, "Build AI agents " * 20) as (ws, _url):
+            result = module._scrape_one_detail(
+                self._detail_job(), cdp_port=9222)
+        self.assertTrue(result["ok"])
+        sent = [c[0][0] for c in ws.send.call_args_list]
+        self.assertNotIn("Network.setBlockedURLs", sent)
+
     def test_parse_detail_api_value_ok(self):
         """详情 API 解析：正常返回 → jd 规范化 + 精简字段集；全角空格清理。"""
         module = load_module()

@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.1"
+__version__ = "2.16.2"
 
 import argparse
 import base64
@@ -120,6 +120,14 @@ CDP_CANDIDATE_PORTS = (9222, 9229, 19222)
 DEBUG_SHOT_ENABLED = False
 DEFAULT_DEBUG_DIR = os.path.expanduser("~/.boss-zhipin-scraper/debug")
 DEBUG_DIR_ENV = "BOSS_DEBUG_DIR"
+# DOM 资源拦截（DOM 链路优化 C-lite / #53）：默认关闭（--dom-block-assets 开）。
+# 只拦 media+font、**保 image**——"从不拉图的浏览器"请求瀑布无真人形态（行为
+# 指纹，Playwright 社区共识）；字体拦截不影响 innerText（取码点非字形）。
+DOM_BLOCK_ASSETS_ENABLED = False
+DOM_BLOCK_URL_PATTERNS = [
+    "*.mp4", "*.webm", "*.mp3", "*.ogg", "*.wav",
+    "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+]
 
 # API 基础路径（便于统一修改）
 API_JOB_LIST_PATH = "/wapi/zpgeek/search/joblist.json"
@@ -1386,6 +1394,22 @@ def _rotate_api_tab(session, cdp_port, keyword, city_code):
     return True
 
 
+def _apply_asset_blocking(ws, sid):
+    """对 DOM 会话启用 media/font 资源拦截（#53，best-effort）。
+
+    CDP ``Network.setBlockedURLs``（URL 模式，零事件流成本）：拦视频/音频/
+    字体，保图片与全部文档/脚本/样式/接口——维持真人请求瀑布形态。任何失败
+    仅记日志，页面按原样加载（提速是收益不是前提）。
+    """
+    try:
+        ws.send("Network.enable", {}, sid)
+        ws.send("Network.setBlockedURLs", {"urls": DOM_BLOCK_URL_PATTERNS}, sid)
+        return True
+    except _cdp_exception_types():
+        log.debug("资源拦截启用失败（按原样加载）", exc_info=True)
+        return False
+
+
 def _open_dom_tab(cdp_port):
     """开一个共享 DOM 详情 tab（串行 dom 通道用，#51）。
 
@@ -1395,6 +1419,8 @@ def _open_dom_tab(cdp_port):
     """
     ws = CDPSession(cdp_port)
     tid, sid = create_page_session(ws, background=page_background_default())
+    if DOM_BLOCK_ASSETS_ENABLED:
+        _apply_asset_blocking(ws, sid)
     return [ws, tid, sid, 0]
 
 
@@ -4088,6 +4114,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         else:
             ws = CDPSession(cdp_port)
             tid, sid = create_page_session(ws, background=page_background_default())
+            if DOM_BLOCK_ASSETS_ENABLED:
+                _apply_asset_blocking(ws, sid)
 
         detail_url = build_detail_url(job)
         # 并发模式全局限速：导航（真实请求）前申请配额
@@ -5931,6 +5959,9 @@ def build_parser():
                            help="静默模式：日志降到 WARNING 级别（结果行仍输出 stdout）")
     g_general.add_argument("--debug-screenshots", action="store_true",
                            help="失败时把页面截图存到 ~/.boss-zhipin-scraper/debug/（排障用；默认关闭）")
+    g_general.add_argument("--dom-block-assets", action="store_true",
+                           help="DOM 详情页拦截 media/font 资源（保图片维持真人请求形态，"
+                                "提速整页加载；innerText 提取不受字体影响）。默认关闭")
 
     return p
 
@@ -5964,6 +5995,12 @@ def run_cli():
     # 失败截图（专题 §3.6）：默认关闭，--debug-screenshots 开启
     global DEBUG_SHOT_ENABLED
     DEBUG_SHOT_ENABLED = bool(getattr(args, "debug_screenshots", False))
+
+    # DOM 资源拦截（#53）：默认关闭，--dom-block-assets 开启
+    global DOM_BLOCK_ASSETS_ENABLED
+    DOM_BLOCK_ASSETS_ENABLED = bool(getattr(args, "dom_block_assets", False))
+    if DOM_BLOCK_ASSETS_ENABLED:
+        print("🚫 已启用 --dom-block-assets：DOM 详情页将拦截 media/font 资源（保图片）")
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
