@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.2"
+__version__ = "2.16.3"
 
 import argparse
 import base64
@@ -154,6 +154,29 @@ MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出�
 # 改为"轮询就绪即返回"+ 轻量滚动 + 缩短页间间隔。
 DETAIL_DOM_READY_TIMEOUT = 12.0       # 等待 JD 区渲染就绪的上限（秒）；就绪立即返回
 DETAIL_DOM_GAP_SECONDS = (4.0, 9.0)   # DOM 详情页间间隔（原 10-25s；就绪等待已保证渲染，间隔只作节奏）
+# 默认值是节律红线：调整须等 #31 实测边界 + 用户拍板；--dom-gap（#55）仅作
+# 实验性覆盖（串行 DOM 与右面板共用，run_cli 内按参数覆写本常量）
+
+
+def parse_dom_gap(value):
+    """解析 ``--dom-gap`` 参数（``MIN,MAX`` 秒，如 ``3,6``）。
+
+    Returns:
+        tuple: ``(min, max)`` 浮点对。
+
+    Raises:
+        ValueError: 格式非法或违反 ``0 < MIN <= MAX <= 120`` 约束。
+    """
+    try:
+        parts = [float(x) for x in str(value).split(",")]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"--dom-gap 应为 MIN,MAX（如 3,6）: {value!r}") from exc
+    if len(parts) != 2:
+        raise ValueError(f"--dom-gap 应为 MIN,MAX 两个数: {value!r}")
+    lo, hi = parts
+    if not (0 < lo <= hi <= 120):
+        raise ValueError(f"--dom-gap 需满足 0 < MIN <= MAX <= 120: {value!r}")
+    return (lo, hi)
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 # FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
 SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
@@ -5897,6 +5920,9 @@ def build_parser():
                                "通道（api 严格 securityId）；encrypt=强制 encryptJobId "
                                "API（不依赖 securityId 有效期，串行）；panel=复用停靠"
                                "搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
+    g_detail.add_argument("--dom-gap", default=None, metavar="MIN,MAX",
+                          help="DOM 族详情岗位间隔秒数（串行 DOM 与右面板共用；"
+                               "默认 4,9。实验参数（#31）：默认值变更需实测边界拍板）")
     g_detail.add_argument("--analysis", action="store_true", help="输出分析报告")
     g_detail.add_argument("--input", default=None,
                           help="从已有 JSON 文件读取（跳过抓取）")
@@ -6001,6 +6027,18 @@ def run_cli():
     DOM_BLOCK_ASSETS_ENABLED = bool(getattr(args, "dom_block_assets", False))
     if DOM_BLOCK_ASSETS_ENABLED:
         print("🚫 已启用 --dom-block-assets：DOM 详情页将拦截 media/font 资源（保图片）")
+
+    # DOM 岗位间隔覆盖（#55）：默认不变（DETAIL_DOM_GAP_SECONDS 4-9s）；
+    # --dom-gap 为 #31 节律实验参数（串行 DOM 与右面板共用）
+    global DETAIL_DOM_GAP_SECONDS
+    if getattr(args, "dom_gap", None):
+        try:
+            DETAIL_DOM_GAP_SECONDS = parse_dom_gap(args.dom_gap)
+        except ValueError as exc:
+            p.error(str(exc))
+        print(f"⏱️  DOM 岗位间隔已覆盖为 "
+              f"{DETAIL_DOM_GAP_SECONDS[0]:g}-{DETAIL_DOM_GAP_SECONDS[1]:g}s"
+              f"（默认 4-9s；节律实验参数）")
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
