@@ -4167,10 +4167,11 @@ class ChromeSetupTests(unittest.TestCase):
 
         tab = [mock.Mock(), "t", "s", 0]
         with tempfile_profile() as paths:
+            out = str(paths["cdp_profile"] / "details.json")
             with mock.patch.object(module, "_scrape_one_detail",
                                    new=fake_one), \
                     mock.patch.object(module, "_open_dom_tab",
-                                      side_effect=tabs) as open_mock, \
+                                      return_value=tab) as open_mock, \
                     mock.patch.object(module, "_close_api_tab") as close_mock, \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
@@ -4182,8 +4183,9 @@ class ChromeSetupTests(unittest.TestCase):
                                       detail_channel="dom")
         open_mock.assert_called_once()
         self.assertEqual(len(seen_sessions), 3)
-        self.assertTrue(all(s is tab for s in seen_sessions),
-                        "三岗应共用同一 DOM tab")
+        # 池化：1 槽位 → 全程 1 个 tab 复用
+        self.assertEqual(len({id(s) for s in seen_sessions}), 1)
+        self.assertTrue(all(s is tab for s in seen_sessions))
         closed = [c[0][0] for c in close_mock.call_args_list
                   if c[0] and c[0][0] is not None]
         self.assertEqual(closed, [tab], "结束应统一关闭共享 DOM tab（且仅它）")
@@ -4220,7 +4222,7 @@ class ChromeSetupTests(unittest.TestCase):
                                    new=fake_one), \
                     mock.patch.object(module, "_open_dom_tab",
                                       side_effect=[tab1, tab2]) as open_mock, \
-                    mock.patch.object(module, "_close_api_tab"), \
+                    mock.patch.object(module, "_close_api_tab") as close_mock, \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
                     mock.patch.object(module, "load_pending_ids",
