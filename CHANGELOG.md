@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.17.4 (2026-09-23)
+
+### 优化（并行 DOM tab 池化 / #73）
+- `_scrape_details_parallel` 新增 DOM 槽位池（`concurrency` 个 None 占位）：首个 DOM 岗懒建 tab；成功计数导航数（`nav_count`，结束打印复用比）；会话坏档（cdp_session）丢弃、下岗重建；结束排空统一关闭。全 API 覆盖时不建池。API/encrypt/panel 路径不动。
+
 ## v2.17.3 (2026-09-23)
 
 ### 优化（并发首波错峰 / #71）

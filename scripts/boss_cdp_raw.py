@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.17.3"
+__version__ = "2.17.4"
 
 import argparse
 import base64
@@ -5126,6 +5126,15 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             except _cdp_exception_types():
                 log.warning("详情 API 共享会话建立失败（该槽位将按需自建）", exc_info=True)
 
+    # DOM 通道并发：槽位池（#73，每 worker 至多一个复用 tab，省每岗开关 ~0.4s）。
+    # concurrency 个 None 占位，首个 DOM 岗懒建 tab；坏档丢弃、下岗重建；
+    # 结束统一关闭。全 API 覆盖（无 DOM 岗）时不建池。
+    dom_pool = None
+    if any(job.get("job_id", "") not in (security_map or {}) for job in todo):
+        dom_pool = queue.Queue()
+        for _ in range(concurrency):
+            dom_pool.put(None)
+
     pool = ThreadPoolExecutor(max_workers=concurrency)
     try:
         # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
@@ -5141,14 +5150,26 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             job_id = job.get("job_id", "")
             job_security = (security_map or {}).get(job_id)
             session = api_pool.get() if api_pool is not None else None
+            dom_sess = None
             try:
                 # 预算轮换：该 tab 详情数达预算即换新 tab（否则下次必 code 37）
                 if session is not None and session[3] >= DETAIL_API_TAB_BUDGET:
                     _rotate_api_tab(session, cdp_port, keyword, city_code)
+                # DOM 岗取槽位 tab（#73）：占位 None 则懒建；建失败回退逐岗自建
+                if not job_security and dom_pool is not None:
+                    dom_sess = dom_pool.get()
+                    if dom_sess is None:
+                        try:
+                            dom_sess = _open_dom_tab(cdp_port)
+                        except _cdp_exception_types():
+                            log.warning("DOM 槽位 tab 建立失败，回退逐岗自建",
+                                        exc_info=True)
+                            dom_sess = None
                 result = _scrape_one_detail(
                     job, cdp_port, stop_event, limiter,
                     security_id=job_security, api_session=session,
-                    city_code=city_code, search_keyword=keyword)
+                    city_code=city_code, search_keyword=keyword,
+                    dom_session=dom_sess)
                 # 风控码二分：仅 token_expired 才换 tab 刷新后重试一次（其余换 tab 无用）
                 if (result["reason"] == "risk_timeout" and job_security
                         and session is not None
@@ -5157,15 +5178,25 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                         result = _scrape_one_detail(
                             job, cdp_port, stop_event, limiter,
                             security_id=job_security, api_session=session,
-                            city_code=city_code, search_keyword=keyword)
+                            city_code=city_code, search_keyword=keyword,
+                            dom_session=dom_sess)
                 # tab 预算计数（#58 同款）：仅 API/encrypt 成功计入
                 if (result["ok"] and session is not None
                         and result.get("channel") in ("api", "encrypt")):
                     session[3] += 1
+                # DOM 槽位记账（#73）：成功计数导航数；会话坏档丢弃（下岗重建）
+                if dom_sess is not None:
+                    if result["ok"]:
+                        dom_sess[3] += 1
+                    elif result.get("reason") == "cdp_session":
+                        _close_api_tab(dom_sess)
+                        dom_sess = None
                 return job, result
             finally:
                 if api_pool is not None and session is not None:
                     api_pool.put(session)  # 归还池（下次任务复用/轮换后的 tab）
+                if dom_pool is not None:
+                    dom_pool.put(dom_sess)  # 归还槽位（可用 tab 或 None 占位）
 
         def fill_window():
             nonlocal submitted_total
@@ -5226,6 +5257,23 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         # 关闭详情 API 共享会话池（**异常/崩溃也保证关闭**，防 tab 泄漏）
         for sess in api_sessions:
             _close_api_tab(sess)
+        # 关闭 DOM 槽位池（#73）：排空归还槽，关非 None tab，报复用比
+        if dom_pool is not None:
+            dom_tabs, dom_navs = 0, 0
+            while True:
+                try:
+                    s = dom_pool.get_nowait()
+                except queue.Empty:
+                    break
+                if s is not None:
+                    dom_tabs += 1
+                    try:
+                        dom_navs += int(s[3])
+                    except (TypeError, ValueError, IndexError):
+                        pass
+                    _close_api_tab(s)
+            if dom_tabs:
+                print(f"  🧷 DOM tab 复用：{dom_tabs} 个 tab 共 {dom_navs} 次导航")
         if output_path:
             persist()
     return results, pending
