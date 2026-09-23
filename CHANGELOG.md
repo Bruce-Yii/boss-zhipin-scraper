@@ -1,5 +1,13 @@
 # Changelog
 
+## v2.17.2 (2026-09-23)
+
+### 健壮性（点击验证专题 §4 落地 / #69）
+- **cardCount=0 空页面豁免（Ccelia）**：探针新增 `cardCount`；空页面无内容证据时标题/登录墙文本命中不判（防空列表误停）；URL/滑块是强结构证据，不受豁免（fail-closed）。真登录墙下游仍有 `DetailLoginRequiredError` 兜底。
+- **rate_limit 独立分类**：探针新增 `rateLimited`（操作频繁类正文命中）；`classify_risk_page` 返回三元组 `(is_risk, reason, category)`（captcha/login/rate_limit）；频率受限**跳过 120s 人工等待**，直接 `risk_timeout` + category `rate_limited`（冷却停手——人滑了也没用）。
+- **检测词表对照补齐**：滑块选择器并集（geetest_panel/#captcha/.captcha-wrapper/.slide-verify/.verify-wrap/.slider-verify/iframe captcha|verify/div.dialog-container:has(canvas)；裸 `[class*=]` 太宽不取）；URL 增 `geetest`；标题增 blocked 系（访问被拒绝/账号异常/账号受限）。
+- runbook 加"登出搜逃生口"（tangzhiyao #42：极端封号时登出后只剩人机验证不封号）。
+
 ## v2.17.1 (2026-09-23)
 
 ### 优化（资源拦截扩展追踪域 / #67）

@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.17.1"
+__version__ = "2.17.2"
 
 import argparse
 import base64
@@ -790,19 +790,29 @@ RISK_PROBE_JS = """
     var bodyText = document.body ? (document.body.innerText || '') : '';
     var slider = document.querySelector(
         '.nc_scale, .captcha-slider, .puzzle-captcha, .geetest_slider, ' +
-        '.yidun_slider, .captcha_verify_box, .verify-captcha'
+        '.yidun_slider, .captcha_verify_box, .verify-captcha, ' +
+        '.geetest_panel, #captcha, .captcha-wrapper, .slide-verify, ' +
+        '.verify-wrap, .slider-verify, ' +
+        'iframe[src*="captcha"], iframe[src*="verify"], ' +
+        'div.dialog-container:has(canvas)'
     );
+    var cards = document.querySelectorAll('li.job-card-box, .job-card-wrap');
+    var rateRe = /操作频繁|访问频繁|请求频繁|稍后再试|频率限制/;
     return JSON.stringify({
         url: url,
         title: title,
         hasSlider: !!slider,
-        hasLoginWall: bodyText.indexOf('登录查看完整内容') !== -1
+        hasLoginWall: bodyText.indexOf('登录查看完整内容') !== -1,
+        cardCount: cards.length,
+        rateLimited: rateRe.test(bodyText)
     });
 })()
 """
 
-RISK_TITLE_KEYWORDS = ("安全验证", "安全检查", "滑块验证", "验证码", "安全校验")
-RISK_URL_KEYWORDS = ("security-check", "security.html", "verify", "captcha")
+RISK_TITLE_KEYWORDS = ("安全验证", "安全检查", "滑块验证", "验证码", "安全校验",
+                       "访问被拒绝", "账号异常", "账号受限")
+RISK_URL_KEYWORDS = ("security-check", "security.html", "verify", "captcha",
+                     "geetest")
 
 
 def _cdp_exception_types():
@@ -860,21 +870,33 @@ def classify_risk_page(probe):
         probe: probe_risk_page 返回的 dict
 
     Returns:
-        (is_risk, reason): is_risk 为 True 时 reason 说明命中的判据
+        (is_risk, reason, category): category 取值 ""（干净）/ "captcha" /
+        "login"（登录墙）/ "rate_limit"（频率受限正文）。调用方据 category
+        分流处置：captcha/login → 120s 人工等待；rate_limit → 跳过人工等待，
+        直接冷却停手（频率限制人滑了也没用）。
+
+    豁免（Ccelia）：``cardCount == 0`` 的空页面无内容证据 → 标题/登录墙文本
+    命中不判（防空列表误停）；URL/滑块是强结构证据，不受豁免。真登录墙下游
+    仍有 ``DetailLoginRequiredError`` 兜底。
     """
     if not isinstance(probe, dict):
-        return False, ""
+        return False, "", ""
     url = str(probe.get("url") or "")
     title = str(probe.get("title") or "")
     if any(kw in url.lower() for kw in RISK_URL_KEYWORDS):
-        return True, "访问到验证/安全页面"
-    if any(kw in title for kw in RISK_TITLE_KEYWORDS):
-        return True, f"页面标题含验证关键词「{title}」"
+        return True, "访问到验证/安全页面", "captcha"
     if probe.get("hasSlider"):
-        return True, "检测到滑块验证元素"
+        return True, "检测到滑块验证元素", "captcha"
+    card_count = probe.get("cardCount")
+    if isinstance(card_count, int) and card_count == 0:
+        return False, "", ""
+    if probe.get("rateLimited"):
+        return True, "页面提示访问频率受限（操作频繁），进入冷却", "rate_limit"
+    if any(kw in title for kw in RISK_TITLE_KEYWORDS):
+        return True, f"页面标题含验证关键词「{title}」", "captcha"
     if probe.get("hasLoginWall"):
-        return True, "页面出现登录墙"
-    return False, ""
+        return True, "页面出现登录墙", "login"
+    return False, "", ""
 
 
 def wait_for_risk_clear(cdp, sid, timeout=DEFAULT_RISK_WAIT_TIMEOUT,
@@ -887,7 +909,7 @@ def wait_for_risk_clear(cdp, sid, timeout=DEFAULT_RISK_WAIT_TIMEOUT,
     deadline = time.time() + timeout
     while time.time() < deadline:
         probe = probe_risk_page(cdp, sid)
-        is_risk, reason = classify_risk_page(probe)
+        is_risk, reason, _category = classify_risk_page(probe)
         if not is_risk:
             return True
         remaining = int(deadline - time.time())
@@ -3232,11 +3254,14 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp.send("Page.navigate", {"url": url}, sid)
                 time.sleep(random.uniform(6, 10))
                 # 页面级风控检测：滑块/验证页/登录墙命中时提示人工介入
-                is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                is_risk, reason, category = classify_risk_page(probe_risk_page(cdp, sid))
                 if is_risk:
-                    print(f"⚠️ 搜索页 {reason}，等待人工处理...")
+                    if category == "rate_limit":
+                        print(f"⚠️ 搜索页 {reason}，跳过人工等待直接停止...")
+                    else:
+                        print(f"⚠️ 搜索页 {reason}，等待人工处理...")
                     set_scrape_lock_risk()  # 并发熔断广播：其他任务全停
-                    if not wait_for_risk_clear(cdp, sid):
+                    if category == "rate_limit" or not wait_for_risk_clear(cdp, sid):
                         print("列表页风控未解除，停止抓取（保留已抓数据）。")
                         warnings.append(f"搜索页风控未解除: {reason}")
                         print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
@@ -3279,10 +3304,13 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                         # 退避重试：第 N 次尝试前等 uniform(6,10)*2^(N-1)（full jitter 思想，
                         # AWS 实测比无抖动指数退避减少 >50% 重试调用量）
                         time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
-                        is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                        is_risk, reason, category = classify_risk_page(probe_risk_page(cdp, sid))
                         if is_risk:
-                            print(f"⚠️ 刷新后 {reason}，等待人工处理...")
-                            if not wait_for_risk_clear(cdp, sid):
+                            if category == "rate_limit":
+                                print(f"⚠️ 刷新后 {reason}，跳过人工等待直接停止...")
+                            else:
+                                print(f"⚠️ 刷新后 {reason}，等待人工处理...")
+                            if category == "rate_limit" or not wait_for_risk_clear(cdp, sid):
                                 print("风控未解除，停止抓取（保留已抓数据）。")
                                 warnings.append(f"刷新后风控未解除: {reason}")
                                 jobs = []
@@ -3313,7 +3341,7 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 # 无风控证据时按"无数据"停止，**不判风控、不写冷却、不告警**（防误停/防冷却污染）。
                 empty_pages += 1
                 if empty_pages >= 2:
-                    is_risk, reason = classify_risk_page(probe_risk_page(cdp, sid))
+                    is_risk, reason, category = classify_risk_page(probe_risk_page(cdp, sid))
                     if is_risk:
                         print(f"⚠️ 连续多页无数据且页面命中风控（{reason}），停止抓取（保留已抓数据）。")
                         warnings.append(f"连续多页无数据+风控页确认: {reason}")
@@ -4297,8 +4325,15 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         if verbose:
             print(f"  就绪={'是' if ready else '超时'}，抽取中...")
 
-        # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入
-        is_risk, risk_reason = classify_risk_page(probe_risk_page(ws, sid))
+        # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入；
+        # 频率受限（rate_limit）跳过人工等待——人滑了也没用，直接冷却停手
+        is_risk, risk_reason, risk_category = classify_risk_page(
+            probe_risk_page(ws, sid))
+        if is_risk and risk_category == "rate_limit":
+            capture_debug_screenshot(ws, sid, "risk")
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "risk_timeout", "message": risk_reason,
+                    "category": "rate_limited", "channel": "dom"}
         if is_risk and not wait_for_risk_clear(ws, sid):
             capture_debug_screenshot(ws, sid, "risk")
             return {"ok": False, "detail": None, "job_id": job_id,
