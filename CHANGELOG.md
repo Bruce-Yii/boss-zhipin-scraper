@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.18.1 (2026-09-24)
+
+### 修复（面板通道真机验证的两处必备修复 / #75）
+- **停靠页 city_code 解析**：`--input` 老文件（列表 meta 无 `city_code`）时面板停靠页无城市筛选 → `jobList` 与输入列表岗位不匹配（真机实测 panel 命中 0/10）。改为 city_code 缺失时从 `city` 中文名 `resolve_city` 解析（真机验证：panel 命中 9/10）。
+- **面板未命中回退 DOM**：面板 miss（jobList 未含目标/超时/JD 过短）→ 自动回退 DOM 独立页（降级链 API→panel→DOM）；共享 DOM 回退 tab（懒建）；结束打印通道分布（`📊 通道分布：panel 命中 N，DOM 回退 M`）。
+
 ## v2.18.0 (2026-09-24)
 
 ### 重写（面板通道 Vue hook 复活 / #75，三次 DOM 点击失败后的正解）

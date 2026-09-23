@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.18.0"
+__version__ = "2.18.1"
 
 import argparse
 import base64
@@ -4990,7 +4990,18 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
     results = list(existing_results) if existing_results is not None else []
     keyword = list_data.get("keyword", "")
     city_code = list_data.get("city_code", "")
+    if not city_code:
+        # #75：--input 老文件常无 city_code → 从中文城市名解析；否则停靠页
+        # 无城市筛选，jobList 与输入列表岗位不匹配（面板全 miss）
+        try:
+            _name, city_code = resolve_city(list_data.get("city", ""))
+            if city_code:
+                print(f"ℹ️  面板停靠页城市码由城市名解析："
+                      f"{list_data.get('city', '')} → {city_code}")
+        except CityResolutionError:
+            city_code = ""
     session = None
+    dom_session = None
     try:
         try:
             session = _open_api_tab(cdp_port, keyword, city_code)
@@ -5001,8 +5012,10 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             print("⚠️  右面板通道无法建立搜索页，跳过详情")
             return results
         ws, sid = session[0], session[2]
+        # 面板未命中时的 DOM 回退共享 tab（懒建；#75）
         start_time = time.time()
         done = ok = 0
+        panel_hit = dom_fallback = 0
         reasons = {}
         seen_links = set()
         for idx, job in enumerate(jobs):
@@ -5020,6 +5033,25 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             print(f"[{idx + 1}/{len(jobs)}] {job.get('boss_name', '')} - {job.get('title', '')}")
             incr_request("detail")
             result = _scrape_one_detail_via_panel(job, ws, sid)
+            # 面板未命中（jobList 未含目标/超时/JD 过短）→ 回退 DOM 独立页
+            # （专题 §5-7 降级链：面板零新增请求，DOM 有请求成本，仅未命中时降级）
+            if not result["ok"] and result["reason"] == "invalid_detail":
+                print(f"  ↩️ 面板未命中（{result['message']}），回退 DOM")
+                if dom_session is None:
+                    try:
+                        dom_session = _open_dom_tab(cdp_port)
+                    except _cdp_exception_types():
+                        log.warning("DOM 回退 tab 建立失败，逐岗自建", exc_info=True)
+                        dom_session = None
+                incr_request("detail")
+                result = _scrape_one_detail(
+                    job, cdp_port, city_code=city_code,
+                    search_keyword=keyword, dom_session=dom_session)
+                if result["ok"]:
+                    dom_fallback += 1
+            else:
+                if result["ok"]:
+                    panel_hit += 1
             done += 1
             if result["ok"]:
                 results.append(result["detail"])
@@ -5046,9 +5078,13 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
                 time.sleep(random.uniform(*DETAIL_DOM_GAP_SECONDS))
         if done:
             print(run_summary(time.time() - start_time, done, ok, reasons))
+            if panel_hit or dom_fallback:
+                print(f"  📊 通道分布：panel 命中 {panel_hit}，DOM 回退 {dom_fallback}")
     finally:
         if session is not None:
             _close_api_tab(session)
+        if dom_session is not None:
+            _close_api_tab(dom_session)
     if output_path:
         _atomic_write_json(output_path, results)
     save_pending_ids(output_path, pending)
