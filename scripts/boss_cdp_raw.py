@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.17.0"
+__version__ = "2.17.1"
 
 import argparse
 import base64
@@ -127,6 +127,9 @@ DOM_BLOCK_ASSETS_ENABLED = False
 DOM_BLOCK_URL_PATTERNS = [
     "*.mp4", "*.webm", "*.mp3", "*.ogg", "*.wav",
     "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
+    # 追踪/监控上报（#67：详情页资源审计实测——每页约 11 个纯追踪请求，
+    # 拦掉零内容风险；未知第一方端点 t/shink 不动）
+    "*hm.baidu.com*", "*apm-fe.zhipin.com*", "*logapi.zhipin.com*",
 ]
 
 # API 基础路径（便于统一修改）
