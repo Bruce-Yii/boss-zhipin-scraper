@@ -1,5 +1,11 @@
 # Changelog
 
+## v2.16.4 (2026-09-23)
+
+### 修复（真机实测发现 / #58）
+- **tab 预算计数按通道区分**：worker 返回值统一新增 `channel` 字段（`api`/`encrypt`/`dom`/`panel`）；`api_session[3]` 仅计 API/encrypt 通道成功——此前 DOM 兜底成功也计数，每 4 岗触发一次无谓轮换（新 tab + 搜索页导航 4-8s）。串行与并发路径同修。
+- **encrypt 兜底连续未命中自动停试**：auto 通道下 encrypt 连续 3 次 invalid_params（判定：`id_mode=encrypt` 且最终 `channel=dom`）→ 本 run 内停试，后续缺凭证岗位直接走 DOM（真机实测 0/6 命中，每岗白付 1 XHR + 节律等待）。强制 `--detail-channel encrypt` 不受影响。
+
 ## v2.16.3 (2026-09-23)
 
 ### 新增（DOM 链路优化 · 优化点 A 准备 / #55）
