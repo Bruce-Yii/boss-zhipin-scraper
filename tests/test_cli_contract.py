@@ -89,6 +89,17 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("--dom-block-assets", r.stdout)
 
+    def test_help_documents_dom_gap_flag(self):
+        """--dom-gap 出现在 --help（#55 间隔实验旋钮，默认 4,9 不变）。"""
+        r = self._run("--help")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--dom-gap", r.stdout)
+
+    def test_invalid_dom_gap_exits_2(self):
+        """--dom-gap 违反约束（MIN>MAX）→ exit 2（CLI 误用语义）。"""
+        r = self._run("--dom-gap", "6,3")
+        self.assertEqual(r.returncode, 2)
+
     def test_help_documents_detail_channel_flag(self):
         """--detail-channel 出现在 --help（含 panel 右面板，上游 #84）。"""
         r = self._run("--help")

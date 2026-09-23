@@ -3942,6 +3942,36 @@ class ChromeSetupTests(unittest.TestCase):
         sent = [c[0][0] for c in ws.send.call_args_list]
         self.assertNotIn("Network.setBlockedURLs", sent)
 
+    def test_parse_dom_gap_valid(self):
+        """--dom-gap 解析（#55）：合法值 → (min, max) 浮点对。"""
+        module = load_module()
+        self.assertEqual(module.parse_dom_gap("3,6"), (3.0, 6.0))
+        self.assertEqual(module.parse_dom_gap("4.5,9"), (4.5, 9.0))
+        self.assertEqual(module.parse_dom_gap("2,4"), (2.0, 4.0))
+
+    def test_parse_dom_gap_invalid(self):
+        """--dom-gap 解析（#55）：格式/约束非法 → ValueError。"""
+        module = load_module()
+        for bad in ("abc", "3", "6,3", "0,5", "3,200", "1,2,3", ""):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    module.parse_dom_gap(bad)
+
+    def test_run_cli_dom_gap_overrides_module_constant(self):
+        """--dom-gap 接线（#55）：run_cli 覆盖模块常量（串行 DOM/面板共用）。"""
+        module = load_module()
+        with mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--dom-gap", "3,6", "--status",
+        ]), \
+                mock.patch.object(module, "run_status",
+                                  side_effect=SystemExit(0)) as status_mock, \
+                mock.patch.object(module, "cleanup_stale_tmp_files"), \
+                mock.patch.object(module, "cleanup_security_sidecars"):
+            with self.assertRaises(SystemExit):
+                module.run_cli()
+        status_mock.assert_called_once()
+        self.assertEqual(module.DETAIL_DOM_GAP_SECONDS, (3.0, 6.0))
+
     def test_parse_detail_api_value_ok(self):
         """详情 API 解析：正常返回 → jd 规范化 + 精简字段集；全角空格清理。"""
         module = load_module()
