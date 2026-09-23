@@ -2607,6 +2607,35 @@ class ChromeSetupTests(unittest.TestCase):
         dom_base = limiter_cls.call_args.kwargs.get("base_rate")
         self.assertAlmostEqual(dom_base, 1.0, msg="DOM 路径基线保持 concurrency*0.5")
 
+    def test_parallel_initial_submissions_are_staggered(self):
+        """#71：首波 window 次提交逐个间隔（削 thundering herd），之后不再补。"""
+        module = load_module()
+        jobs = self._sample_jobs(6)["jobs"]
+        submitted = []
+
+        def fake_one(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                    security_id=None, api_session=None, city_code="",
+                    search_keyword=""):
+            submitted.append(job["job_id"])
+            return {"ok": True, "detail": {"job_id": job["job_id"], "jd": "x"},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "dom"}
+
+        with mock.patch.object(module, "_scrape_one_detail", new=fake_one), \
+                mock.patch.object(module, "AdaptiveRateLimiter"), \
+                mock.patch.object(module, "load_existing_detail_ids",
+                                  return_value=set()), \
+                mock.patch.object(module, "load_pending_ids",
+                                  return_value=set()), \
+                mock.patch.object(module.time, "sleep") as sleep_mock:
+            module._scrape_details_parallel(
+                jobs, cdp_port=9222, concurrency=2)
+        staggers = [c for c in sleep_mock.call_args_list
+                    if c == mock.call(module.PARALLEL_START_STAGGER_SECONDS)]
+        # window = concurrency*2 = 4：首波 4 次提交各间隔一次，后续补提交不再间隔
+        self.assertEqual(len(staggers), 4)
+        self.assertEqual(len(submitted), 6)
+
     def test_parallel_api_channel_rotates_tab_on_budget(self):
         """预算轮换：同一 tab 达 DETAIL_API_TAB_BUDGET 次后自动换新 tab（支撑批量）。"""
         module = load_module()

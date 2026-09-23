@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.17.2"
+__version__ = "2.17.3"
 
 import argparse
 import base64
@@ -1284,6 +1284,9 @@ SCROLL_BOTTOM_JS = """
 
 # 右面板 JD 通道（专题 §1.4 / 上游 #84）：面板就绪等待上限（秒）
 PANEL_READY_TIMEOUT = 10.0
+# 并发首波提交间隔（秒，#71）：初始 window 个任务逐个间隔提交，削冷缓存
+# thundering herd；稳态靠任务时长差异自然去同步，不受影响
+PARALLEL_START_STAGGER_SECONDS = 1.0
 # encrypt 兜底连续未命中停试阈值（#58；真机实测 invalid_params 概率高时
 # 每岗白付 1 XHR + 节律等待，3 次足够判定）
 ENCRYPT_MISS_DISABLE_THRESHOLD = 3
@@ -5132,6 +5135,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         todo_iter = iter(todo)
         total = len(todo)
         in_flight = set()
+        submitted_total = 0
 
         def run_one(job):
             job_id = job.get("job_id", "")
@@ -5164,6 +5168,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     api_pool.put(session)  # 归还池（下次任务复用/轮换后的 tab）
 
         def fill_window():
+            nonlocal submitted_total
             while len(in_flight) < window:
                 if stop_event.is_set():
                     return
@@ -5175,6 +5180,12 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     job = next(todo_iter)
                 except StopIteration:
                     return
+                if submitted_total < window:
+                    # 首波错峰（#71）：初始 window 个任务逐个间隔提交，避免 N 个
+                    # worker 同时导航（冷缓存 thundering herd）；主线程在初始
+                    # 填充期 sleep 无害（尚无结果可处理），之后自然去同步
+                    time.sleep(PARALLEL_START_STAGGER_SECONDS)
+                submitted_total += 1
                 # 与串行路径一致：每个提交的详情计入全局请求预算（500 上限）
                 incr_request("detail")
                 in_flight.add(pool.submit(run_one, job))

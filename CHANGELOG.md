@@ -1,5 +1,10 @@
 # Changelog
 
+## v2.17.3 (2026-09-23)
+
+### 优化（并发首波错峰 / #71）
+- `_scrape_details_parallel` 初始 `window`（=并发×2）次提交逐个间隔 `PARALLEL_START_STAGGER_SECONDS`（1.0s）：削冷缓存 thundering herd（N worker 同时导航）；主线程初始填充期 sleep 无害；稳态靠任务时长差异自然去同步，不受影响。API/DOM 并发路径共用。
+
 ## v2.17.2 (2026-09-23)
 
 ### 健壮性（点击验证专题 §4 落地 / #69）
