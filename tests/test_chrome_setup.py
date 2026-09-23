@@ -5940,6 +5940,67 @@ class PanelJdTests(unittest.TestCase):
         self.assertEqual(r["reason"], "invalid_detail")
         self.assertIn("过短", r["message"])
 
+    def test_panel_city_code_resolved_from_city_name(self):
+        """#75：--input 无 city_code → 从 city 名解析（否则停靠页无城市筛选）。"""
+        module = load_module()
+        opened = {}
+
+        def fake_open_api_tab(cdp_port, keyword, city_code):
+            opened["city_code"] = city_code
+            return None  # 早退，避免后续流程
+
+        with mock.patch.object(module, "_open_api_tab",
+                               side_effect=fake_open_api_tab), \
+                mock.patch.object(module, "resolve_city",
+                                  return_value=("北京", "101010100")):
+            module._scrape_details_via_panel(
+                [], {"keyword": "AI", "city": "北京"}, "out.json", 9222, "json")
+        self.assertEqual(opened["city_code"], "101010100")
+
+    def test_panel_miss_falls_back_to_dom(self):
+        """#75：面板未命中 → 自动回退 DOM（降级链 API→panel→DOM）。"""
+        module = load_module()
+        jobs = [{"job_id": "j1", "title": "T1",
+                 "job_link": "https://www.zhipin.com/job_detail/e1.html"}]
+        calls = {"dom": 0}
+
+        def fake_panel(job, ws, sid):
+            return {"ok": False, "detail": None, "job_id": job["job_id"],
+                    "reason": "invalid_detail", "message": "no match",
+                    "channel": "panel"}
+
+        def fake_dom(job, cdp_port, stop_event=None, limiter=None, verbose=False,
+                     security_id=None, api_session=None, city_code="",
+                     search_keyword="", id_mode="security", dom_session=None):
+            calls["dom"] += 1
+            return {"ok": True, "detail": {"job_id": job["job_id"],
+                                           "jd": "x" * 200},
+                    "job_id": job["job_id"], "reason": "", "message": "",
+                    "channel": "dom"}
+
+        session = [mock.Mock(), "t", "s", 0]
+        dom_tab = [mock.Mock(), "dt", "ds", 0]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.json")
+            with mock.patch.object(module, "_open_api_tab",
+                                   return_value=session), \
+                    mock.patch.object(module, "_open_dom_tab",
+                                      return_value=dom_tab), \
+                    mock.patch.object(module, "_scrape_one_detail_via_panel",
+                                      new=fake_panel), \
+                    mock.patch.object(module, "_scrape_one_detail", new=fake_dom), \
+                    mock.patch.object(module, "_close_api_tab"), \
+                    mock.patch.object(module, "resolve_city",
+                                      return_value=("北京", "101010100")), \
+                    mock.patch.object(module, "load_existing_detail_ids",
+                                      return_value=set()), \
+                    mock.patch.object(module.time, "sleep"):
+                r = module._scrape_details_via_panel(
+                    jobs, {"keyword": "AI", "city": "北京"}, out, 9222, "json")
+        self.assertEqual(calls["dom"], 1, "面板 miss 应回退 DOM 一次")
+        self.assertEqual(len(r), 1)
+        self.assertTrue(r[0].get("jd"))
+
 
 class MultiKeywordTests(unittest.TestCase):
     """§4.1 多关键词 CLI：`--keyword` 拆词 + 列表结果按 job_id 合并。"""
