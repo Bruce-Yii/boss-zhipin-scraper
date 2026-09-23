@@ -4004,6 +4004,10 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertIn("*.woff2", patterns)
         self.assertNotIn("*.png", patterns, "不得拦截图片（行为指纹）")
         self.assertNotIn("*.jpg", patterns, "不得拦截图片（行为指纹）")
+        # #67：追踪域拦截（资源审计实测约 11 个/页，零内容风险）
+        self.assertIn("*hm.baidu.com*", patterns)
+        self.assertIn("*apm-fe.zhipin.com*", patterns)
+        self.assertIn("*logapi.zhipin.com*", patterns)
 
     def test_apply_asset_blocking_best_effort(self):
         """资源拦截（#53）：CDP 失败仅记日志返回 False，不抛异常。"""
