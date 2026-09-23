@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.16.4"
+__version__ = "2.16.5"
 
 import argparse
 import base64
@@ -1263,9 +1263,11 @@ PANEL_READY_TIMEOUT = 10.0
 # 每岗白付 1 XHR + 节律等待，3 次足够判定）
 ENCRYPT_MISS_DISABLE_THRESHOLD = 3
 # 点击搜索页上指定岗位卡片（优先按 encryptJobId/链接匹配，退化按标题文本）
+# #57：标题可能截断，按标题前 12 字做前缀兜底匹配（列表卡常截断带…）
 CLICK_CARD_JS = r"""
 (function(){
     var key = __KEY__, title = __TITLE__;
+    var t12 = title ? title.substring(0, 12) : '';
     var links = document.querySelectorAll('a.job-name, .job-card-box a, a[href*="/job_detail/"]');
     for (var i = 0; i < links.length; i++) {
         var h = links[i].getAttribute('href') || links[i].href || '';
@@ -1273,11 +1275,70 @@ CLICK_CARD_JS = r"""
     }
     var cards = document.querySelectorAll('li.job-card-box, .job-card-wrap');
     for (var j = 0; j < cards.length; j++) {
-        if (title && (cards[j].innerText || '').indexOf(title) !== -1) { cards[j].click(); return true; }
+        var ct = (cards[j].innerText || '').replace(/\s+/g, ' ');
+        if ((title && ct.indexOf(title) !== -1) || (t12 && ct.indexOf(t12) !== -1)) { cards[j].click(); return true; }
     }
     return false;
 })()
 """
+
+# 右面板"目标岗位"状态探测（#57：面板存在≠内容正确，必须等面板切换到目标岗位）
+# 返回 {ready, title_ok, comp_ok, jd_len, head}——head 为面板文本前 120 字（去空白），
+# 用于"内容指纹变化"兜底（标题/公司名格式漂移时仍能检测点击是否生效）。
+PANEL_JOB_STATE_JS = r"""
+(function(){
+    var t = __TITLE__, c = __COMPANY__;
+    var panel = document.querySelector('.job-detail-box');
+    var sec = document.querySelector('.job-detail-section, .job-sec, .job-detail-body, .job-sec-text');
+    if (!sec) { return JSON.stringify({ready: false}); }
+    var text = ((panel && panel.innerText) || sec.innerText || '');
+    return JSON.stringify({
+        ready: true,
+        title_ok: !t || text.indexOf(t) !== -1,
+        comp_ok: !c || text.indexOf(c) !== -1,
+        jd_len: (sec.innerText || '').length,
+        head: text.replace(/\s+/g, ' ').substring(0, 120)
+    });
+})()
+"""
+
+
+def _wait_for_panel_job(ws, sid, title="", company="", snapshot_head="",
+                        timeout=None, poll=0.4):
+    """等待右面板内容切换到目标岗位（#57）。
+
+    判定：面板就绪（JD 区存在且 ≥80 字）**且**（标题与 company 同时命中，
+    或面板文本指纹相对点击前快照发生变化——格式漂移时的兜底）。
+    超时/异常返回 False（上层按 invalid_detail 处理，回退语义保守）。
+    """
+    timeout = timeout if timeout is not None else PANEL_READY_TIMEOUT
+    js = (PANEL_JOB_STATE_JS.replace("__TITLE__", json.dumps(str(title or "")[:24]))
+          .replace("__COMPANY__", json.dumps(str(company or "")[:24])))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            val = ws.eval_js(js, sid)
+            state = json.loads(val) if isinstance(val, str) else {}
+        except _cdp_exception_types():
+            return False
+        if (state.get("ready") and state.get("jd_len", 0) >= 80
+                and ((state.get("title_ok") and state.get("comp_ok"))
+                     or state.get("head") != snapshot_head)):
+            return True
+        time.sleep(poll)
+    return False
+
+
+def _panel_job_head(ws, sid, title=""):
+    """点击前读取右面板文本指纹（空面板返回 ""）。"""
+    try:
+        val = ws.eval_js(
+            PANEL_JOB_STATE_JS.replace("__TITLE__", json.dumps(str(title or "")[:24]))
+            .replace("__COMPANY__", '""'), sid)
+        state = json.loads(val) if isinstance(val, str) else {}
+        return state.get("head", "") if state.get("ready") else ""
+    except _cdp_exception_types():
+        return ""
 
 
 def _normalize_detail_whitespace(text):
@@ -4698,20 +4759,26 @@ def _scrape_one_detail_via_panel(job, ws, sid):
     job_id = job.get("job_id", "")
     key = str(job.get("encrypt_job_id") or job.get("job_link") or "")
     title = str(job.get("title") or "")
+    company = str(job.get("boss_name") or "")
     if not key and not title:
         return {"ok": False, "detail": None, "job_id": job_id,
                 "reason": "invalid_detail", "message": "缺少定位卡片的关键字",
                 "channel": "panel"}
     try:
+        # #57：点击前记录面板文本指纹——面板"存在"不等于"内容已切到目标岗位"
+        # （初始首卡面板本就有内容，旧逻辑立即通过 → 读到旧面板）
+        snapshot_head = _panel_job_head(ws, sid, title)
         js = (CLICK_CARD_JS.replace("__KEY__", json.dumps(key))
               .replace("__TITLE__", json.dumps(title)))
         if not ws.eval_js(js, sid):
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail", "message": "搜索页未找到该岗位卡片",
                     "channel": "panel"}
-        if not _wait_for_detail_ready(ws, sid, timeout=PANEL_READY_TIMEOUT):
+        if not _wait_for_panel_job(ws, sid, title=title, company=company,
+                                   snapshot_head=snapshot_head):
             return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "invalid_detail", "message": "右面板未就绪",
+                    "reason": "invalid_detail",
+                    "message": "右面板未切换到目标岗位（内容仍为上一岗位）",
                     "channel": "panel"}
         _dismiss_dialogs(ws, sid)
         val = ws.eval_js(EXTRACT_DETAIL_JS, sid)

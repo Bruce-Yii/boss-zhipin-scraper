@@ -5469,15 +5469,24 @@ class PanelJdTests(unittest.TestCase):
         self.assertIn("__KEY__", module.CLICK_CARD_JS)
         self.assertIn("__TITLE__", module.CLICK_CARD_JS)
         self.assertIn(".click()", module.CLICK_CARD_JS)
+        # #57：长标题截断时按前 12 字前缀匹配
+        self.assertIn("substring(0, 12)", module.CLICK_CARD_JS)
 
     def test_panel_detail_success(self):
         module = load_module()
         ws = mock.Mock()
         long_jd = "负责 AI 产品规划、需求分析和跨团队项目推进。\n" * 8
-        # 顺序：点卡片(True) → 就绪(True) → 清弹窗(True) → 抽取(JSON)
-        ws.eval_js.side_effect = [True, True, True,
-                                  json.dumps({"jd": long_jd, "tags": [],
-                                              "page_text": "", "url": ""})]
+        # #57 新调用序列：快照 → 点击 → 身份等待 → 清弹窗 → 抽取
+        state = json.dumps({"ready": True, "title_ok": True, "comp_ok": True,
+                           "jd_len": 200, "head": "PANEL-HDR"})
+        ws.eval_js.side_effect = [
+            json.dumps({"ready": False}),  # 点击前快照（无面板）
+            True,                          # 点击卡片
+            state,                         # 面板身份等待（标题+公司命中）
+            True,                          # 清弹窗
+            json.dumps({"jd": long_jd, "tags": [],
+                        "page_text": "", "url": ""}),
+        ]
         with mock.patch.object(module.time, "sleep"):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertTrue(r["ok"])
@@ -5493,13 +5502,55 @@ class PanelJdTests(unittest.TestCase):
         self.assertIn("未找到", r["message"])
 
     def test_panel_detail_not_ready(self):
+        """#57：面板存在但内容未切到目标岗位 → invalid_detail（旧 bug：读旧面板）。"""
         module = load_module()
         ws = mock.Mock()
-        ws.eval_js.return_value = True  # 点击成功，但就绪轮询一直 False
+        # 超时 0：等待循环不执行 → 仅快照+点击被消费
+        ws.eval_js.side_effect = [
+            json.dumps({"ready": True, "title_ok": False, "comp_ok": False,
+                        "jd_len": 300, "head": "STALE"}),  # 快照：旧面板指纹
+            True,  # 点击
+        ]
         with mock.patch.object(module, "PANEL_READY_TIMEOUT", 0.0):
             r = module._scrape_one_detail_via_panel(self._job(), ws, "s")
         self.assertFalse(r["ok"])
-        self.assertIn("未就绪", r["message"])
+        self.assertEqual(r["reason"], "invalid_detail")
+        self.assertIn("未切换到目标岗位", r["message"])
+
+    def test_wait_for_panel_job_accepts_identity_match(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"ready": True, "title_ok": True, "comp_ok": True,
+             "jd_len": 200, "head": "HDR"})
+        self.assertTrue(module._wait_for_panel_job(
+            ws, "s", title="AI产品经理", company="C", snapshot_head="OLD"))
+
+    def test_wait_for_panel_job_head_change_fallback(self):
+        """#57：标题匹配失败时，面板指纹变化（点击生效）也放行。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"ready": True, "title_ok": False, "comp_ok": False,
+             "jd_len": 200, "head": "NEW-JD"})
+        self.assertTrue(module._wait_for_panel_job(
+            ws, "s", snapshot_head="OLD-JD"))
+
+    def test_wait_for_panel_job_times_out_without_change(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.return_value = json.dumps(
+            {"ready": True, "title_ok": False, "comp_ok": False,
+             "jd_len": 200, "head": "SAME"})
+        with mock.patch.object(module, "PANEL_READY_TIMEOUT", 0.0):
+            self.assertFalse(module._wait_for_panel_job(
+                ws, "s", snapshot_head="SAME"))
+
+    def test_wait_for_panel_job_cdp_exception_returns_false(self):
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js.side_effect = TimeoutError("cdp died")
+        self.assertFalse(module._wait_for_panel_job(ws, "s"))
 
 
 class MultiKeywordTests(unittest.TestCase):
