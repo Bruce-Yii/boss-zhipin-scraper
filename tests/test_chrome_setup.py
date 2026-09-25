@@ -1217,6 +1217,143 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertNotIn("accessToken", cleaned["items"][0])
         self.assertEqual(cleaned["items"][1]["author"], "keep")
 
+    def test_export_csv_sinks_sanitize_credentials_and_url_queries(self):
+        """CSV 是独立导出边界，不能绕过 JSON 清洗。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            csv_path = paths["cdp_profile"] / "jobs.csv"
+            module.write_csv(str(csv_path), [{
+                "job_id": "a", "title": "A", "location": "上海",
+                "job_link": ("https://www.zhipin.com/job_detail/a.html"
+                             "?securityId=list-secret&foo=ok"),
+                "company_name": "C", "welfare": "cookie=csv-secret",
+            }])
+            text = csv_path.read_text(encoding="utf-8-sig")
+            self.assertNotIn("list-secret", text)
+            self.assertNotIn("csv-secret", text)
+            self.assertIn("foo=ok", text)
+
+            detail_csv = paths["cdp_profile"] / "details.csv"
+            module.write_detail_csv(str(detail_csv), [{
+                "job_id": "a", "title": "A", "company": "C",
+                "job_link": "https://www.zhipin.com/job_detail/a.html?wt2=detail-secret",
+                "jd": "token=detail-text-secret",
+            }])
+            detail_text = detail_csv.read_text(encoding="utf-8-sig")
+            self.assertNotIn("detail-secret", detail_text)
+            self.assertNotIn("detail-text-secret", detail_text)
+
+    def test_detail_json_sink_sanitizes_preloaded_results(self):
+        """详情 JSON 的渐进/最终写盘也不能落原始 securityId 或敏感 URL。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            output = str(paths["cdp_profile"] / "boss_details_test.json")
+            detail = {
+                "job_id": "a", "title": "A",
+                "job_link": "https://x/a?securityId=detail-query-secret",
+                "security_id": "detail-security-secret",
+                "jd": "岗位职责",
+            }
+            module.scrape_details(
+                {"jobs": []}, output_path=output,
+                preloaded_details=[detail], detail_channel="dom")
+            text = pathlib.Path(output).read_text(encoding="utf-8")
+            self.assertNotIn("detail-security-secret", text)
+            self.assertNotIn("detail-query-secret", text)
+            self.assertNotIn("security_id", text)
+
+    def test_sanitize_url_removes_fragment_and_nested_credentials(self):
+        """URL fragment 与 redirect 值中的嵌套凭据必须清掉。"""
+        module = load_module()
+        cleaned = module._sanitize_payload({
+            "job_link": (
+                "https://x.test/job?foo=1#access_token=fragment-secret"),
+            "links": [
+                "https://x.test/job?next=https%3A%2F%2Fx.test%2F%3Fwt2%3Dnested-secret",
+            ],
+        })
+        text = json.dumps(cleaned, ensure_ascii=False)
+        self.assertNotIn("fragment-secret", text)
+        self.assertNotIn("nested-secret", text)
+        self.assertIn("foo=1", text)
+
+    def test_flush_jobs_ignores_malformed_legacy_metadata(self):
+        """损坏旧文件/record_counts/jobs 结构应安全降级，不阻断新写盘。"""
+        module = load_module()
+        valid = {
+            "job_id": "a", "title": "A", "location": "上海",
+            "job_link": "https://www.zhipin.com/job_detail/a.html",
+            "company_name": "C",
+        }
+        with tempfile_profile() as paths:
+            for index, raw in enumerate((
+                    "[]", '{"jobs": null}', '{"jobs": [], "record_counts": ["bad"]}')):
+                with self.subTest(raw=raw):
+                    target = paths["cdp_profile"] / f"legacy-{index}.json"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(raw, encoding="utf-8")
+                    module.flush_jobs(str(target), {"keyword": "AI"}, [valid])
+                    data = json.loads(target.read_text(encoding="utf-8"))
+                    self.assertEqual(data["job_count"], 1)
+
+    def test_flush_jobs_deduplicates_same_batch_and_marks_conflicts(self):
+        """同批次重复 ID 不应虚增 new；不同 payload 应进入 quarantine。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            base = {
+                "job_id": "same", "location": "上海",
+                "job_link": "https://www.zhipin.com/job_detail/same.html",
+                "company_name": "C",
+            }
+            module.flush_jobs(target, {"keyword": "AI"}, [
+                {**base, "title": "first"},
+                {**base, "title": "second"},
+            ])
+            data = json.loads(pathlib.Path(target).read_text(encoding="utf-8"))
+            self.assertEqual(data["record_counts"]["new"], 1)
+            self.assertEqual(data["record_counts"]["duplicate"], 1)
+            self.assertEqual(data["job_count"], 1)
+            self.assertTrue(any(item.get("reason") == "key_conflict"
+                                for item in data.get("quarantine", [])))
+
+    def test_flush_jobs_quarantines_container_job_id(self):
+        """列表/字典 job_id 不可哈希时必须进入 quarantine，而非崩溃。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            module.flush_jobs(target, {"keyword": "AI"}, [{
+                "job_id": ["bad"], "title": "A", "location": "上海",
+                "job_link": "https://www.zhipin.com/job_detail/a.html",
+                "company_name": "C",
+            }])
+            data = json.loads(pathlib.Path(target).read_text(encoding="utf-8"))
+            self.assertEqual(data["job_count"], 0)
+            self.assertTrue(any("job_id" in item.get("reason", "")
+                                for item in data["quarantine"]))
+
+    def test_flush_jobs_does_not_conflict_on_legacy_sensitive_only_fields(self):
+        """旧文件多出的凭据字段清洗后，不应制造 key_conflict。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = paths["cdp_profile"] / "jobs.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps({
+                "jobs": [{
+                    "job_id": "a", "title": "A", "location": "上海",
+                    "job_link": "https://www.zhipin.com/job_detail/a.html",
+                    "company_name": "C", "wt2": "legacy-secret",
+                }],
+            }), encoding="utf-8")
+            module.flush_jobs(str(target), {"keyword": "AI"}, [{
+                "job_id": "a", "title": "A", "location": "上海",
+                "job_link": "https://www.zhipin.com/job_detail/a.html",
+                "company_name": "C",
+            }])
+            data = json.loads(target.read_text(encoding="utf-8"))
+            self.assertFalse(any(item.get("reason") == "key_conflict"
+                                 for item in data.get("quarantine", [])))
+
     def test_flush_jobs_handles_non_dict_records_without_traceback(self):
         """非 dict 记录应进入 quarantine，不得触发 AttributeError。"""
         module = load_module()
@@ -1881,7 +2018,7 @@ class ChromeSetupTests(unittest.TestCase):
                              "https://www.zhipin.com/job_detail/x.html",
                              "job_link 是公开信息保留")
 
-    # ----- 双端契约一致校验（消费端校验器 vendor 副本 v2.0.0）-----
+    # ----- 双端契约一致校验（消费端校验器 vendor 副本 v2.1.0）-----
 
     CONSUMER_VALIDATOR = (
         pathlib.Path(__file__).resolve().parents[0]
@@ -1898,7 +2035,7 @@ class ChromeSetupTests(unittest.TestCase):
                         "契约样例 fixture 缺失")
 
     def test_vendor_validator_passes_contract_fixture(self):
-        """双端一致：消费端校验器（vendor 副本 v2.0.0）须通过我方契约样例，
+        """双端一致：消费端校验器（vendor 副本 v2.1.0）须通过我方契约样例，
         且输出行含 v2.0.0（版本漂移即失败，触发与 ai-pm-job-intel 对齐）。"""
         result = subprocess.run(
             [sys.executable, str(self.CONSUMER_VALIDATOR), str(self.CONTRACT_FIXTURE)],
@@ -1906,7 +2043,7 @@ class ChromeSetupTests(unittest.TestCase):
         )
         out = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, f"校验器退出码非 0:\n{out}")
-        self.assertIn("validator=v2.0.0", out,
+        self.assertIn("validator=v2.1.0", out,
                       f"校验器版本不匹配（需与 ai-pm-job-intel 对齐）:\n{out}")
         self.assertIn("ok=True", out, f"样例未通过消费端契约校验:\n{out}")
 
@@ -3115,8 +3252,8 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module, "AdaptiveRateLimiter") as limiter_cls, \
                     mock.patch.object(module, "_open_dom_tab",
                                       return_value=[mock.Mock(), "t", "s", 0]), \
-                    mock.patch.object(module, "_atomic_write_json",
-                                      wraps=module._atomic_write_json) as atomic, \
+                    mock.patch.object(module, "_atomic_write_export_json",
+                                      wraps=module._atomic_write_export_json) as atomic, \
                     mock.patch.object(module, "load_existing_detail_ids",
                                       return_value=set()), \
  mock.patch.object(module, "_open_dom_tab",

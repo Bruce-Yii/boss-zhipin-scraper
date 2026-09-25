@@ -7,7 +7,7 @@
 # 同步约定（契约变更时）:
 #   1. ai-pm-job-intel 递增 VALIDATOR_VERSION 并交付最新两份文件（contract_check.py + validate_export.py）
 #   2. 同步替换本目录两份文件（tests/fixtures/consumer_validator/）
-#   3. CI 断言 validator=v2.0.0 版本匹配，漂移即红（触发双端对齐）
+#   3. CI 断言 validator=v2.1.0 版本匹配，漂移即红（触发双端对齐）
 #   4. 全量回归依据（私有仓不可直接引用，vendor 副本保证 CI 双端一致校验，无逻辑改动）
 # ---------------------------------------------------------------------------
 #!/usr/bin/env python

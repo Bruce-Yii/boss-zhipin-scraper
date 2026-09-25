@@ -73,6 +73,35 @@ class ContractValidatorTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertTrue(any("wt2" in error for error in report["errors"]))
 
+    def test_allows_ordinary_token_text_but_rejects_structured_credentials(self):
+        """validator 不应把 JD 普通文本中的 token 误报；结构化凭据字段必须拒绝。"""
+        ordinary = validator.validate_export({
+            "format_version": 2, "job_count": 1,
+            "jobs": [{**valid_job(), "jd": "负责 token 化与模型评估"}],
+        })
+        self.assertTrue(ordinary["ok"], ordinary["errors"])
+        for field, value in (
+                ("encryptJobId", "E"), ("security_map", {"a": "S"}),
+                ("secret", "S"), ("accessToken", "S"), ("lid", "L")):
+            with self.subTest(field=field):
+                report = validator.validate_export({
+                    "format_version": 2, "job_count": 1,
+                    "jobs": [{**valid_job(), field: value}],
+                })
+                self.assertFalse(report["ok"])
+                self.assertTrue(any(field.lower() in error.lower()
+                                    for error in report["errors"]), report["errors"])
+
+    def test_rejects_sensitive_url_query_and_fragment(self):
+        report = validator.validate_export({
+            "format_version": 2, "job_count": 1,
+            "jobs": [{**valid_job(), "job_link": (
+                "https://x.test/a?securityId=query-secret#access_token=fragment-secret")}],
+        })
+        self.assertFalse(report["ok"])
+        self.assertTrue(any("security" in error.lower()
+                            for error in report["errors"]), report["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()

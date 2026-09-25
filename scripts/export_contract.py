@@ -44,7 +44,9 @@ _INTERNAL_KEY_TOKENS = frozenset({
     "encrypt_boss_id", "encrypt_brand_id",
 })
 _CONTRACT_REQUIRED_FIELDS = ("job_id", "title", "location", "job_link", "company_name")
-_URL_KEY_TOKENS = frozenset({"url", "link", "job_link", "company_link"})
+_URL_KEY_TOKENS = frozenset({
+    "url", "urls", "link", "links", "job_link", "company_link", "href", "uri",
+})
 
 
 def _normalized_key(key):
@@ -72,7 +74,17 @@ def _is_url_key(key):
     if key is None:
         return False
     normalized = _normalized_key(key)
-    return normalized in _URL_KEY_TOKENS or normalized.endswith("_url") or normalized.endswith("_link")
+    return (normalized in _URL_KEY_TOKENS
+            or normalized.endswith(("_url", "_link", "_uri", "_href"))
+            or normalized.endswith(("_urls", "_links")))
+
+
+def _looks_like_url(value):
+    """判断字符串是否应进入 URL 清洗分支（不依赖字段名）。"""
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return text.startswith(("http://", "https://", "//"))
 
 
 def _scrub_secrets(text):
@@ -82,20 +94,52 @@ def _scrub_secrets(text):
     return _SECRET_KEY_PATTERN.sub(lambda m: f"{m.group(1)}=***", text)
 
 
-def _sanitize_url(value):
-    """移除 URL 查询串中的凭据和 BOSS 内部标识参数。"""
+def _query_pairs(value):
+    """解析 query/fragment 参数；格式异常时返回空列表。"""
+    try:
+        return parse_qsl((value or "").lstrip("?"), keep_blank_values=True)
+    except (TypeError, ValueError):
+        return []
+
+
+def _contains_sensitive_query(value):
+    """递归检查 URL/query 值中的敏感参数（含嵌套 redirect URL）。"""
+    if not isinstance(value, str) or not value:
+        return False
     try:
         parsed = urlsplit(value)
     except ValueError:
+        return False
+    for key, nested in _query_pairs(parsed.query):
+        if _is_sensitive_key(key) or _is_internal_key(key):
+            return True
+        if _looks_like_url(nested) and _contains_sensitive_query(nested):
+            return True
+        if _contains_sensitive_query(nested):
+            return True
+    return any(_is_sensitive_key(key) or _is_internal_key(key)
+               for key, _ in _query_pairs(parsed.fragment))
+
+
+def _sanitize_url(value):
+    """移除 URL query/fragment 中的凭据，并递归清理嵌套 URL。"""
+    try:
+        parsed = urlsplit(value)
+    except (TypeError, ValueError):
         return _scrub_secrets(value)
-    if not parsed.query:
-        return _scrub_secrets(value)
-    safe_pairs = [
-        (key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True)
-        if not _is_sensitive_key(key) and not _is_internal_key(key)
-    ]
+    safe_pairs = []
+    for key, nested in _query_pairs(parsed.query):
+        if _is_sensitive_key(key) or _is_internal_key(key):
+            continue
+        if _looks_like_url(nested):
+            nested = _sanitize_url(nested)
+        elif _contains_sensitive_query(nested):
+            # 无法安全证明的嵌套 query 参数宁可丢弃。
+            continue
+        safe_pairs.append((key, _scrub_secrets(nested)))
+    # fragment 不属于发给服务端的必要职位信息，统一丢弃以覆盖隐式 token。
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
-                       urlencode(safe_pairs), parsed.fragment))
+                       urlencode(safe_pairs), ""))
 
 
 def _sanitize_payload(value, *, key=None):
@@ -112,7 +156,7 @@ def _sanitize_payload(value, *, key=None):
     if isinstance(value, tuple):
         return tuple(_sanitize_payload(item, key=key) for item in value)
     if isinstance(value, str):
-        if _is_url_key(key):
+        if _is_url_key(key) or _looks_like_url(value):
             return _sanitize_url(value)
         return _scrub_secrets(value)
     return value
@@ -123,12 +167,27 @@ def _sanitize_job(job):
     return _sanitize_payload(job)
 
 
+def _normalized_job_id(value):
+    """返回可哈希的 job_id；容器/空值视为非法并进入 quarantine。"""
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _missing_required_fields(job):
     """返回 job 缺失的契约必填字段列表（非 dict / 空值都算缺失）。"""
     if not isinstance(job, dict):
         return list(_CONTRACT_REQUIRED_FIELDS)
-    return [f for f in _CONTRACT_REQUIRED_FIELDS
-            if not str(job.get(f) or "").strip()]
+    missing = []
+    for field in _CONTRACT_REQUIRED_FIELDS:
+        value = job.get(field)
+        if field == "job_id":
+            if _normalized_job_id(value) is None:
+                missing.append(field)
+        elif not str(value or "").strip():
+            missing.append(field)
+    return missing
 
 
 def merge_unique(existing, incoming, key="job_id", new_overrides=False):
@@ -146,19 +205,48 @@ def merge_unique(existing, incoming, key="job_id", new_overrides=False):
     if new_overrides:
         by_key = {}
         for item in existing:
-            if isinstance(item, dict) and item.get(key):
-                by_key[item.get(key)] = item
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalized_job_id(item.get(key)) if key == "job_id" else item.get(key)
+            if normalized is not None and normalized != "":
+                try:
+                    by_key[normalized] = item
+                except TypeError:
+                    continue
         for item in incoming:
-            if isinstance(item, dict) and item.get(key):
-                by_key[item.get(key)] = item
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalized_job_id(item.get(key)) if key == "job_id" else item.get(key)
+            if normalized is not None and normalized != "":
+                try:
+                    by_key[normalized] = item
+                except TypeError:
+                    continue
         return list(by_key.values())
 
-    seen = {item.get(key, "") for item in existing if isinstance(item, dict)}
+    seen = set()
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalized_job_id(item.get(key)) if key == "job_id" else item.get(key)
+        if normalized is not None and normalized != "":
+            try:
+                seen.add(normalized)
+            except TypeError:
+                continue
     merged = list(existing)
     for item in incoming:
-        if isinstance(item, dict) and item.get(key, "") not in seen:
-            seen.add(item.get(key, ""))
-            merged.append(item)
+        if not isinstance(item, dict):
+            continue
+        normalized = _normalized_job_id(item.get(key)) if key == "job_id" else item.get(key)
+        if normalized is None or normalized == "":
+            continue
+        try:
+            if normalized not in seen:
+                seen.add(normalized)
+                merged.append(item)
+        except TypeError:
+            continue
     return merged
 
 
@@ -179,6 +267,11 @@ def _atomic_write_json(path, payload):
                 os.remove(tmp_path)
             except OSError:
                 pass
+
+
+def _atomic_write_export_json(path, payload):
+    """用户可见导出统一先递归脱敏；sidecar 等内部通道不调用此 helper。"""
+    _atomic_write_json(path, _sanitize_payload(payload))
 
 
 def cleanup_stale_tmp_files(result_dir, max_age_seconds=300):
@@ -207,59 +300,106 @@ def flush_jobs(path, meta, jobs):
     血缘字段（record_counts）跨次累积：渐进写盘时每次 flush 只算当次
     new/duplicate/quarantine 增量，与旧值相加。
     """
+    if not isinstance(meta, dict):
+        meta = {}
     existing_jobs = []
     old_counts = {"new": 0, "duplicate": 0, "quarantine": 0}
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
                 old = json.load(f)
-            existing_jobs = old.get("jobs", [])
-            old_counts = old.get("record_counts") or old_counts
-        except (json.JSONDecodeError, OSError, ValueError):
+            if isinstance(old, dict):
+                raw_existing = old.get("jobs")
+                if isinstance(raw_existing, list):
+                    existing_jobs = raw_existing
+                raw_counts = old.get("record_counts")
+                if isinstance(raw_counts, dict):
+                    for name in old_counts:
+                        value = raw_counts.get(name)
+                        if type(value) is int and value >= 0:
+                            old_counts[name] = value
+        except (json.JSONDecodeError, OSError, ValueError, TypeError):
             pass
-    existing_ids = {j.get("job_id") for j in existing_jobs
-                    if isinstance(j, dict) and j.get("job_id")}
-    existing_payloads = {j.get("job_id"): j for j in existing_jobs
-                         if isinstance(j, dict) and j.get("job_id")}
-    raw_jobs = list(jobs or [])
+
+    existing_clean = [_sanitize_job(job) for job in existing_jobs]
+    existing_ids = set()
+    existing_payloads = {}
+    for job in existing_clean:
+        if not isinstance(job, dict):
+            continue
+        jid = _normalized_job_id(job.get("job_id"))
+        if jid is not None:
+            existing_ids.add(jid)
+            existing_payloads[jid] = job
+
+    if isinstance(jobs, (list, tuple)):
+        raw_jobs = list(jobs)
+    elif jobs is None:
+        raw_jobs = []
+    else:
+        raw_jobs = [jobs]
     invalid_incoming = [job for job in raw_jobs if not isinstance(job, dict)]
     incoming_dicts = [job for job in raw_jobs if isinstance(job, dict)]
-    sanitized_incoming = [_sanitize_job(j) for j in incoming_dicts]
+    sanitized_incoming = [_sanitize_job(job) for job in incoming_dicts]
 
-    # 键冲突检测：incoming 与已有同 job_id 但 payload 不同 → quarantine 记录
-    # （merge_unique 本身旧版本优先，这里把"静默覆盖"变成显式信号；
-    #  比较在 sanitize 后进行，跨 run 续抓不因敏感键差异误报）
-    incoming_ids = [j.get("job_id") for j in sanitized_incoming
-                    if isinstance(j, dict) and j.get("job_id")]
+    # 先按规范化 ID 对本次 incoming 有序去重；重复重发计入 duplicate，
+    # 不同 payload 记录为显式 key_conflict。
+    unique_incoming = []
+    incoming_by_id = {}
+    invalid_id_count = 0
+    batch_conflicts = set()
+    valid_incoming_count = 0
+    for job in sanitized_incoming:
+        jid = (_normalized_job_id(job.get("job_id"))
+               if isinstance(job, dict) else None)
+        if jid is None:
+            invalid_id_count += 1
+            continue
+        valid_incoming_count += 1
+        if jid in incoming_by_id:
+            if incoming_by_id[jid] != job:
+                batch_conflicts.add(jid)
+            continue
+        incoming_by_id[jid] = job
+        unique_incoming.append(job)
+
+    incoming_ids = list(incoming_by_id)
     new_count = sum(1 for jid in incoming_ids if jid not in existing_ids)
-    dup_count = len(incoming_ids) - new_count
+    dup_count = valid_incoming_count - new_count
 
-    merged = merge_unique(existing_jobs, incoming_dicts)
-    sanitized = [_sanitize_job(j) for j in merged]
+    merged = merge_unique(existing_clean, unique_incoming)
+    sanitized = [_sanitize_job(job) for job in merged]
     quarantine = [{
         "job_id": None,
         "reason": "record_not_object",
     } for _ in invalid_incoming]
+    if invalid_id_count:
+        quarantine.append({
+            "job_id": None,
+            "reason": f"invalid_job_id={invalid_id_count}",
+        })
+
     valid = []
-    for j in sanitized:
-        missing = _missing_required_fields(j)
+    for job in sanitized:
+        missing = _missing_required_fields(job)
         if missing:
             quarantine.append({
-                "job_id": j.get("job_id") if isinstance(j, dict) else None,
+                "job_id": job.get("job_id") if isinstance(job, dict) else None,
                 "reason": "missing_required_fields=" + ",".join(missing),
             })
         else:
-            valid.append(j)
-    key_conflicts = [jid for jid in existing_payloads
-                     if jid in incoming_ids
-                     and existing_payloads[jid] != next(
-                         (x for x in sanitized_incoming
-                          if isinstance(x, dict) and x.get("job_id") == jid), {})]
+            valid.append(job)
+
+    key_conflicts = {
+        jid for jid, old_job in existing_payloads.items()
+        if jid in incoming_by_id and old_job != incoming_by_id[jid]
+    }
+    key_conflicts.update(batch_conflicts)
     if key_conflicts:
-        log.warning("job_id 键冲突（同 ID 不同 payload，保留旧版本）: %s",
-                    key_conflicts[:5])
+        log.warning("job_id 键冲突（同 ID 不同 payload，保留首条/旧版本）: %s",
+                    sorted(key_conflicts)[:5])
         quarantine.extend({"job_id": jid, "reason": "key_conflict"}
-                           for jid in key_conflicts)
+                           for jid in sorted(key_conflicts))
 
     counts = dict(old_counts)
     counts["new"] += new_count
