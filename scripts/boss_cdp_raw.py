@@ -4316,6 +4316,7 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
         if task_detail and has_jobs:
             raw_path = list_data.get("output_path")
             list_path = raw_path if isinstance(raw_path, str) else ""
+            channel_stats = {}
             try:
                 details_result = scrape_details(
                     list_data, output_path=_detail_path_for_list(list_path),
@@ -4323,6 +4324,7 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                     list_output_path=list_path or None,
                     security_map=list_data.get("security_map"),
                     detail_channel=detail_channel,
+                    channel_stats=channel_stats,
                 )
             except Exception as e:  # 有意宽捕：详情失败不中断批量其余任务
                 failed += 1
@@ -4336,7 +4338,10 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
             if list_path and isinstance(details_result, list):
                 merged_export = _merge_jd_into_export(
                     list_path, details_result, base=list_data,
-                    keep_without_jd=keep_without_jd)
+                    keep_without_jd=keep_without_jd,
+                    extra_meta=_detail_channel_metadata(
+                        list_data, detail_channel, channel_stats,
+                        stats_supplied=True))
                 if merged_export:
                     kept, dropped = merged_export
                     print(f"  ✅ 口径一：{task['keyword']}@{task['city']} 导出 {kept} 条"
@@ -5004,11 +5009,73 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
         pass
 
 
+_DETAIL_CHANNELS = ("api", "encrypt", "dom", "panel")
+
+
+def _record_detail_channel(channel_stats, result):
+    """只按已完成岗位的实际结果累计详情通道，不把失败尝试计入。"""
+    if not isinstance(channel_stats, dict) or not isinstance(result, dict):
+        return
+    if not result.get("ok"):
+        return
+    channel = result.get("channel")
+    if channel in _DETAIL_CHANNELS:
+        channel_stats[channel] = channel_stats.get(channel, 0) + 1
+
+
+def _classify_detail_channels(channel_stats):
+    """把实际通道计数归类为单一通道或 mixed。"""
+    active = [channel for channel in _DETAIL_CHANNELS
+              if isinstance(channel_stats, dict)
+              and channel_stats.get(channel, 0) > 0]
+    if not active:
+        return "unknown"
+    return active[0] if len(active) == 1 else "mixed"
+
+
+def _detail_channel_metadata(list_data, requested_channel, channel_stats,
+                             stats_supplied=True):
+    """生成实际通道 metadata；未传 stats 的旧调用方走兼容推断。"""
+    if stats_supplied and channel_stats:
+        counts = {
+            channel: int(channel_stats.get(channel, 0))
+            for channel in _DETAIL_CHANNELS
+            if isinstance(channel_stats, dict)
+            and type(channel_stats.get(channel, 0)) is int
+            and channel_stats.get(channel, 0) > 0
+        }
+        if counts:
+            return {
+                "detail_channel": _classify_detail_channels(counts),
+                "detail_channel_counts": counts,
+            }
+
+    jobs = list_data.get("jobs", []) if isinstance(list_data, dict) else []
+    if not isinstance(jobs, list):
+        jobs = []
+    security_map = (list_data.get("security_map") or {}
+                    if isinstance(list_data, dict) else {})
+    with_sid = sum(1 for job in jobs
+                   if isinstance(job, dict) and job.get("job_id") in security_map)
+    if requested_channel in ("encrypt", "dom", "panel"):
+        channel = requested_channel
+    elif security_map and with_sid == len(jobs):
+        channel = "api"
+    elif with_sid == 0:
+        channel = "encrypt" if requested_channel == "auto" else "dom"
+    else:
+        channel = "mixed"
+    metadata = {"detail_channel": channel}
+    if stats_supplied:
+        metadata["detail_channel_counts"] = {}
+    return metadata
+
+
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
                    concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
                    security_map=None, max_seconds=None, preloaded_details=None,
-                   detail_channel="auto"):
+                   detail_channel="auto", channel_stats=None):
     """抓取详情。
 
     Args:
@@ -5020,7 +5087,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
         preloaded_details: 可选 [detail dict]——SQLite 增量层读回的历史详情
             （P4c-2 断点续抓）：并入 results 并计入 existing_ids，既免重抓，
             又保证这些岗位仍带 JD 进入本 run 导出（避免"跳过即丢 JD"）。
+        channel_stats: 可选可变 dict；按本 run 成功结果累计 api/encrypt/dom/panel。
     """
+    if channel_stats is None:
+        channel_stats = {}
+    else:
+        channel_stats.clear()
     jobs = list_data.get("jobs", [])
     if max_details:
         jobs = jobs[:max_details]
@@ -5087,7 +5159,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             jobs, list_data, output_path, cdp_port, fmt,
             existing_ids=existing_ids, pending_ids=pending,
             existing_results=results, list_output_path=list_output_path,
-            max_seconds=max_seconds)
+            max_seconds=max_seconds, channel_stats=channel_stats)
 
     # encrypt 通道目前仅串行实现（同 panel 策略）：并发请求降为串行
     if detail_channel == "encrypt" and concurrency > 1:
@@ -5107,7 +5179,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             city=list_data.get("city", ""),
             city_code=list_data.get("city_code", ""),
             max_seconds=max_seconds,
-            detail_channel=detail_channel)
+            detail_channel=detail_channel,
+            channel_stats=channel_stats)
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -5278,6 +5351,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
                                             search_keyword=detail_keyword,
                                             id_mode=job_id_mode,
                                             dom_session=dom_session)
+        _record_detail_channel(channel_stats, result)
         # tab 预算计数（#58）：仅 API/encrypt 通道的成功计入（DOM 兜底成功
         # 不占 API tab 配额——否则每 4 岗触发一次无谓轮换）
         if (result["ok"] and api_session is not None
@@ -5296,6 +5370,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         reason = result["reason"]
 
         if result["ok"]:
+            consecutive_cdp_errors = 0
             detail = result["detail"]
             results.append(detail)
             serial_ok += 1
@@ -5459,8 +5534,10 @@ def _scrape_one_detail_via_panel(job, ws, sid):
 def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
                               existing_ids=None, pending_ids=None,
                               existing_results=None, list_output_path=None,
-                              max_seconds=None):
+                              max_seconds=None, channel_stats=None):
     """右面板 JD 串行抓取：开一个停靠的真实搜索页，逐岗点卡片读面板（零新增请求）。"""
+    if channel_stats is None:
+        channel_stats = {}
     existing_ids = existing_ids if existing_ids is not None else set()
     pending = dict(pending_ids) if pending_ids is not None else {}
     results = list(existing_results) if existing_results is not None else []
@@ -5478,6 +5555,11 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             city_code = ""
     session = None
     dom_session = None
+    start_time = time.time()
+    done = ok = 0
+    panel_hit = dom_fallback = 0
+    reasons = {}
+    seen_links = set()
     try:
         try:
             session = _open_api_tab(cdp_port, keyword, city_code)
@@ -5486,15 +5568,13 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             session = None
         if session is None:
             print("⚠️  右面板通道无法建立搜索页，跳过详情")
-            return results
-        ws, sid = session[0], session[2]
+            ws = sid = None
+        else:
+            ws, sid = session[0], session[2]
         # 面板未命中时的 DOM 回退共享 tab（懒建；#75）
-        start_time = time.time()
-        done = ok = 0
-        panel_hit = dom_fallback = 0
-        reasons = {}
-        seen_links = set()
         for idx, job in enumerate(jobs):
+            if session is None:
+                break
             if max_seconds and time.time() - start_time >= max_seconds:
                 print(f"⏱️ 已达 --max-seconds={max_seconds}s 预算，优雅停止详情（已抓 {ok} 条）")
                 break
@@ -5525,11 +5605,15 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
                     search_keyword=keyword, dom_session=dom_session)
                 if result["ok"]:
                     dom_fallback += 1
+                elif result["reason"] == "cdp_session" and dom_session is not None:
+                    _close_api_tab(dom_session)
+                    dom_session = None
             else:
                 if result["ok"]:
                     panel_hit += 1
             done += 1
             if result["ok"]:
+                _record_detail_channel(channel_stats, result)
                 results.append(result["detail"])
                 ok += 1
                 if job_id:
@@ -5540,15 +5624,32 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             elif result["reason"] == "risk_timeout":
                 reasons["risk_timeout"] = reasons.get("risk_timeout", 0) + 1
                 print(f"  ⚠️ {result['message']}")
+                if output_path:
+                    save_pending_ids(output_path, pending)
                 _note_detail_risk_blocked(list_output_path,
                                           city_name=list_data.get("city", ""),
                                           keyword=keyword)
+                break
+            elif (result["reason"] == "cdp_session"
+                  and result.get("channel") == "panel"):
+                # panel 依赖单一停靠 WS；死亡后保守停止点击并落 pending，
+                # 不把它伪装成可继续的普通 DOM 失败，也不凑满三次再停。
+                reasons["cdp_session"] = reasons.get("cdp_session", 0) + 1
+                print(f"  ⚠️ {result['message']}；面板会话已失效，停止后续点击")
+                if job_id:
+                    pending[job_id] = pending.get(job_id, 0) + 1
+                if output_path:
+                    save_pending_ids(output_path, pending)
+                _close_api_tab(session)
+                session = None
                 break
             else:
                 reasons[result["reason"]] = reasons.get(result["reason"], 0) + 1
                 print(f"  ⏭️ {result['message']}")
                 if result["reason"] == "cdp_session" and job_id:
                     pending[job_id] = pending.get(job_id, 0) + 1
+                    if output_path:
+                        save_pending_ids(output_path, pending)
             # 面板零新增请求（同页内点击），仅轻度节奏间隔
             if idx + 1 < len(jobs):
                 time.sleep(random.uniform(*DETAIL_DOM_GAP_SECONDS))
@@ -5585,7 +5686,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              write_every=5, list_output_path=None,
                              keyword="", city="", security_map=None,
                              city_code="", max_seconds=None,
-                             detail_channel="dom"):
+                             detail_channel="dom", channel_stats=None):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -5601,11 +5702,14 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         write_every: 渐进写盘间隔（条数）
         security_map: 详情 API 通道凭据（{job_id: securityId}）；为 None 走 DOM 渲染
         city_code: 城市码（详情 API 参数）
+        channel_stats: 可选可变 dict；仅主线程累计成功结果的最终通道。
 
     Returns:
         (results, pending): results 为全量详情（含 existing_results）；
             pending 为待重试 job_id 集合
     """
+    if channel_stats is None:
+        channel_stats = {}
     existing_ids = existing_ids if existing_ids is not None else set()
     pending = dict(pending_ids) if pending_ids is not None else {}
     if limiter is None:
@@ -5656,13 +5760,18 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         nonlocal consecutive_cdp_errors
         job_id = job.get("job_id", "")
         if result["ok"]:
+            _record_detail_channel(channel_stats, result)
+            consecutive_cdp_errors = 0
             limiter.record_success()
             results.append(result["detail"])
             if job_id:
                 pending.pop(job_id, None)
             return
-        limiter.record_failure()
         reason = result["reason"]
+        if reason in ("invalid_detail", "stopped"):
+            # 停止信号不是岗位失败，不应污染 pending 或触发失败降速。
+            return
+        limiter.record_failure()
         if reason == "login_required":
             stop_event.set()
         elif reason == "risk_timeout":
@@ -5679,9 +5788,6 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             if consecutive_cdp_errors >= MAX_CDP_CONSECUTIVE_ERRORS:
                 stop_event.set()
                 mark_cdp_cooldown()  # 熔断冷却：防"熔断→立即重启→再熔断"循环
-        if reason == "invalid_detail":
-            # 解析类失败（页面结构变了等）：重试纯浪费且掩盖结构漂移信号，不进 pending
-            return
         if job_id:
             pending[job_id] = pending.get(job_id, 0) + 1
             if output_path:
@@ -5722,6 +5828,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         todo_iter = iter(todo)
         total = len(todo)
         in_flight = set()
+        future_jobs = {}
         submitted_total = 0
 
         def run_one(job):
@@ -5818,31 +5925,41 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 submitted_total += 1
                 # 与串行路径一致：每个提交的详情计入全局请求预算（500 上限）
                 incr_request("detail")
-                in_flight.add(pool.submit(run_one, job))
+                future = pool.submit(run_one, job)
+                in_flight.add(future)
+                future_jobs[future] = job
 
         fill_window()
         completed = 0
         parallel_ok = 0
+        parallel_stopped = 0
         parallel_reasons = {}
         while in_flight:
             done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
             for future in done:
+                job = future_jobs.pop(future, {})
                 try:
                     job, result = future.result()
                 except _cdp_exception_types() as exc:
                     result = {"ok": False, "detail": None,
-                              "job_id": "", "reason": "cdp_session",
-                              "message": str(exc)}
+                              "job_id": job.get("job_id", ""),
+                              "reason": "cdp_session", "message": str(exc)}
                 handle_result(job, result)
                 completed += 1
                 if result["ok"]:
                     parallel_ok += 1
+                elif result["reason"] == "stopped":
+                    parallel_stopped += 1
                 else:
                     reason = result["reason"] or "unknown"
                     parallel_reasons[reason] = parallel_reasons.get(reason, 0) + 1
-                mark = "✓" if result["ok"] else f"✗ {result['reason']}"
+                mark = ("✓" if result["ok"]
+                        else "⏹" if result["reason"] == "stopped"
+                        else f"✗ {result['reason']}")
                 print(f"  [并发 {completed}/{total}] {job.get('title', '')} {mark}")
-                progress = progress_line(completed, total, parallel_ok)
+                visible_completed = completed - parallel_stopped
+                progress = (progress_line(visible_completed, total, parallel_ok)
+                            if visible_completed else None)
                 if progress:
                     print(progress)
                 if output_path and completed % write_every == 0:
@@ -5854,10 +5971,11 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                     time.sleep(COOL_SECONDS)
                     print("🧊 冷却结束，继续\n")
             fill_window()
-        if completed:
+        summary_total = completed - parallel_stopped
+        if summary_total:
             print(run_summary(time.time() - start_time,
-                              completed, parallel_ok, parallel_reasons))
-            print_dom_stage_timings(completed)
+                              summary_total, parallel_ok, parallel_reasons))
+            print_dom_stage_timings(summary_total)
     finally:
         pool.shutdown(wait=True)
         # 关闭详情 API 共享会话池（**异常/崩溃也保证关闭**，防 tab 泄漏）
@@ -7254,6 +7372,7 @@ def _run_cli_impl(p, args):
 
     # 抓详情
     details = None
+    channel_stats = {}
     if args.detail and list_data.get("jobs"):
         pending_ids = None
         if args.retry_job:
@@ -7298,6 +7417,7 @@ def _run_cli_impl(p, args):
                     security_map=list_data.get("security_map"),
                     max_seconds=(args.max_seconds or None),
                     detail_channel=args.detail_channel,
+                    channel_stats=channel_stats,
                 )
             finally:
                 if sidecar_owned:
@@ -7321,31 +7441,19 @@ def _run_cli_impl(p, args):
             export_path = list_data.get("output_path")
             if not export_path and args.input and args.output:
                 export_path = args.output
-            # 显式多通道：据 security_map 覆盖度与 --detail-channel 标记
-            # detail_channel（api/encrypt/dom/mixed）
-            _smap = list_data.get("security_map") or {}
-            _detail_jobs = list_data.get("jobs", [])
-            _with_sid = sum(1 for j in _detail_jobs
-                            if isinstance(j, dict) and j.get("job_id") in _smap)
-            if args.detail_channel == "encrypt":
-                _channel = "encrypt"
-            elif _smap and _with_sid == len(_detail_jobs):
-                _channel = "api"
-            elif _with_sid == 0:
-                # auto 下缺凭证岗位实际先试 encryptJobId API（失败才落 DOM）
-                _channel = "encrypt" if args.detail_channel == "auto" else "dom"
-            else:
-                _channel = "mixed"
+            # 优先使用实际 per-job 通道计数；仅历史预加载等无新计数场景回退推断。
+            detail_channel_meta = _detail_channel_metadata(
+                list_data, args.detail_channel, channel_stats, stats_supplied=True)
             if export_path:
                 merged_export = _merge_jd_into_export(
                     export_path, details, base=list_data,
                     keep_without_jd=args.keep_without_jd,
-                    extra_meta={"detail_channel": _channel})
+                    extra_meta=detail_channel_meta)
                 if merged_export:
                     kept, dropped = merged_export
                     print(f"✅ 口径一：导出 {kept} 条（含 jd）"
                           + (f"，剔除无 JD {dropped} 条" if dropped else "")
-                          + f"｜detail_channel={_channel}")
+                          + f"｜detail_channel={detail_channel_meta['detail_channel']}")
             elif args.input:
                 print("ℹ️  --input 模式未指定 --output，跳过 jd 并入（原列表保持原样）")
             # --filter-inactive：按 HR 活跃度剔除僵尸岗（对最终导出生效）

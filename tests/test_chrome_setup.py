@@ -3332,8 +3332,8 @@ class ChromeSetupTests(unittest.TestCase):
                               existing_results=None, output_path=None,
                               write_every=5, list_output_path=None,
                               keyword="", city="", security_map=None,
-                              city_code="", max_seconds=None,
-                              detail_channel="dom"):
+                             city_code="", max_seconds=None,
+                             detail_channel="dom", channel_stats=None):
                 # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
                 captured["concurrency"] = concurrency
                 merged = list(existing_results or []) + [fake_detail]
@@ -6506,7 +6506,9 @@ class PanelJdTests(unittest.TestCase):
         with mock.patch.object(module, "_open_api_tab",
                                side_effect=fake_open_api_tab), \
                 mock.patch.object(module, "resolve_city",
-                                  return_value=("北京", "101010100")):
+                                  return_value=("北京", "101010100")), \
+                mock.patch.object(module, "_atomic_write_export_json"), \
+                mock.patch.object(module, "save_pending_ids"):
             module._scrape_details_via_panel(
                 [], {"keyword": "AI", "city": "北京"}, "out.json", 9222, "json")
         self.assertEqual(opened["city_code"], "101010100")
