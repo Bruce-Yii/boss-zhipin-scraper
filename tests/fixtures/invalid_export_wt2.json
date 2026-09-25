@@ -1,0 +1,14 @@
+{
+  "format_version": 2,
+  "job_count": 1,
+  "jobs": [
+    {
+      "job_id": "fixture-invalid-1",
+      "title": "AI 产品经理",
+      "location": "上海",
+      "job_link": "https://www.zhipin.com/job_detail/fixture-invalid-1.html",
+      "company_name": "测试公司",
+      "wt2": "fixture-credential"
+    }
+  ]
+}

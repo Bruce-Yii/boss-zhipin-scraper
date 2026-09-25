@@ -76,6 +76,7 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
 
 FORMAT_VERSION = _export_contract.FORMAT_VERSION
 _scrub_secrets = _export_contract._scrub_secrets
+_sanitize_payload = _export_contract._sanitize_payload
 _sanitize_job = _export_contract._sanitize_job
 _missing_required_fields = _export_contract._missing_required_fields
 merge_unique = _export_contract.merge_unique

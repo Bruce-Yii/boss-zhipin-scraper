@@ -1170,6 +1170,67 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(result, (1, 0))
             self.assertTrue(os.path.exists(target))
 
+    def test_merge_jd_missing_target_sanitizes_security_map_and_nested_secrets(self):
+        """sidecar + 新输出路径不能把 security_map 或嵌套凭据写入导出。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "new-output.json")
+            base = {
+                "keyword": "AI",
+                "city": "北京",
+                "security_map": {"a": "secret-id"},
+                "cookie": "secret-cookie",
+                "jobs": [{
+                    "job_id": "a",
+                    "title": "A",
+                    "location": "北京",
+                    "job_link": ("https://www.zhipin.com/job_detail/a.html"
+                                 "?securityId=secret-id&foo=ok"),
+                    "company_name": "C",
+                    "profile": {"token": "nested-secret"},
+                    "securityId": "camel-secret",
+                }],
+            }
+            result = module._merge_jd_into_export(
+                target, [{"job_id": "a", "jd": "J"}], base=base)
+            self.assertEqual(result, (1, 0))
+            text = pathlib.Path(target).read_text(encoding="utf-8")
+            for secret in ("secret-id", "secret-cookie", "nested-secret", "camel-secret"):
+                self.assertNotIn(secret, text)
+            self.assertNotIn("security_map", text)
+            self.assertIn("foo=ok", text)
+            self.assertNotIn("securityId", text)
+            self.assertEqual(base["security_map"], {"a": "secret-id"},
+                             "脱敏不得原地修改调用方 base")
+
+    def test_sanitize_job_recurses_lists_and_camel_case_credentials(self):
+        """job 脱敏递归处理嵌套容器和驼峰凭据键。"""
+        module = load_module()
+        cleaned = module._sanitize_job({
+            "job_id": "a",
+            "securityId": "one",
+            "encryptJobId": "two",
+            "items": [{"accessToken": "three"}, {"author": "keep"}],
+        })
+        self.assertNotIn("securityId", cleaned)
+        self.assertNotIn("encryptJobId", cleaned)
+        self.assertNotIn("accessToken", cleaned["items"][0])
+        self.assertEqual(cleaned["items"][1]["author"], "keep")
+
+    def test_flush_jobs_handles_non_dict_records_without_traceback(self):
+        """非 dict 记录应进入 quarantine，不得触发 AttributeError。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            target = str(paths["cdp_profile"] / "jobs.json")
+            module.flush_jobs(target, {"keyword": "AI"}, ["bad", {
+                "job_id": "a", "title": "A", "location": "上海",
+                "job_link": "https://www.zhipin.com/job_detail/a.html",
+                "company_name": "C",
+            }])
+            data = json.loads(pathlib.Path(target).read_text(encoding="utf-8"))
+            self.assertEqual(data["job_count"], 1)
+            self.assertEqual(len(data["quarantine"]), 1)
+
     def test_status_reports_runtime_and_cache(self):
         """--status：离线汇总运行态 + 缓存态（无网络请求）。"""
         module = load_module()

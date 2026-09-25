@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 log = logging.getLogger("boss_cdp")  # 与主文件同名 logger，日志路由一致
 
@@ -28,12 +29,50 @@ _SECRET_KEY_PATTERN = re.compile(
 
 # BOSS 内部标识字段（规格侧建议剔除：下游误读风险，非契约字段；
 # 详情抓取用 job_link 即可导航，不依赖这些参数）
-_INTERNAL_KEYS = ("security_id", "lid", "encrypt_job_id",
+_INTERNAL_KEYS = ("security_id", "security_map", "lid", "encrypt_job_id",
                   "encrypt_boss_id", "encrypt_brand_id")
 
-# 契约必填字段（与消费端校验器 CONTRACT_FIELDS 一致）：写盘前 schema 校验，
-# 缺失即 quarantine 剔除并记录原因——防页面结构漂移产出脏数据进下游
+# 归一化后按完整 token 匹配，避免把 author/accounting 等正常字段误删。
+_KEY_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+_KEY_NON_ALNUM = re.compile(r"[^a-z0-9]+", re.IGNORECASE)
+_SENSITIVE_KEY_TOKENS = frozenset({
+    "cookie", "token", "password", "account", "auth", "secret", "session",
+    "credential", "authorization", "wt2", "zp_stoken", "zp_token", "acw_tc",
+})
+_INTERNAL_KEY_TOKENS = frozenset({
+    "security", "security_id", "security_map", "lid", "encrypt_job_id",
+    "encrypt_boss_id", "encrypt_brand_id",
+})
 _CONTRACT_REQUIRED_FIELDS = ("job_id", "title", "location", "job_link", "company_name")
+_URL_KEY_TOKENS = frozenset({"url", "link", "job_link", "company_link"})
+
+
+def _normalized_key(key):
+    key = _KEY_CAMEL_BOUNDARY.sub("_", str(key))
+    return _KEY_NON_ALNUM.sub("_", key).strip("_").lower()
+
+
+def _is_sensitive_key(key):
+    normalized = _normalized_key(key)
+    tokens = set(filter(None, normalized.split("_")))
+    # 复合凭据名（如 zp_stoken/acw_tc）不能只按 "_" 分词匹配；
+    # 同时保留精确归一化名匹配，避免 token 交集规则漏掉这些历史字段。
+    return normalized in _SENSITIVE_KEY_TOKENS or bool(tokens & _SENSITIVE_KEY_TOKENS)
+
+
+def _is_internal_key(key):
+    normalized = _normalized_key(key)
+    return (normalized in _INTERNAL_KEY_TOKENS
+            or normalized.startswith("encrypt_")
+            or normalized == "security"
+            or normalized.startswith("security_"))
+
+
+def _is_url_key(key):
+    if key is None:
+        return False
+    normalized = _normalized_key(key)
+    return normalized in _URL_KEY_TOKENS or normalized.endswith("_url") or normalized.endswith("_link")
 
 
 def _scrub_secrets(text):
@@ -43,17 +82,45 @@ def _scrub_secrets(text):
     return _SECRET_KEY_PATTERN.sub(lambda m: f"{m.group(1)}=***", text)
 
 
-def _sanitize_job(job):
-    """导出前过滤敏感字段与 BOSS 内部标识（规格 NFR-6 + 联调建议）。
+def _sanitize_url(value):
+    """移除 URL 查询串中的凭据和 BOSS 内部标识参数。"""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return _scrub_secrets(value)
+    if not parsed.query:
+        return _scrub_secrets(value)
+    safe_pairs = [
+        (key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True)
+        if not _is_sensitive_key(key) and not _is_internal_key(key)
+    ]
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path,
+                       urlencode(safe_pairs), parsed.fragment))
 
-    外部数据（--merge/--input）可能夹带凭据字段；列表 API 字段均为公开
-    职位信息，不受影响。
-    """
-    if not isinstance(job, dict):
-        return job
-    return {k: v for k, v in job.items()
-            if not any(s in k.lower() for s in _SENSITIVE_KEYS)
-            and k not in _INTERNAL_KEYS}
+
+def _sanitize_payload(value, *, key=None):
+    """递归复制并清理 dict/list/tuple 中的敏感字段和 URL 凭据。"""
+    if isinstance(value, dict):
+        cleaned = {}
+        for raw_key, raw_value in value.items():
+            if _is_sensitive_key(raw_key) or _is_internal_key(raw_key):
+                continue
+            cleaned[raw_key] = _sanitize_payload(raw_value, key=raw_key)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_payload(item, key=key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_payload(item, key=key) for item in value)
+    if isinstance(value, str):
+        if _is_url_key(key):
+            return _sanitize_url(value)
+        return _scrub_secrets(value)
+    return value
+
+
+def _sanitize_job(job):
+    """导出前递归过滤敏感字段与 BOSS 内部标识。"""
+    return _sanitize_payload(job)
 
 
 def _missing_required_fields(job):
@@ -154,25 +221,31 @@ def flush_jobs(path, meta, jobs):
                     if isinstance(j, dict) and j.get("job_id")}
     existing_payloads = {j.get("job_id"): j for j in existing_jobs
                          if isinstance(j, dict) and j.get("job_id")}
-    sanitized_incoming = [_sanitize_job(j) for j in jobs]
+    raw_jobs = list(jobs or [])
+    invalid_incoming = [job for job in raw_jobs if not isinstance(job, dict)]
+    incoming_dicts = [job for job in raw_jobs if isinstance(job, dict)]
+    sanitized_incoming = [_sanitize_job(j) for j in incoming_dicts]
 
     # 键冲突检测：incoming 与已有同 job_id 但 payload 不同 → quarantine 记录
     # （merge_unique 本身旧版本优先，这里把"静默覆盖"变成显式信号；
     #  比较在 sanitize 后进行，跨 run 续抓不因敏感键差异误报）
     incoming_ids = [j.get("job_id") for j in sanitized_incoming
-                    if j.get("job_id")]
+                    if isinstance(j, dict) and j.get("job_id")]
     new_count = sum(1 for jid in incoming_ids if jid not in existing_ids)
     dup_count = len(incoming_ids) - new_count
 
-    merged = merge_unique(existing_jobs, jobs)
+    merged = merge_unique(existing_jobs, incoming_dicts)
     sanitized = [_sanitize_job(j) for j in merged]
-    quarantine = []
+    quarantine = [{
+        "job_id": None,
+        "reason": "record_not_object",
+    } for _ in invalid_incoming]
     valid = []
     for j in sanitized:
         missing = _missing_required_fields(j)
         if missing:
             quarantine.append({
-                "job_id": j.get("job_id"),
+                "job_id": j.get("job_id") if isinstance(j, dict) else None,
                 "reason": "missing_required_fields=" + ",".join(missing),
             })
         else:
@@ -181,7 +254,7 @@ def flush_jobs(path, meta, jobs):
                      if jid in incoming_ids
                      and existing_payloads[jid] != next(
                          (x for x in sanitized_incoming
-                          if x.get("job_id") == jid), {})]
+                          if isinstance(x, dict) and x.get("job_id") == jid), {})]
     if key_conflicts:
         log.warning("job_id 键冲突（同 ID 不同 payload，保留旧版本）: %s",
                     key_conflicts[:5])
@@ -202,7 +275,7 @@ def flush_jobs(path, meta, jobs):
     if quarantine:
         meta["quarantine"] = quarantine
     meta["jobs"] = valid
-    _atomic_write_json(path, meta)
+    _atomic_write_json(path, _sanitize_payload(meta))
 
 
 def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
@@ -232,7 +305,9 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         except (OSError, json.JSONDecodeError, ValueError):
             data = None
     if not isinstance(data, dict):
-        data = base
+        data = _sanitize_payload(base)
+    else:
+        data = _sanitize_payload(data)
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
         return None
 
@@ -274,6 +349,6 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
             f"口径一：已剔除 {len(dropped_ids)} 条无 JD 岗位（见 meta.dropped_no_jd）")
         data["warnings"] = warnings
     if extra_meta:
-        data.update(extra_meta)
-    _atomic_write_json(target_path, data)
+        data.update(_sanitize_payload(extra_meta))
+    _atomic_write_json(target_path, _sanitize_payload(data))
     return len(kept), len(dropped_ids)

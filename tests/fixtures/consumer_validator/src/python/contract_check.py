@@ -18,7 +18,10 @@
 import json
 
 CONTRACT_FIELDS = ["job_id", "title", "location", "job_link", "company_name"]
-SENSITIVE_KEYWORDS = ["cookie", "password", "session", "__zp_stoken", "acw_tc"]
+SENSITIVE_KEYWORDS = [
+    "cookie", "password", "session", "__zp_stoken", "acw_tc", "wt2",
+    "securityid", "security_id", "access_token", "authorization", "token",
+]
 
 # 校验器版本：契约变更时递增；双端比对此版本号即可检测 vendor 副本漂移
 VALIDATOR_VERSION = "2.0.0"
@@ -28,17 +31,26 @@ VALIDATOR_VERSION = "2.0.0"
 EXPECTED_FORMAT_VERSIONS = {1, 2}
 
 
-def validate_export(data: dict) -> dict:
+def validate_export(data) -> dict:
     """校验导出数据，返回报告 dict（ok/errors/warnings/统计）。
 
-    format_version 1/2 均接受；v2 可选扩展字段做类型校验（mode/observed_jobs/exhausted），
-    缺失不报错（旧文件兼容）。
+    format_version 1/2 均接受；v2 可选扩展字段做类型校验。所有结构错误都以
+    报告返回，不把异常泄漏给 CLI 调用方。
     """
     errors: list[str] = []
     warnings: list[str] = []
+    if not isinstance(data, dict):
+        return {
+            "ok": False,
+            "errors": ["顶层 JSON 必须是对象/dict"],
+            "warnings": warnings,
+            "job_count": 0,
+            "format_version": None,
+        }
+
     fv = data.get("format_version")
-    if fv not in EXPECTED_FORMAT_VERSIONS:
-        errors.append(f"format_version={fv!r}（期望 1 或 2）")
+    if type(fv) is not int or fv not in EXPECTED_FORMAT_VERSIONS:
+        errors.append(f"format_version={fv!r}（期望整数 1 或 2）")
     jobs = data.get("jobs")
     if not isinstance(jobs, list):
         errors.append("jobs 缺失或非数组")
@@ -65,18 +77,31 @@ def validate_export(data: dict) -> dict:
         errors.append(f"exhausted 必须为布尔（got {type(exhausted).__name__}）")
 
     missing = {f: 0 for f in CONTRACT_FIELDS}
-    for j in jobs:
-        for f in CONTRACT_FIELDS:
-            if not j.get(f):
-                missing[f] += 1
-    for f, n in missing.items():
-        if n:
-            errors.append(f"必填字段 {f} 缺失 {n}/{len(jobs)} 条")
+    seen_ids = set()
+    duplicate_ids = set()
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            errors.append(f"jobs[{index}] 必须是对象/dict")
+            missing["job_id"] += 1
+            continue
+        for field in CONTRACT_FIELDS:
+            if not str(job.get(field) or "").strip():
+                missing[field] += 1
+        job_id = str(job.get("job_id") or "").strip()
+        if job_id:
+            if job_id in seen_ids:
+                duplicate_ids.add(job_id)
+            seen_ids.add(job_id)
+    for field, count in missing.items():
+        if count:
+            errors.append(f"必填字段 {field} 缺失 {count}/{len(jobs)} 条")
+    if duplicate_ids:
+        errors.append(f"重复 job_id: {', '.join(sorted(duplicate_ids))}")
 
     blob = json.dumps(data, ensure_ascii=False).lower()
-    for kw in SENSITIVE_KEYWORDS:
-        if kw in blob:
-            errors.append(f"检出敏感关键字: {kw}")
+    for keyword in SENSITIVE_KEYWORDS:
+        if keyword in blob:
+            errors.append(f"检出敏感关键字: {keyword}")
 
     return {
         "ok": not errors,

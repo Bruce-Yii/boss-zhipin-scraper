@@ -32,7 +32,7 @@ def main() -> int:
     path = Path(sys.argv[1])
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as e:
         print(f"读取失败: {e}")
         return 2
     report = validate_export(data)
