@@ -17,6 +17,9 @@
 
 import json
 import os
+import re
+import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 
 try:
@@ -25,6 +28,63 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
     import export_contract as _export_contract
 
 _scrub_secrets = _export_contract._scrub_secrets
+_sanitize_payload = _export_contract._sanitize_payload
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)(authorization\s*:\s*bearer\s+)([^\s,;]+)")
+
+
+def _scrub_audit_text(value):
+    """在通用 key=value 脱敏之外，清理 Authorization: Bearer 头。"""
+    return _AUTH_HEADER_RE.sub(r"\1***", _scrub_secrets(value))
+
+
+def _json_safe_audit_value(value):
+    """递归转换审计字段；不可序列化值变成类型标记而非抛异常。"""
+    if isinstance(value, dict):
+        safe = {}
+        for key, nested in value.items():
+            safe_key = key if isinstance(key, (str, int, float, bool)) or key is None \
+                else f"<{type(key).__name__}>"
+            safe[safe_key] = _json_safe_audit_value(nested)
+        return safe
+    if isinstance(value, list):
+        return [_json_safe_audit_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe_audit_value(item) for item in value]
+    if isinstance(value, str):
+        return _scrub_audit_text(value)
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return f"<{type(value).__name__}>"
+
+
+@contextmanager
+def _append_lock(path):
+    """短暂互斥保护滚动+追加；锁竞争超时则 best-effort 继续。"""
+    lock_path = f"{path}.lock"
+    deadline = time.monotonic() + 1.0
+    acquired = False
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(fd)
+            acquired = True
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        except OSError:
+            break
+    try:
+        yield
+    finally:
+        if acquired:
+            try:
+                os.remove(lock_path)
+            except OSError:
+                pass
+
 
 DEFAULT_AUDIT_PATH = os.path.expanduser("~/.boss-zhipin-scraper/risk_events.jsonl")
 ALT_AUDIT_PATH_ENV = "BOSS_AUDIT_PATH"  # 测试/多环境覆盖
@@ -59,18 +119,20 @@ def record_event(event, *, path=None, **fields):
     Returns:
         bool: 写入成功 True；IO 失败静默 False（best-effort，不抛异常）。
     """
-    target = path or audit_path()
+    target = str(path or audit_path())
     try:
         os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-        _rotate(target)
-        entry = {"ts": datetime.now(UTC).isoformat(timespec="seconds"),
-                 "event": str(event)}
-        for key, value in fields.items():
-            entry[key] = _scrub_secrets(value) if isinstance(value, str) else value
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        safe_fields = _json_safe_audit_value(_sanitize_payload(fields))
+        entry = dict(safe_fields)
+        # 保留字段由审计器最后生成，调用方不能伪造事件身份或时间。
+        entry["ts"] = datetime.now(UTC).isoformat(timespec="seconds")
+        entry["event"] = _scrub_audit_text(str(event))
+        with _append_lock(target):
+            _rotate(target)
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         return True
-    except (OSError, ValueError):
+    except (OSError, TypeError, ValueError):
         return False
 
 
