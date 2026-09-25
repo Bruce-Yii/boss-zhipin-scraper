@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.18 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.18.4 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.18.3-orange.svg)
+![Version](https://img.shields.io/badge/version-2.18.4-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -170,14 +170,15 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv; csv also exports list and detail CSVs |
 | `--detail` | Scrape detail-page JD (on by default) |
 | `--no-detail` | Do not scrape detail pages |
-| `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended; global rate limit + adaptive slow-down on errors). **The API channel reuses a shared tab pool** and paces about 15s per worker (`DETAIL_API_PACE_SECONDS`), i.e. about N/15 requests per second at concurrency N |
-| `--detail-channel` | Detail channel: `html` (default; DOM-family fast path — same-origin fetch of the detail page's server-rendered HTML, no rendering, ~180ms/job measured, JD matches the rendered version on 99.7%+ of characters, falls back to rendering on failure) / `dom` (force full-page rendering) / `auto` (old default: API when securityId is present, else try the encryptJobId API first and fall back to DOM) / `api` (strict securityId) / `encrypt` (force the encryptJobId API — no dependency on one-shot securityId, serial) / `panel` (reuse the search page, click a card and read the right panel's JD — zero extra requests, serial; upstream #84 idea) |
+| `--concurrency` | Detail scrape concurrency (default 1 = serial; 2-3 recommended). The API path uses a shared tab pool, but requests are globally serialized by `BurstThrottle(center=2.25)` (target about 0.44 req/s, with burst penalties); it does not use a fixed per-worker interval or scale linearly with N. The DOM path (including the html fast path) uses adaptive limiting; panel remains serial |
+| `--detail-channel` | Detail channel: `html` (default; DOM-family fast path — same-origin fetch of the detail page's server-rendered HTML, no rendering, ~180ms/job measured, JD matches the rendered version on 99.7%+ of characters, falls back to rendering on failure) / `dom` (force full-page rendering) / `auto` (old default: API when securityId is present, else try the encryptJobId API first and fall back to DOM) / `api` (strict securityId) / `encrypt` (force the encryptJobId API — no dependency on one-shot securityId, serial) / `panel` (reuse the search page, click a card and read the right panel's JD — zero extra requests, serial; upstream #84 idea). The export meta records the real successful channel `api`/`encrypt`/`dom`/`panel`/`mixed` plus `detail_channel_counts` |
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--filter-inactive` | Drop long-inactive (zombie) jobs by HR activity (matches only "active N weeks/months/years ago"; does not drop this-week/this-month activity); off by default |
 | `--foreground-capture` | Use a foreground Target for list / login probe / detail DOM; for environments where Chrome on Linux/Xvfb cannot capture search responses with a background Target (stays background by default) |
 | `--list-mode xhr / passive` | List channel: `xhr` = inject XHR to the wapi (default, fast, pairs with `--pages-parallel`); `passive` = passively capture the page's own joblist responses via the Network domain (zero injected requests, removes the injected-XHR trigger for code 37, upstream #55; mutually exclusive with `--pages-parallel`, falls back to serial) |
 | `--analysis` | Analysis report |
 | `--merge FILE` | Merge existing data (deduped by job_id) |
+| `--input FILE` | Continue from an existing list JSON; prefer an unexpired securityId sidecar, try the encrypt API first in auto mode, then fall back to DOM by policy; the input list is not rewritten |
 | `--db [PATH]` | Enable the SQLite incremental store (WAL) + cross-run detail resume; without a value it uses the default DB `~/.boss-zhipin-scraper/boss.db` (outside the repo, never committed); JSON/CSV exports are unchanged |
 | `--allow-dom-fallback` | Allow DOM extraction fallback when the API has no data; off by default, salaries may be unreliable |
 | `--check` | Environment check (CDP + deps + login state) |
@@ -220,6 +221,13 @@ Key risk events (risk/captcha full-stop, login failure, circuit-breaker cooldown
 - Configure in the project root `.env` (gitignored, not committed): `ALERT_WEBHOOK_URL=<endpoint URL>`, `ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - Silent skip if unconfigured or on network failure (logged only); never blocks the scrape flow
 
+## Run Lifecycle and Coordination
+
+- Normal CLI and smoke-test runs acquire one run lock before entering a live run and hold it from cooldown/login checks through list, detail, merge, analysis, and SQLite finalization. A held lock produces a non-zero exit.
+- Cooldown is checked before any live request. A list/detail risk signal starts cooldown; Chrome is not auto-restarted while cooling down. Offline commands such as `--status`, `--verify`, and `--list-results` do not take the run lock.
+- `--batch` owns the same single run lock and passes `lock_already_held=True` to each task. Inter-task anti-risk waits remain in place, and a risk signal stops later tasks.
+- `securityId` is used only in memory or the restricted sidecar during a live detail window. It never enters JSON/CSV/SQLite, logs, alerts, or Git. Actual successful detail channels and counts are written to export metadata for auditability.
+
 ## Export Contract v2
 
 The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-job-intel):
@@ -241,16 +249,16 @@ The list JSON provides a stable contract for downstream consumers (e.g. ai-pm-jo
 - Required fields: `job_id`/`title`/`location`/`job_link`/`company_name`; sensitive fields are stripped before writing (credentials never land in files)
 - Optional (list scraping): `exhausted` (bool — whether this run reached the end of the result set: any page returning <30 items → true; `--pages 1` with <30 items → true; full pages without reaching the end → false. Basis for the spec-side sampling-aware de-listing; formally included in contract v2; missing field treated as false), `anonymous` (anonymous-posting flag 0/1 — recruiter hides the company name), `job_valid_status` (BOSS's official in-recruitment status, can calibrate de-listing inference), `icon_flags`/`icon_word` (platform labels such as "urgent"/"new"), `proxy_job`/`proxy_type` (proxy-hiring markers: headhunter/outsourcing), `job_type` (job type code)
 - Optional (detail scraping): `page_update_date` (the detail page's "页面更新时间：YYYY-MM-DD" — DOM path only, unavailable via the API channel), `job_status_desc` (job status description), `brand_introduce` (company intro), `brand_stage_name`/`brand_scale_name`/`brand_industry_name` (company semantic dimensions), `brand_active_time` (company-level activity time from the detail API `brandComInfo.activeTime`, no extra request)
-- **Detail scraping uses the API channel** (2026-08-14): one lightweight request per job (`/wapi/zpgeek/job/detail.json`) instead of full-page rendering — JD returns in ~0s; `securityId` is passed in-process from the list stage (never written to export files, red line preserved); each tab allows ~4-5 requests and the program rotates tabs automatically; `--input` backfill of old files automatically falls back to DOM rendering
+- **Detail scraping uses the API channel** (2026-08-14): one lightweight request per job (`/wapi/zpgeek/job/detail.json`) instead of full-page rendering — JD returns in ~0s; `securityId` is passed in-process from the list stage (never written to export files, red line preserved); the per-tab success budget is **4**, so the program rotates before the fifth request; `--input` prefers an unexpired sidecar, and auto mode tries the encrypt API before the policy DOM fallback
 - **Mode 1 (default): jd merged into the export, jobs without JD are dropped** (2026-09-22): every job carries `jd` inline; JD-less jobs are removed (meta records `jd_coverage` and `dropped_no_jd`); `--keep-without-jd` keeps them with a marker
-- **Explicit multi-channel** (2026-09-22; encrypt added 2026-09-23): the detail phase records `detail_channel` in meta (`api`/`encrypt`/`dom`/`mixed`) — API fast path when `securityId` is available; when credentials are missing it first tries the **encryptJobId API** (a lightweight XHR carrying only jobId — `encryptJobId` is long-lived and does not depend on the one-shot securityId; endpoint rejection or parse failures fall back to DOM, while real risk signals still stop everything instead of pushing through), and only then the DOM slow path; `--input` resume reuses the sidecar to stay on the API path, else it follows the same fallback chain **with an explicit notice**
-- **securityId restricted sidecar** (2026-09-22, red-line exception): stored under `~/.boss-zhipin-scraper/.session/` (outside the repo), `chmod 600`, 60-min TTL, deleted on normal finish; **never enters exports/logs/git**; the login cookie is never persisted. See `AGENTS.md`/`CONTRIBUTING.md`
-- **Optional SQLite incremental store (P4c-2)**: enable with `--db [PATH]` (default `~/.boss-zhipin-scraper/boss.db`, **outside the repo, never committed**; zero new deps — stdlib `sqlite3`). WAL mode plus a `job_id`-keyed incremental upsert (`first_seen_at` preserved, `updated_at` overwritten), coexisting with JSON/CSV instead of replacing them; stored details seed cross-run resume (works even with a fresh output file, so no re-fetch). Records are sanitized before insert (cookie/token/securityId/internal IDs never persisted)
+- **Explicit multi-channel + actual channel counts** (2026-09-22; encrypt added 2026-09-23): the detail phase records successful-result `detail_channel` values (`api`/`encrypt`/`dom`/`panel`/`mixed`) and `detail_channel_counts` in meta; failed attempts do not count as channel outcomes. Endpoint/parse failures may fall back to DOM, while real risk signals remain fail-closed
+- **securityId restricted sidecar** (2026-09-22, red-line exception): a live list run writes it only when entering the detail window under `~/.boss-zhipin-scraper/.session/` (outside the repo), with mode `600` and a 60-minute TTL, then deletes it in the detail-call `finally`; `--input` only reads an existing sidecar and does not own it. It **never enters exports/logs/Git**, and the login cookie is never persisted. See `AGENTS.md`/`CONTRIBUTING.md`
+- **Optional SQLite incremental store (P4c-2)**: enable with `--db [PATH]` (default `~/.boss-zhipin-scraper/boss.db`, **outside the repo, never committed**; zero new deps — stdlib `sqlite3`). WAL mode plus a `job_id`-keyed incremental upsert (`first_seen_at` preserved, `updated_at` overwritten), coexisting with JSON/CSV instead of replacing them; stored details seed cross-run resume (works even with a fresh output file, so no re-fetch). Records are sanitized before insert (cookie/token/securityId/internal IDs never persisted). Future schemas are rejected without downgrade writes; stats use a read-only connection, and interrupted runs retain `finished_at=NULL` lineage
 - On finish a structured result line is printed: `EXPORT_OK jobs=N city=X keyword=Y path=Z` (or `EXPORT_FAIL reason=...` on risk-blocked abort)
 
 ## Post-Scrape Summary & Prompt
 
-`scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, computes **reliable aggregate stats** (salary market / salary-by-experience / top-salary ranking / experience / degree / district / company / scale / stage / skill tags) and produces a copy-paste prompt. **Suspected sales jobs are auto-filtered** (non-target roles mixed in by BOSS's fuzzy keyword matching: strong title markers like "sales/BD/account manager", or strong JD markers like "commission/revenue target/collection"; a lone "sales" word in a PM JD is not flagged), with the filtered count annotated in the summary. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
+`scripts/job_summary.py` only reads the already-scraped `boss_jobs_*.json` and `boss_details_*.json`, computes **reliable aggregate stats** (salary market / salary-by-experience / top-salary ranking / experience / degree / district / company / scale / stage / skill tags) and produces a copy-paste prompt. **Suspected sales jobs are auto-filtered** (non-target roles mixed in by BOSS's fuzzy keyword matching: strong title markers like "sales/BD/account manager", or strong JD markers like "commission/revenue target/collection"; a lone "sales" word in a PM JD is not flagged). Jobs and their matching details are retained as one set for both text statistics and salary/experience charts, with the filtered count annotated. Experience aliases include `在校/应届`/`应届生`, and company labels prefer the contract field `company_name`. It never reads your local résumé file, pulls in no PDF dependency, and never scores a person against a job.
 
 > Design split: the script only computes number-based stats (100% accurate); **semantic analysis is left to the AI agent** — the prompt references the full list/detail data file paths so the agent can read the complete JDs for deep research (skill profile of high-paying jobs, job-type clustering, job-search strategy, etc.).
 >
@@ -291,7 +299,11 @@ boss-zhipin-scraper/
 ├── data/
 │   └── city_codes.json   # Full city-code map
 ├── scripts/
-│   ├── boss_cdp_raw.py   # Main scraping script
+│   ├── boss_cdp_raw.py   # Main scraper + CLI orchestration
+│   ├── ratelimit.py      # BurstThrottle / adaptive limiting
+│   ├── export_contract.py# Export contract, recursive redaction, atomic writes
+│   ├── db_store.py       # SQLite schema / run lineage
+│   ├── audit.py          # Risk-event audit log
 │   └── job_summary.py    # Post-scrape summary + prompt
 └── requirements.txt
 ```
@@ -303,7 +315,7 @@ This is a Chrome-CDP-based BOSS Zhipin crawler. Core flow:
 1. Connect to an already-open Chrome via the Chrome DevTools Protocol (CDP)
 2. Inject JS inside the BOSS Zhipin page that calls the search API via synchronous XHR
 3. The API returns plaintext `salaryDesc`, bypassing the front-end font obfuscation
-4. The list API preserves `securityId` / `lid` context, carried into the detail page
+4. List-stage `securityId` exists only in memory or the restricted sidecar and is never written to exports; details use the `api`/`encrypt`/`dom`/`panel` paths, with actual successful channels recorded in metadata
 5. Each page is written to disk immediately, deduped by `job_id`; repeated pages (paging failure) end early, and consecutive empty pages are only treated as risk after the page is confirmed to be a risk/captcha page (avoids false stops)
 
 DOM extraction is not used for the list by default, since DOM salaries may be hit by font-based obfuscation. Only when `--allow-dom-fallback` is explicitly passed will it fall back to DOM when the API returns no data.
@@ -357,6 +369,19 @@ python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --c
 ```
 
 `--close-chrome` is off by default, and it only fires on the **success path** of a completed scrape — login failures, crashes, and other early exits leave the Chrome running so the login state is preserved.
+
+## Development and Test Isolation
+
+Tests do not need—and must not use—a real Chrome session. Before committing, run focused tests and then the isolation guard. The guard executes the full discovery suite under a temporary HOME and verifies that profile, run-lock, cooldown, audit, and runner-trace state were not modified:
+
+```bash
+python3 -m unittest tests.test_job_summary -v
+python3 -m unittest tests.test_isolation_guard -v
+python3 -m ruff check scripts tests
+python3 -m py_compile scripts/boss_cdp_raw.py scripts/ratelimit.py scripts/export_contract.py scripts/db_store.py scripts/audit.py scripts/job_summary.py
+```
+
+Do not run tests from an old worktree or against live runtime state. Run a real login or scrape only after the user explicitly authorizes it.
 
 ## 📌 TODO
 

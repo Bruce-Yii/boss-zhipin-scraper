@@ -1,7 +1,7 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.18.3
+version: 2.18.4
 author: eatmoreduck
 license: MIT
 platforms: [macos, linux, windows]
@@ -10,7 +10,7 @@ metadata:
     tags: [scraper, jobs, career, cdp, chrome, zhipin, boss直聘]
 ---
 
-# BOSS直聘职位抓取工具 v2.15
+# BOSS直聘职位抓取工具 v2.18.4
 
 通过 Chrome CDP 协议抓取 BOSS直聘 (zhipin.com) 职位数据，输出结构化 JSON/CSV（含明文薪资），并可对已抓取结果生成聚合摘要和求职材料优化提示词。
 
@@ -24,7 +24,11 @@ metadata:
 
 本 skill 的脚本在 skill 目录下：
 
-- `scripts/boss_cdp_raw.py`：抓取主脚本
+- `scripts/boss_cdp_raw.py`：抓取主脚本 + CLI 编排
+- `scripts/ratelimit.py`：BurstThrottle / 自适应限速
+- `scripts/export_contract.py`：导出契约、递归脱敏、原子写
+- `scripts/db_store.py`：SQLite schema / run lineage
+- `scripts/audit.py`：风险事件审计
 - `scripts/job_summary.py`：抓取后摘要和提示词脚本
 
 **运行任何命令前，必须先确定脚本的绝对路径。**
@@ -142,6 +146,19 @@ python3 "$SUMMARY_PATH" \
   --top 15
 ```
 
+## 开发与测试隔离
+
+单元测试必须完全 mock，不连接真实 Chrome、不发 BOSS 请求。提交前运行目标测试和隔离守卫；守卫会在临时 HOME 下执行完整 discovery，并检查 profile、run lock、cooldown、audit、runner trace 未被改写：
+
+```bash
+python3 -m unittest tests.test_job_summary -v
+python3 -m unittest tests.test_isolation_guard -v
+python3 -m ruff check scripts tests
+python3 -m py_compile scripts/boss_cdp_raw.py scripts/ratelimit.py scripts/export_contract.py scripts/db_store.py scripts/audit.py scripts/job_summary.py
+```
+
+不要从旧工作树或真实运行态执行测试；真实登录/抓取需用户明确授权后单独运行。
+
 ## 参数速查
 
 | 参数 | 默认值 | 说明 |
@@ -154,7 +171,7 @@ python3 "$SUMMARY_PATH" \
 | `--list-mode xhr/passive` | xhr | 列表通道：xhr=注入 XHR（默认，快）；passive=Network 域被动捕获页面自身响应（零注入请求，消除 code 37，上游 #55；与 --pages-parallel 互斥） |
 | `--max-jobs N` | 全部 | 列表条数上限，抓够即停 |
 | `--industry` | - | 行业代码（见下方筛选参数） |
-| `--input FILE` | - | 从已有 JSON 读取（跳过列表抓取；此时无 securityId，详情退化为 DOM 渲染） |
+| `--input FILE` | - | 从已有 JSON 读取（跳过列表抓取；优先读取未过期 securityId sidecar，auto 模式缺凭据时先试 encrypt API，再按规则回退 DOM；不改写输入列表） |
 | `--list-cities [关键词]` | - | 打印支持的城市列表（可选关键词过滤） |
 | `--output` | ~/.boss-zhipin-scraper/job-result/... | 列表输出路径 |
 | `--detail-output` | ~/.boss-zhipin-scraper/job-result/... | 详情输出路径 |
@@ -163,8 +180,8 @@ python3 "$SUMMARY_PATH" \
 | `--no-detail` | - | 不抓取详情页（关闭默认行为） |
 | `--max-details` | 全部 | 详情页数量上限 |
 | `--analysis` | 关闭 | 输出分析报告 |
-| `--concurrency N` | 1 | 详情抓取并发度（2-3 推荐；越高成功率越低，含全局限速与错误率自适应降速） |
-| `--detail-channel` | html | 详情通道：html（默认，详情页 HTML 直取，不渲染）/ dom（强制整页渲染）/ auto/api/encrypt/panel |
+| `--concurrency N` | 1 | 详情抓取并发度（2-3 推荐；API 通道使用共享 tab 池，但请求由 `BurstThrottle(center=2.25)` 全局串行节流，目标约 0.44 req/s；不按 worker 固定间隔，也不按 N 线性放大。DOM 通道含 html 直取，自适应限速；panel 串行） |
+| `--detail-channel` | html | 详情通道：html（默认，详情页 HTML 直取，不渲染）/ dom（强制整页渲染）/ auto/api/encrypt/panel；meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts`（panel=复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84） |
 | `--max-concurrent N` | 1 | 并发抓取任务数上限（规格硬防线；仅指令显式开启，任一任务风控即全停） |
 | `--keep-without-jd` | 关闭 | 保留无 JD 岗位（默认口径一：详情抓完后剔除无 JD 岗位） |
 | `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |
@@ -254,8 +271,8 @@ python3 "$SUMMARY_PATH" \
 
 1. 通过 Chrome DevTools Protocol (CDP) 连接到已打开的 Chrome 浏览器
 2. **列表**：在 BOSS直聘页面内注入 JS，用同步 XHR 调用 `/wapi/zpgeek/search/joblist.json` API，返回明文 `salaryDesc`（如 `30-60K·15薪`），绕过前端字体反爬
-3. **详情（默认 API 通道）**：调用 `/wapi/zpgeek/job/detail.json`（每岗 1 次轻量 XHR 取完整 JD）；`securityId` 由列表阶段同进程内存传递、**不落导出文件**（红线）；每 tab 约 4 次配额，程序按预算自动轮换 tab；`--input` 老文件无 `securityId` 时自动回退 DOM 渲染
-4. 默认禁用 DOM fallback，避免把字体反爬后的薪资写入结果；只有显式 `--allow-dom-fallback` 才降级
+3. **详情（默认 API 通道）**：调用 `/wapi/zpgeek/job/detail.json`（每岗 1 次轻量 XHR 取完整 JD）；`securityId` 由列表阶段同进程内存传递、**不落导出文件**（红线）；API 请求由 `BurstThrottle(center=2.25)` 全局串行节流（目标约 0.44 req/s）；每 tab 成功预算为 4，程序在第 5 次前轮换；`--input` 优先复用未过期 sidecar，auto 模式缺凭据时先试 encrypt API，再按规则回退 DOM
+4. 默认禁用列表 DOM fallback，避免把字体反爬后的薪资写入结果；只有显式 `--allow-dom-fallback` 才降级。详情 meta 记录实际成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 与 `detail_channel_counts`
 5. 每页 30 条，每页抓完立即写入文件，异常退出不丢数据
 6. 按 `job_id`（job_link 的 MD5 哈希前 16 位）去重
 7. 默认口径一：详情抓完后把 `jd` 并入导出并剔除无 JD 岗位（`--keep-without-jd` 可保留）
@@ -265,6 +282,8 @@ python3 "$SUMMARY_PATH" \
 `--setup-chrome` 默认使用持久隔离 profile，不软链接、不读取、不复制主 Chrome profile。首次启动和后续重复启动都只会创建或复用 `~/.boss-zhipin-scraper/chrome-profile`，不会清空其中的 BOSS 登录态。setup 会等待登录完成，并用多组关键词/城市 probe，要求搜索接口返回明文薪资；如果一直拿不到 `salaryDesc`，不要继续抓取并把 DOM 薪资当成可信数据。这样 CDP 只暴露 BOSS 专用浏览器里的数据，不影响用户主 Chrome、Gmail、GitHub 等账号。
 
 `--input ... --analysis --no-detail` 会优先加载 `--detail-output`，其次加载与输入列表同目录、同时间戳的 `boss_details_*.json`，最后查找 `~/.boss-zhipin-scraper/job-result` 下最新详情文件。
+
+live list run 只在进入详情调用窗口时写 `securityId` sidecar，并在 `finally` 删除；`--input` 只读既有 sidecar。sidecar 位于仓库外、权限 `600`、TTL 60 分钟，绝不进入导出、SQLite、日志、告警或 Git；登录 cookie 永不落盘。
 
 需要清空 BOSS 专用浏览器登录态时使用：
 
@@ -286,7 +305,8 @@ python3 "$SCRIPT_PATH" --setup-chrome --reset-chrome-profile --cdp-port 45222
 - 仅用于个人求职研究
 - 单次最多 10 页（300 条），防封号
 - 翻页间隔 12-22 秒随机延迟（并发 >1 时自动拉长到 20-30 秒），3 页约 1 分钟
-- 详情页每条 10-25 秒，10 条约 3-5 分钟
+- API 详情节律由 `BurstThrottle(center=2.25)` 全局串行控制（默认目标约 0.44 req/s，含高斯抖动、长暂停和 burst 惩罚）；`--concurrency` 只影响 tab/worker 组织，不会把 API 请求放大为 N 倍速率。DOM/panel 仍按各自渲染/串行节奏
+- **run 锁与冷却守则**：普通 CLI/smoke 从冷却检查到详情/分析/DB 收尾全程持一把 run 锁；batch 自己持锁并复用 `lock_already_held=True`；冷却在任何 live request 前检查，锁冲突返回非零。详情或列表遇风控后进入冷却，冷却期间不自动重启 Chrome
 - **并发守则（ai-pm-job-intel 规格 §3.6）**：默认并发上限 1（互斥锁硬防线）；`--max-concurrent N`（2-3）仅指令显式开启；任一任务遇风控 → 全停挂起等人工，确认后 `--reset-lock` 重开
 - BOSS直聘可能更新 API 路径，失效时需更新脚本中 `API_JOB_LIST_PATH` 常量
 

@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.18（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.18.4（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.18.3-orange.svg)
+![Version](https://img.shields.io/badge/version-2.18.4-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -173,14 +173,15 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
-| `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
-| `--detail-channel` | 详情通道：`html`（默认，DOM 家族快路径：同源 fetch 详情页首屏 SSR HTML、不渲染，实测 ~180ms/岗，JD 与渲染版字符重合 99.7%+，失败自动回退渲染）/ `dom`（强制整页渲染）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`（严格 securityId）/ `encrypt`（强制 encryptJobId API，不依赖 securityId 有效期，串行）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路） |
+| `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐）。API 通道使用共享 tab 池，但请求由 `BurstThrottle(center=2.25)` 全局串行节流（目标约 0.44 req/s，含 burst 惩罚）；不按 worker 固定间隔，也不按并发 N 线性放大。DOM 通道（含 html 直取）使用自适应限速，panel 通道保持串行 |
+| `--detail-channel` | 详情通道：`html`（默认，DOM 家族快路径：同源 fetch 详情页首屏 SSR HTML、不渲染，实测 ~180ms/岗，JD 与渲染版字符重合 99.7%+，失败自动回退渲染）/ `dom`（强制整页渲染）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`（严格 securityId）/ `encrypt`（强制 encryptJobId API，不依赖 securityId 有效期，串行）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路）。meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |
 | `--foreground-capture` | 列表/登录探测/详情 DOM 改用前台 Target；用于 Chrome 在 Linux/Xvfb 下后台 Target 捕获不到搜索响应的环境（默认保持后台） |
 | `--list-mode xhr / passive` | 列表通道：`xhr`=注入 XHR 拉 wapi（默认，快，配合 `--pages-parallel`）；`passive`=Network 域被动捕获页面自身 joblist 响应（零注入请求，消除注入 XHR 触发的 code 37，上游 #55；与 `--pages-parallel` 互斥自动回串行） |
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
+| `--input FILE` | 从已有列表 JSON 继续处理；优先读取未过期 securityId sidecar，auto 模式缺凭据时先试 encrypt API，再按规则回退 DOM；不会改写输入列表 |
 | `--db [PATH]` | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值时用默认库 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
@@ -223,6 +224,13 @@ python3 scripts/job_summary.py --top 15
 - 配置：项目根目录 `.env`（gitignore 排除，不入仓库）——`ALERT_WEBHOOK_URL=<端点地址>`、`ALERT_WEBHOOK_TOKEN=<Bearer token>`
 - 未配置或网络失败时静默跳过，不影响抓取主流程（失败仅记日志）
 
+## 运行生命周期与协调
+
+- 普通 CLI 与 smoke test 在进入 live run 前取得一把 run 锁，并从冷却检查、登录探测、列表抓取一直持有到详情、合并、分析、SQLite 收尾结束；锁被占用时返回非零退出码。
+- 熔断冷却在任何 live request 前检查。详情或列表命中风控后进入冷却，冷却期间不会自动重启 Chrome；`--status`、`--verify`、`--list-results` 等离线命令不持有 run 锁。
+- `--batch` 自己持有同一把 run 锁，任务通过 `lock_already_held=True` 复用；任务之间仍执行防风控等待，任一任务遇到风控会停止后续任务。
+- `securityId` 只在 live 详情窗口使用受限 sidecar；sidecar 不进入 JSON/CSV/SQLite、日志、告警或 Git。详情通道的真实成功结果和计数写入导出 meta，便于复盘。
+
 ## 导出契约 v2
 
 列表 JSON 为下游程序提供稳定契约（供 ai-pm-job-intel 等系统消费）：
@@ -244,16 +252,16 @@ python3 scripts/job_summary.py --top 15
 - 必填字段：`job_id`/`title`/`location`/`job_link`/`company_name`；导出前自动过滤敏感字段（凭据不落文件）
 - 可选字段（列表抓取时）：`exhausted`（bool，本 run 是否翻到底：任一副页返回 <30 条 → true；`--pages 1` 单页 <30 条 → true；满页未到底 → false。规格侧抽样感知下架判定依据；随契约 v2 正式纳入，字段缺失按 false 处理）、`anonymous`（匿名岗位标记 0/1——招聘方隐藏公司名）、`job_valid_status`（BOSS 官方在招状态，可校准下架推断）、`icon_flags`/`icon_word`（"急"/"新"等平台标签）、`proxy_job`/`proxy_type`（代招标记：猎头/外包）、`job_type`（岗位类型编码）
 - 可选字段（详情抓取时）：`page_update_date`（详情页"页面更新时间：YYYY-MM-DD"——仅 DOM 路径；API 通道无此字段）、`job_status_desc`（岗位状态描述）、`brand_introduce`（公司介绍）、`brand_stage_name`/`brand_scale_name`/`brand_industry_name`（公司语义化维度）、`brand_active_time`（公司级活跃时间，详情 API `brandComInfo.activeTime`，零额外请求）
-- **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；每 tab 约 4-5 次配额，程序自动轮换 tab；`--input` 补抓老文件时自动回退 DOM 渲染
+- **详情抓取走 API 通道**（2026-08-14）：每岗 1 次轻量接口请求（`/wapi/zpgeek/job/detail.json`）替代详情页整页渲染，JD 秒回；`securityId` 由列表阶段内存传递（不落导出文件，红线保持）；同一 tab 成功预算为 **4**，程序在第 5 次前主动轮换；`--input` 优先复用未过期 sidecar，auto 模式缺凭据时先试 encrypt API，再按规则回退 DOM
 - **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
-- **显式多通道**（2026-09-22；2026-09-23 增 encrypt）：详情抓取在 meta 记 `detail_channel`（`api`/`encrypt`/`dom`/`mixed`）——有 `securityId` 走 API 快通道；缺凭证先试 **encryptJobId API**（仅带 jobId 的轻量 XHR，`encryptJobId` 长期有效、不依赖一次性 securityId；接口拒绝/解析类失败回退 DOM，真风控照旧全停不硬闯），失败才 DOM 慢通道；`--input` 续抓优先复用 sidecar 走 API，未命中则按上述兜底链路并**明确提示**
-- **securityId 受限 sidecar**（2026-09-22，红线例外）：`~/.boss-zhipin-scraper/.session/`（仓库外）、`chmod 600`、60 分钟 TTL、run 结束即删；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
-- **SQLite 增量存储（可选，P4c-2）**：`--db [PATH]` 启用（默认 `~/.boss-zhipin-scraper/boss.db`，**仓库外、不进 git**；零新依赖——stdlib `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 不变、`updated_at` 覆盖），与 JSON/CSV **并存不替换**；库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓）。入库前统一脱敏（cookie/token/securityId/内部标识不落库）
+- **显式多通道 + 真实通道统计**（2026-09-22；2026-09-23 增 encrypt）：详情抓取在 meta 记录实际成功结果的 `detail_channel`（`api`/`encrypt`/`dom`/`panel`/`mixed`）及 `detail_channel_counts`；失败尝试不计入通道统计。缺凭据先试 **encryptJobId API**（仅带 jobId 的轻量 XHR），接口拒绝/解析类失败才回退 DOM，真实风控仍 fail-closed
+- **securityId 受限 sidecar**（2026-09-22，红线例外）：live list run 只在进入详情窗口时写入 `~/.boss-zhipin-scraper/.session/`（仓库外），权限 `600`、TTL 60 分钟，并在详情调用 `finally` 中删除；`--input` 只读既有 sidecar、不取得所有权；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
+- **SQLite 增量存储（可选，P4c-2）**：`--db [PATH]` 启用（默认 `~/.boss-zhipin-scraper/boss.db`，**仓库外、不进 git**；零新依赖——stdlib `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 不变、`updated_at` 覆盖），与 JSON/CSV **并存不替换**；库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓）。入库前统一脱敏（cookie/token/securityId/内部标识不落库）。未来 schema 会被旧代码拒绝而不会降级写回，`--stats` 使用只读连接；异常中断保留 `finished_at=NULL` 的 run lineage
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词
 
-`scripts/job_summary.py` 只读取已抓取的 `boss_jobs_*.json` 和 `boss_details_*.json`，做**可靠聚合统计**（薪资行情/经验薪资/高薪岗位榜/经验/学历/地区/公司/规模/融资阶段/技能标签）并生成一段可复制提示词。**自动剔除疑似销售岗**（关键词模糊匹配混入的非目标岗位：title 含"销售/BD/客户经理"等强特征，或 JD 含"提成/业绩指标/回款"等强特征；产品岗 JD 的"销售"单字不误伤），剔除数在摘要中标注。它不读取本地简历文件，不引入 PDF 依赖，也不给个人与岗位做分数判断。
+`scripts/job_summary.py` 只读取已抓取的 `boss_jobs_*.json` 和 `boss_details_*.json`，做**可靠聚合统计**（薪资行情/经验薪资/高薪岗位榜/经验/学历/地区/公司/规模/融资阶段/技能标签）并生成一段可复制提示词。**自动剔除疑似销售岗**（关键词模糊匹配混入的非目标岗位：title 含"销售/BD/客户经理"等强特征，或 JD 含"提成/业绩指标/回款"等强特征；产品岗 JD 的"销售"单字不误伤），岗位与对应详情作为一个 retained set 同时进入文字统计和薪资/经验图表，剔除数在摘要中标注。经验标签支持 `在校/应届`/`应届生`，公司名优先使用契约字段 `company_name`。它不读取本地简历文件，不引入 PDF 依赖，也不给个人与岗位做分数判断。
 
 > 设计分工：脚本只做"数字类"统计（100% 准确），**语义分析交给 AI agent**——提示词会引用完整列表/详情数据文件路径，agent 可读取完整 JD 做深度调研（高薪岗位技能画像、岗位类型聚类、求职策略等）。
 >
@@ -293,7 +301,11 @@ boss-zhipin-scraper/
 ├── data/
 │   └── city_codes.json   # 全量城市码表
 ├── scripts/
-│   ├── boss_cdp_raw.py   # 抓取主脚本
+│   ├── boss_cdp_raw.py   # 抓取主脚本 + CLI 编排
+│   ├── ratelimit.py      # BurstThrottle / 自适应限速
+│   ├── export_contract.py# 导出契约、递归脱敏、原子写
+│   ├── db_store.py       # SQLite schema / run lineage
+│   ├── audit.py          # 风险事件审计
 │   └── job_summary.py    # 抓取后摘要 + 提示词
 └── requirements.txt
 ```
@@ -305,7 +317,7 @@ boss-zhipin-scraper/
 1. 通过 Chrome DevTools Protocol (CDP) 连接到已打开的 Chrome
 2. 在 BOSS直聘页面内注入 JS，用同步 XHR 调用搜索 API
 3. API 返回明文 `salaryDesc`，绕过前端字体反爬
-4. 列表 API 保留 `securityId` / `lid` 等上下文，进入详情页时带上这些参数
+4. 列表阶段的 `securityId` 只在内存或受限 sidecar 中短暂存在，不写入导出；详情按 `api`/`encrypt`/`dom`/`panel` 通道执行，并在 meta 记录真实成功通道
 5. 每页抓完立即写入文件，按 `job_id` 去重；翻页失效（本页内容与之前重复）提前结束，连续空页仅在页面确认风控时才判风控（防误停）
 
 默认不会使用 DOM 提取列表，因为 DOM 薪资可能受字体反爬影响。只有明确传 `--allow-dom-fallback` 时，API 无数据才会降级 DOM。
@@ -359,6 +371,19 @@ python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --c
 ```
 
 `--close-chrome` 默认不开启；且只在抓取走完的**成功路径**上触发，登录失败、异常退出等情况不会关闭 Chrome，登录态得以保留。
+
+## 开发与测试隔离
+
+测试不需要、也不应连接真实 Chrome。提交前先运行目标测试，再运行隔离守卫；守卫会在临时 HOME 下执行完整 discovery，并确认 profile、run lock、cooldown、audit 与 runner trace 等受保护状态没有被改写：
+
+```bash
+python3 -m unittest tests.test_job_summary -v
+python3 -m unittest tests.test_isolation_guard -v
+python3 -m ruff check scripts tests
+python3 -m py_compile scripts/boss_cdp_raw.py scripts/ratelimit.py scripts/export_contract.py scripts/db_store.py scripts/audit.py scripts/job_summary.py
+```
+
+不要从旧工作树或真实运行态执行测试；需要真实登录/抓取时由用户明确授权后再单独运行。
 
 ## 📌 TODO
 

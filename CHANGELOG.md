@@ -26,6 +26,19 @@
   （HTTP 200 但正文是限制页）时判为 `risk_timeout` + `account_risk`，触发既有的全停 +
   冷却 + 告警流程——账号已被临时限制时不再继续硬打。
 
+## v2.18.4 (2026-09-25)
+
+### 修复与加固
+- **测试隔离**：全套测试改用临时 HOME/profile，并补齐 CDP 残留清理守卫，避免测试改写真实运行态。
+- **导出安全**：JSON/CSV/详情/pending 等出口统一递归脱敏 URL 与凭据字段；sidecar 是唯一受控的 `securityId` 例外。
+- **run 生命周期**：列表、详情、合并、分析与 SQLite 收尾共用 run 锁；冷却在任何 live request 前检查；live sidecar 只在详情窗口创建并在 `finally` 删除，`--input` 只读既有 sidecar。
+- **详情可观测性**：按真实成功结果记录 `detail_channel` 与 `detail_channel_counts`（`api`/`encrypt`/`dom`/`panel`/`mixed`），修正 pending、坏会话与熔断收尾语义。
+- **列表与持久层**：统一空页/风控 fail-closed 语义，batch 透传安全参数；SQLite 拒绝未来 schema，stats 使用只读连接，run lineage 保留未完成记录。
+- **摘要一致性**：销售岗位及其详情作为一个 retained set 同时服务文字统计和图表；`在校/应届`/`应届生` 归入经验，公司名优先使用 `company_name`。
+
+### 文档
+- 同步中英文 README、SKILL 与 AGENTS：记录 `BurstThrottle(center=2.25)`、sidecar 生命周期、run 锁/冷却、真实通道元数据和测试隔离流程；版本统一为 v2.18.4。
+
 ## v2.18.3 (2026-09-24)
 
 ### 调整
