@@ -1911,6 +1911,8 @@ class ChromeSetupTests(unittest.TestCase):
                                   return_value=True), \
                 mock.patch.object(module, "resolve_city",
                                   return_value=("上海", "101020100")), \
+                mock.patch.object(module, "cleanup_stale_tmp_files") as cleanup_tmp, \
+                mock.patch.object(module, "cleanup_security_sidecars") as cleanup_sidecars, \
                 mock.patch.object(module, "check_login_state",
                                   return_value=UNAUTH), \
                 mock.patch.object(module, "send_alert"), \
@@ -1921,6 +1923,8 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 1, "登录失败应非零退出")
         self.assertIn("未检测到 BOSS直聘登录状态", output.getvalue())
         scrape.assert_not_called(), "登录失败时零请求发出"
+        self.assertEqual(cleanup_tmp.call_count, 2)
+        cleanup_sidecars.assert_called_once_with()
 
     def test_login_failure_sends_alert(self):
         """登录失效推送：UNAUTH/RESTRICTED/RESPONSE_ERROR → send_alert 携带 EXPORT_FAIL reason=login_failed。"""
@@ -1937,6 +1941,8 @@ class ChromeSetupTests(unittest.TestCase):
                                           return_value=True), \
                         mock.patch.object(module, "resolve_city",
                                           return_value=("上海", "101020100")), \
+                        mock.patch.object(module, "cleanup_stale_tmp_files") as cleanup_tmp, \
+                        mock.patch.object(module, "cleanup_security_sidecars") as cleanup_sidecars, \
                         mock.patch.object(module, "check_login_state",
                                           return_value=result), \
                         mock.patch.object(module, "send_alert") as alert, \
@@ -1952,6 +1958,8 @@ class ChromeSetupTests(unittest.TestCase):
                 self.assertIn("city=上海", text)
                 self.assertIn(status.name, text)
                 scrape.assert_not_called()
+                self.assertEqual(cleanup_tmp.call_count, 2)
+                cleanup_sidecars.assert_called_once_with()
 
     def test_dod6_risk_compliance_no_bypass_no_high_frequency(self):
         """DoD 6 风控合规：源码自查——无 headless 伪装、无验证码绕过、
@@ -3323,6 +3331,8 @@ class ChromeSetupTests(unittest.TestCase):
         ]), \
              mock.patch.object(module, "require_runtime_dependencies",
                                return_value=True), \
+             mock.patch.object(module, "cleanup_stale_tmp_files") as cleanup_tmp, \
+             mock.patch.object(module, "cleanup_security_sidecars") as cleanup_sidecars, \
              mock.patch.object(module, "resolve_city",
                                side_effect=module.CityResolutionError("无法解析城市")), \
              mock.patch.object(module, "check_login_state") as login_probe, \
@@ -3334,6 +3344,8 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(exit_context.exception.code, 2)
         self.assertIn("无法解析城市", output.getvalue() + err.getvalue())
         login_probe.assert_not_called()
+        self.assertEqual(cleanup_tmp.call_count, 2)
+        cleanup_sidecars.assert_called_once_with()
 
     def test_resolve_city_empty_input(self):
         module = load_module()
@@ -5146,6 +5158,8 @@ class BestPracticesBatch2Tests(unittest.TestCase):
         module = load_module()
         with mock.patch.object(module, "run_cli",
                                side_effect=RuntimeError("boom")) as run_cli, \
+             mock.patch.object(module, "close_orphan_dock_tabs") as dock_cleanup, \
+             mock.patch.object(module, "close_orphan_detail_tabs") as detail_cleanup, \
              mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             with self.assertRaises(SystemExit) as exit_context:
                 module.main()
@@ -5153,6 +5167,8 @@ class BestPracticesBatch2Tests(unittest.TestCase):
         self.assertIn("boom", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
         run_cli.assert_called_once()
+        dock_cleanup.assert_called_once_with()
+        detail_cleanup.assert_called_once_with()
 
     # ----- #7 原子写 fsync + 启动清扫 .tmp -----
 
@@ -5510,10 +5526,14 @@ class BestPracticesBatch3Tests(unittest.TestCase):
         with mock.patch.object(module, "run_cli",
                                side_effect=RuntimeError(
                                    "failed: __zp_stoken__=topsecret123")), \
+             mock.patch.object(module, "close_orphan_dock_tabs") as dock_cleanup, \
+             mock.patch.object(module, "close_orphan_detail_tabs") as detail_cleanup, \
              mock.patch("sys.stderr", new_callable=io.StringIO) as err:
             with self.assertRaises(SystemExit):
                 module.main()
         self.assertNotIn("topsecret123", err.getvalue())
+        dock_cleanup.assert_called_once_with()
+        detail_cleanup.assert_called_once_with()
 
     # ----- A 组：CDP 会话心跳/快速失败 -----
 
