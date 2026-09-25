@@ -94,6 +94,8 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
 # SQLite 增量层（P4c-2）：主文件 re-export，保持 scripts.boss_cdp_raw.X 导入面
 DEFAULT_DB_PATH = _db_store.DEFAULT_DB_PATH
 open_db_store = _db_store.open_store
+open_db_store_readonly = _db_store.open_store_readonly
+DbSchemaError = _db_store.DbSchemaError
 upsert_db_jobs = _db_store.upsert_jobs
 upsert_db_details = _db_store.upsert_details
 load_db_details = _db_store.load_details
@@ -7076,6 +7078,49 @@ def _cli_uses_outer_run_lock(args):
     return True
 
 
+def _close_db_run_state(args):
+    state = getattr(args, "_db_run_state", None)
+    if not state or state.get("closed"):
+        return
+    try:
+        state["conn"].close()
+    except (OSError, sqlite3.Error):
+        pass
+    state["closed"] = True
+
+
+def _abort_db_run_state(args):
+    """异常/SystemExit 收尾：保留可见 run，但 finished_at 留 NULL。"""
+    state = getattr(args, "_db_run_state", None)
+    if not state or state.get("closed"):
+        return
+    list_data = state.get("list_data") or {}
+    details = state.get("details") or []
+    if not isinstance(list_data, dict):
+        list_data = {}
+    if not isinstance(details, list):
+        details = []
+    try:
+        record_db_run(
+            state["conn"], state["run_id"], mode="single",
+            keyword=list_data.get("keyword") or getattr(args, "keyword", ""),
+            city=list_data.get("city") or getattr(args, "city", ""),
+            job_count=len(list_data.get("jobs", [])),
+            detail_count=len(details), finished_at=None)
+    except (OSError, sqlite3.Error, TypeError, ValueError):
+        pass
+
+
+def _run_cli_with_db_cleanup(p, args):
+    try:
+        return _run_cli_impl(p, args)
+    except BaseException:
+        _abort_db_run_state(args)
+        raise
+    finally:
+        _close_db_run_state(args)
+
+
 def run_cli():
     """解析 CLI，并在单个 live run 的列表、详情与收尾阶段全程持锁。"""
     p = build_parser()
@@ -7087,7 +7132,7 @@ def run_cli():
         except ValueError as exc:
             p.error(str(exc))
     if not _cli_uses_outer_run_lock(args):
-        return _run_cli_impl(p, args)
+        return _run_cli_with_db_cleanup(p, args)
 
     if not acquire_scrape_lock(max_concurrent=args.max_concurrent):
         print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
@@ -7100,7 +7145,7 @@ def run_cli():
             print("EXPORT_FAIL reason=cooldown_active")
             print("   请等待冷却结束，或先人工处理浏览器验证后重试。")
             sys.exit(1)
-        return _run_cli_impl(p, args)
+        return _run_cli_with_db_cleanup(p, args)
     finally:
         release_scrape_lock()
 
@@ -7291,6 +7336,26 @@ def _run_cli_impl(p, args):
         if val:
             filters[key] = val
 
+    # SQLite run lineage：先落 started run，再进行列表/详情等任何抓取。
+    db_conn = None
+    db_run_id = None
+    db_state = None
+    if args.db:
+        try:
+            db_conn = open_db_store(args.db)
+        except (OSError, sqlite3.Error, DbSchemaError) as e:
+            p.error(f"无法打开 SQLite 库 {args.db}: {e}")
+        db_run_id = uuid.uuid4().hex
+        db_state = {
+            "conn": db_conn, "run_id": db_run_id,
+            "list_data": None, "details": None, "closed": False,
+        }
+        args._db_run_state = db_state
+        record_db_run(
+            db_conn, db_run_id, mode="single", keyword=args.keyword,
+            city=args.city, finished_at=None)
+        print(f"🗄️  SQLite 增量层已启用: {args.db}")
+
     # 加载或抓取列表
     sidecar_owned = None  # 本次详情窗口自建的 securityId sidecar
     if args.input:
@@ -7393,18 +7458,9 @@ def _run_cli_impl(p, args):
                           list_data.get("jobs") or [])
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
+        if db_state is not None:
+            db_state["list_data"] = list_data
         # sidecar 只在真正开始详情前创建，并由详情调用 finally 删除。
-
-    # SQLite 增量层（P4c-2）：--db 启用；列表/详情与 JSON/CSV 并存、增量入库
-    db_conn = None
-    db_run_id = None
-    if args.db:
-        try:
-            db_conn = open_db_store(args.db)
-        except (OSError, sqlite3.Error) as e:
-            p.error(f"无法打开 SQLite 库 {args.db}: {e}")
-        db_run_id = uuid.uuid4().hex
-        print(f"🗄️  SQLite 增量层已启用: {args.db}")
 
     # 合并外部文件
     merged_details = None
@@ -7527,6 +7583,9 @@ def _run_cli_impl(p, args):
                     kept, dropped = filter_inactive_in_export(export_path, inactive_ids)
                     print(f"🧟 --filter-inactive：HR 长期未活跃剔除 {dropped} 条（列表 {kept}）")
 
+    if db_state is not None:
+        db_state["details"] = details
+
     # 分析
     if args.analysis:
         # 如果有详情文件也加载
@@ -7537,15 +7596,19 @@ def _run_cli_impl(p, args):
     # P4c-2：记录本 run 并打印库统计（收尾；与 JSON/CSV 并存）
     if db_conn is not None:
         try:
-            record_db_run(db_conn, db_run_id, mode="single",
-                          keyword=args.keyword, city=args.city,
-                          job_count=len(list_data.get("jobs", [])),
-                          detail_count=len(details or []))
+            record_db_run(
+                db_conn, db_run_id, mode="single",
+                keyword=list_data.get("keyword") or args.keyword,
+                city=list_data.get("city") or args.city,
+                job_count=len(list_data.get("jobs", [])),
+                detail_count=len(details or []))
             s = db_store_stats(db_conn)
             print(f"\n🗄️  SQLite: 列表 {s['jobs']}｜详情 {s['details']}"
                   f"（含 JD {s['details_with_jd']}）｜runs {s['runs']}｜{s['db_path']}")
         finally:
             db_conn.close()
+            if db_state is not None:
+                db_state["closed"] = True
 
     # 抓取正常结束后按需收尾（仅成功路径；异常/登录失败走 sys.exit，不会触发，保留登录态）
     if args.close_chrome:
