@@ -1852,6 +1852,7 @@ class ChromeSetupTests(unittest.TestCase):
                 mock.patch.object(module, "API_ATTEMPT_LIMIT", 1), \
                 mock.patch.object(module, "probe_risk_page",
                                   side_effect=[{}, {"hasSlider": True}]), \
+                mock.patch.object(module, "set_scrape_lock_risk"), \
                 mock.patch.object(module, "flush_jobs"), \
                 mock.patch.object(module.time, "sleep"), \
                 mock.patch("sys.stdout",
