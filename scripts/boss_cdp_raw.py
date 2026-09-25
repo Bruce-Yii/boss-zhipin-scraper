@@ -3505,15 +3505,37 @@ def page_fingerprint(jobs):
 
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr"):
-    city_name, city_code = resolve_city(city_input)
-    # 单进程互斥（规格 §3.6）：默认并发上限 1（现状）；--max-concurrent N 仅指令显式放开
+                max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr",
+                lock_already_held=False):
+    """列表抓取入口；默认持有 run 锁，显式上层持锁时只执行实际抓取。"""
+    if lock_already_held:
+        return _scrape_list_impl(
+            keyword, city_input, max_pages, filters, output_path,
+            cdp_port=cdp_port, fmt=fmt, allow_dom_fallback=allow_dom_fallback,
+            max_jobs=max_jobs, max_concurrent=max_concurrent,
+            pages_parallel=pages_parallel, list_mode=list_mode)
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
+        city_name, city_code = resolve_city(city_input)
         print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
         print(f"EXPORT_FAIL reason=lock_held city={city_name} keyword={keyword}")
         return {"keyword": keyword, "city": city_name, "total": 0, "jobs": [],
                 "security_map": {}, "city_code": city_code}
-    cdp = CDPSession(cdp_port)
+    try:
+        return _scrape_list_impl(
+            keyword, city_input, max_pages, filters, output_path,
+            cdp_port=cdp_port, fmt=fmt, allow_dom_fallback=allow_dom_fallback,
+            max_jobs=max_jobs, max_concurrent=max_concurrent,
+            pages_parallel=pages_parallel, list_mode=list_mode)
+    finally:
+        release_scrape_lock()
+
+
+def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
+                      cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
+                      max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr"):
+    city_name, city_code = resolve_city(city_input)
+    cdp = None
+    tid = None
     all_jobs = []
     seen = set()
     if not output_path:
@@ -3568,7 +3590,16 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     empty_pages = 0  # 连续空页计数（风控静默降级信号，>=2 即停）
     seen_page_fingerprints = set()  # 整页 job 指纹：重复=翻页失效，提前停（BossHunter 手法）
 
-    tid, sid = create_page_session(cdp, background=page_background_default())
+    try:
+        cdp = CDPSession(cdp_port)
+        tid, sid = create_page_session(cdp, background=page_background_default())
+    except Exception:
+        if cdp is not None:
+            try:
+                cdp.close()
+            except Exception:
+                pass
+        raise
 
     def human_scroll(cdp, sid):
         """模拟人类滚动: 随机次数、随机距离、随机停顿，偶尔回滚一点"""
@@ -3822,9 +3853,12 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
     except RuntimeError as e:
         print(f"\n⚠️ {e}")
     finally:
-        cdp.send("Target.closeTarget", {"targetId": tid})
-        cdp.close()
-        release_scrape_lock()
+        if cdp is not None:
+            try:
+                if tid is not None:
+                    cdp.send("Target.closeTarget", {"targetId": tid})
+            finally:
+                cdp.close()
 
     print(f"\n{'='*60}")
     print(f"完成: {len(all_jobs)} 条")
@@ -4193,7 +4227,36 @@ def _list_has_detail_risk(list_path):
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
               detail=True, detail_concurrency=1, keep_without_jd=False,
-              pages_parallel=1, list_mode="xhr", detail_channel="auto"):
+              pages_parallel=1, list_mode="xhr", detail_channel="auto",
+              lock_already_held=False):
+    """批量入口；默认持有一次 run 锁，任务内显式复用该锁。"""
+    if lock_already_held:
+        return _run_batch_impl(
+            config_path, cdp_port=cdp_port, max_concurrent=max_concurrent,
+            detail=detail, detail_concurrency=detail_concurrency,
+            keep_without_jd=keep_without_jd, pages_parallel=pages_parallel,
+            list_mode=list_mode, detail_channel=detail_channel)
+    if not acquire_scrape_lock(max_concurrent=max_concurrent):
+        print("❌ 已有抓取任务在运行（并发已达上限），批量任务拒绝启动。")
+        print("EXPORT_FAIL reason=lock_held")
+        return 1
+    try:
+        cooldown = check_cdp_cooldown()
+        if cooldown is not None:
+            print(f"❌ CDP 会话熔断冷却中（剩余约 {cooldown}s），批量任务未启动。")
+            return 1
+        return _run_batch_impl(
+            config_path, cdp_port=cdp_port, max_concurrent=max_concurrent,
+            detail=detail, detail_concurrency=detail_concurrency,
+            keep_without_jd=keep_without_jd, pages_parallel=pages_parallel,
+            list_mode=list_mode, detail_channel=detail_channel)
+    finally:
+        release_scrape_lock()
+
+
+def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
+                    detail=True, detail_concurrency=1, keep_without_jd=False,
+                    pages_parallel=1, list_mode="xhr", detail_channel="auto"):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -4237,6 +4300,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                 max_concurrent=max_concurrent,
                 pages_parallel=pages_parallel,
                 list_mode=list_mode,
+                lock_already_held=True,
             )
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
@@ -6839,9 +6903,53 @@ def _apply_verbosity(verbose, quiet):
         logging.getLogger().setLevel(logging.INFO)
 
 
+def _cli_uses_outer_run_lock(args):
+    """当前参数组合是否由 run_cli 外层持锁（batch 自己管理 run 锁）。"""
+    # 与 run_cli 的分派顺序保持一致：靠前模式优先，避免组合参数误入抓取路径。
+    if (args.check or args.status or args.verify or args.list_results
+            or args.archive is not None):
+        return False
+    if args.batch:
+        return False  # run_batch 自己获取并释放一次 run 锁
+    if args.smoke_test:
+        return True
+    if (args.list_cities is not None or args.setup_chrome
+            or args.stop_chrome or args.reset_lock):
+        return False
+    return True
+
+
 def run_cli():
+    """解析 CLI，并在单个 live run 的列表、详情与收尾阶段全程持锁。"""
     p = build_parser()
     args = p.parse_args()
+    # 纯参数校验必须先于 run 锁/冷却，保持 CLI 误用稳定返回 exit 2。
+    if getattr(args, "dom_gap", None):
+        try:
+            parse_dom_gap(args.dom_gap)
+        except ValueError as exc:
+            p.error(str(exc))
+    if not _cli_uses_outer_run_lock(args):
+        return _run_cli_impl(p, args)
+
+    if not acquire_scrape_lock(max_concurrent=args.max_concurrent):
+        print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
+        print("EXPORT_FAIL reason=lock_held")
+        sys.exit(1)
+    try:
+        cooldown = check_cdp_cooldown()
+        if cooldown is not None:
+            print(f"❌ CDP 会话熔断冷却中（剩余约 {cooldown}s），本次未启动。")
+            print("EXPORT_FAIL reason=cooldown_active")
+            print("   请等待冷却结束，或先人工处理浏览器验证后重试。")
+            sys.exit(1)
+        return _run_cli_impl(p, args)
+    finally:
+        release_scrape_lock()
+
+
+def _run_cli_impl(p, args):
+    """已由外层完成模式分派；需要 live run 的调用必须持有 run 锁。"""
     _apply_verbosity(args.verbose, args.quiet)
     if args.verbose:
         log.debug("已开启 DEBUG 日志")
@@ -7002,7 +7110,7 @@ def run_cli():
             filters[key] = val
 
     # 加载或抓取列表
-    sidecar_owned = None  # 本次 run 自建的 securityId sidecar（成功结束即删）
+    sidecar_owned = None  # 本次详情窗口自建的 securityId sidecar
     if args.input:
         with open(args.input, encoding="utf-8") as f:
             list_data = json.load(f)
@@ -7063,6 +7171,7 @@ def run_cli():
                 max_concurrent=args.max_concurrent,
                 pages_parallel=args.pages_parallel,
                 list_mode=args.list_mode,
+                lock_already_held=True,
             )
         else:
             # §4.1 多关键词：依次抓取（复用单关键词链路），按 job_id 合并为一份列表
@@ -7079,6 +7188,7 @@ def run_cli():
                     max_concurrent=args.max_concurrent,
                     pages_parallel=args.pages_parallel,
                     list_mode=args.list_mode,
+                    lock_already_held=True,
                 )
                 list_data = merge_list_data(list_data, part)
                 if idx < len(keywords):
@@ -7101,9 +7211,7 @@ def run_cli():
                           list_data.get("jobs") or [])
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
-        # 写入受限 sidecar，供后续 --input 续抓走 API 通道（仓库外/600/短 TTL）
-        sidecar_owned = write_security_sidecar(
-            list_data.get("output_path"), list_data.get("security_map"))
+        # sidecar 只在真正开始详情前创建，并由详情调用 finally 删除。
 
     # SQLite 增量层（P4c-2）：--db 启用；列表/详情与 JSON/CSV 并存、增量入库
     db_conn = None
@@ -7168,22 +7276,32 @@ def run_cli():
                 preloaded_details = load_db_details(db_conn, _job_ids)
                 if preloaded_details:
                     print(f"🗄️  SQLite 命中 {len(preloaded_details)} 条历史详情（断点续抓）")
-            details = scrape_details(
-                list_data, args.max_details, args.detail_output,
-                cdp_port=args.cdp_port, fmt=args.format,
-                concurrency=args.concurrency,
-                pending_ids=pending_ids,
-                preloaded_details=preloaded_details,
-                # E 降级：验证码命中全停时，往实际落盘的列表文件追加降级原因。
-                # 修复（2026-09-22 审计）：--input 模式为只读，绝不把输入文件当输出
-                # 改写（否则风控回调会把用户文件追加 warnings 写坏）。
-                list_output_path=None if args.input else list_data.get("output_path"),
-                # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
-                # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
-                security_map=list_data.get("security_map"),
-                max_seconds=(args.max_seconds or None),
-                detail_channel=args.detail_channel,
-            )
+            sidecar_owned = None
+            try:
+                # 仅 live list run 自建 sidecar，且只覆盖详情调用窗口。
+                # --input 只读取上一 run 的 sidecar，不取得其所有权。
+                if not args.input:
+                    sidecar_owned = write_security_sidecar(
+                        list_data.get("output_path"), list_data.get("security_map"))
+                details = scrape_details(
+                    list_data, args.max_details, args.detail_output,
+                    cdp_port=args.cdp_port, fmt=args.format,
+                    concurrency=args.concurrency,
+                    pending_ids=pending_ids,
+                    preloaded_details=preloaded_details,
+                    # E 降级：验证码命中全停时，往实际落盘的列表文件追加降级原因。
+                    # 修复（2026-09-22 审计）：--input 模式为只读，绝不把输入文件当输出
+                    # 改写（否则风控回调会把用户文件追加 warnings 写坏）。
+                    list_output_path=None if args.input else list_data.get("output_path"),
+                    # 详情 API 通道：同进程列表阶段暂存的 securityId（内存传递，
+                    # 不落导出文件；--input 模式无 security_map → DOM 渲染兜底）
+                    security_map=list_data.get("security_map"),
+                    max_seconds=(args.max_seconds or None),
+                    detail_channel=args.detail_channel,
+                )
+            finally:
+                if sidecar_owned:
+                    delete_security_sidecar(list_data.get("output_path"))
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
             details = merge_details_from_lists(merged_details, details)
@@ -7236,9 +7354,6 @@ def run_cli():
                 if inactive_ids:
                     kept, dropped = filter_inactive_in_export(export_path, inactive_ids)
                     print(f"🧟 --filter-inactive：HR 长期未活跃剔除 {dropped} 条（列表 {kept}）")
-            # 本次 run 自建的 sidecar：成功结束即删（TTL 为兜底）
-            if sidecar_owned:
-                delete_security_sidecar(list_data.get("output_path"))
 
     # 分析
     if args.analysis:
