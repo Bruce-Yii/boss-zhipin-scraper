@@ -3990,7 +3990,11 @@ class ChromeSetupTests(unittest.TestCase):
 
         self.assertNotIn("jd = body.substring", module.EXTRACT_DETAIL_JS)
         self.assertIn("page_text", module.EXTRACT_DETAIL_JS)
-        self.assertIn("text.indexOf('职位描述')", module.EXTRACT_DETAIL_JS)
+        # JD 必须来自**区块**且要求含「职位描述」，不得退回整页正文。
+        # 2026-10-22 起区块选择改为 .job-sec-text 优先（外层容器会把薪资/HR
+        # 模块带进 JD），回退分支里仍要求含「职位描述」。
+        self.assertIn(".indexOf('职位描述')", module.EXTRACT_DETAIL_JS)
+        self.assertNotIn("jd = pageText", module.EXTRACT_DETAIL_JS)
 
     def test_extract_job_description_removes_header_and_recruiter_footer(self):
         module = load_module()
@@ -6266,6 +6270,78 @@ class DomSpeedupTests(unittest.TestCase):
         result = module._scrape_one_detail_via_html(job, ws, "s", limiter=limiter)
         self.assertTrue(result["ok"], result.get("message"))
         limiter.acquire.assert_called_once()
+
+    def test_html_channel_rejects_page_not_matching_the_job(self):
+        """直取取回的页面与目标岗位不一致 → 判失败（上层回退渲染版）。
+
+        2026-10-22 真机实测：平台会间歇性对 fetch 请求返回**别的岗位**的内容，
+        绝不把别的岗位的 JD 记成目标岗位的 JD。
+        """
+        module = load_module()
+        ws = mock.Mock()
+        payload = json.dumps({
+            "ok": True,
+            "jd": "岗位职责 负责 AI 产品需求分析与设计，推动版本交付。" * 6,
+            "title": "完全不相干的岗位名称",
+            "salary": "10-20K",
+            "company": "某公司",
+            "page_text": "随便什么文本",
+            "tags": [],
+        }, ensure_ascii=False)
+        ws.eval_js_async.return_value = payload
+        with mock.patch.object(module, "_consume_detail_page_budget",
+                               return_value=(True, 1, 700, "")):
+            result = module._scrape_one_detail_via_html(
+                {"job_id": "j1", "title": "AI产品经理",
+                 "job_link": "https://www.zhipin.com/job_detail/x.html"},
+                ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "invalid_detail")
+        self.assertIn("不一致", result["message"])
+
+    def test_html_channel_accepts_page_matching_the_job(self):
+        """标题一致 → 正常出 JD（校验不能误伤）。"""
+        module = load_module()
+        ws = mock.Mock()
+        payload = json.dumps({
+            "ok": True,
+            "jd": "岗位职责 负责 AI 产品需求分析与设计，推动版本交付。" * 6,
+            "title": "AI产品经理",
+            "salary": "30-60K",
+            "company": "某公司",
+            "page_text": "随便什么文本",
+            "tags": [],
+        }, ensure_ascii=False)
+        ws.eval_js_async.return_value = payload
+        with mock.patch.object(module, "_consume_detail_page_budget",
+                               return_value=(True, 1, 700, "")):
+            result = module._scrape_one_detail_via_html(
+                {"job_id": "j1", "title": "AI产品经理",
+                 "job_link": "https://www.zhipin.com/job_detail/x.html"},
+                ws, "s")
+        self.assertTrue(result["ok"], result.get("message"))
+        self.assertIn("需求分析", result["detail"]["jd"])
+
+    def test_norm_title_ignores_whitespace_and_case(self):
+        module = load_module()
+        self.assertEqual(module._norm_title(" AI 产品经理\n"),
+                         module._norm_title("ai产品经理"))
+        self.assertNotEqual(module._norm_title("AI产品经理"),
+                            module._norm_title("AI产品销售经理"))
+
+    def test_extract_js_prefers_precise_job_sec_text(self):
+        """JD 提取必须优先 .job-sec-text（外层容器会把薪资/HR 模块带进 JD）。
+
+        2026-10-21 实测：294 条里 40 条尾部被污染（薪资详情 / HR 活跃块 /
+        "公司·招聘专员"后缀），根因是取"含职位描述的最长块"选中了外层容器。
+        """
+        module = load_module()
+        for blob in (module.EXTRACT_DETAIL_JS, module.HTML_DETAIL_JS):
+            self.assertIn("pickJdText", blob)
+            self.assertIn(".job-sec-text:not(.fold-text)", blob)
+        # 两条路径必须共用同一套取法（口径一致）
+        self.assertIn(module.JD_PICK_JS, module.EXTRACT_DETAIL_JS)
+        self.assertIn(module.JD_PICK_JS, module.HTML_DETAIL_JS)
 
     def test_html_channel_detects_access_restricted_page(self):
         """「访问受限」页（HTTP 200 但正文是限制页）→ 判风控并全停，不当解析失败。"""
