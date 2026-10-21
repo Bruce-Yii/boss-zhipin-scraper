@@ -87,6 +87,16 @@ cleanup_stale_tmp_files = _export_contract.cleanup_stale_tmp_files
 flush_jobs = _export_contract.flush_jobs
 _merge_jd_into_export = _export_contract._merge_jd_into_export
 
+# 详情页访问日预算（2026-10-21）：跨 run 持久化的计数器，见 scripts/daily_budget.py
+try:
+    from scripts import daily_budget as _daily_budget
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import daily_budget as _daily_budget
+
+DAILY_DETAIL_BUDGET = _daily_budget.DEFAULT_DAILY_DETAIL_BUDGET
+_budget_consume = _daily_budget.consume
+_budget_remaining = _daily_budget.remaining
+
 try:
     from scripts import db_store as _db_store
 except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
@@ -194,9 +204,16 @@ MAX_PENDING_RETRIES = 3         # 详情失败自动重试次数上限（超出�
 # 各 0.8-5s + 页间 10-25s）→ 实测 ~38s/条，比同行独立详情页（~9.5s/条）慢约 4×。
 # 改为"轮询就绪即返回"+ 轻量滚动 + 缩短页间间隔。
 DETAIL_DOM_READY_TIMEOUT = 12.0       # 等待 JD 区渲染就绪的上限（秒）；就绪立即返回
-DETAIL_DOM_GAP_SECONDS = (4.0, 9.0)   # DOM 详情页间间隔（原 10-25s；就绪等待已保证渲染，间隔只作节奏）
-# 默认值是节律红线：调整须等 #31 实测边界 + 用户拍板；--dom-gap（#55）仅作
-# 实验性覆盖（串行 DOM 与右面板共用，run_cli 内按参数覆写本常量）
+DETAIL_DOM_GAP_SECONDS = (0.8, 1.4)   # DOM 详情页间间隔（秒）
+# 2026-10-21 调整（用户拍板：日预算 700 + 不要龟速）：原 (4.0, 9.0) 约 0.11-0.25 条/秒，
+# 一天 700 条要跑 47-105 分钟；现目标 ~1 条/秒（09-23 实测唯一"千条无硬封"档位），
+# 700 条约 12 分钟跑完。--dom-gap（#55）仍可覆盖。
+# 速率与并发解耦：并发只决定"同时在飞几个"，不决定请求速率（见 DETAIL_PAGE_RATE_PER_SECOND）。
+DETAIL_PAGE_RATE_PER_SECOND = 1.0    # 详情页请求速率上限（req/s，绝对值）
+# 为什么不按并发线性放大：平台侧对**详情页访问次数**有日累计预算（09-23 实测 ~700/~994
+# 两道墙，第三方 BossHunter 也取 900/天），速率超过 ~1 条/秒后**多拿不到任何记录**，
+# 只会提高被判定为更高风控档位的概率（09-23 1 条/秒 → 只撞滑块验证码，可人工解开；
+# 2026-10-21 2.3-2.6 条/秒 → 撞"账户受限+定时恢复"硬限制）。
 
 
 def parse_dom_gap(value):
@@ -583,6 +600,16 @@ INDUSTRY_MAP = {
 _request_budget = {"probe": 0, "list": 0, "detail": 0}
 
 
+def _consume_detail_page_budget(n=1):
+    """记一次**详情页请求**到日预算；超限返回 (False, used, limit)。
+
+    计数口径是**请求次数**而非岗位数（平台数的是请求）：DOM 渲染一次岗位 = 1 次
+    页面导航；HTML 直取一次岗位 = 1 次 fetch；直取失败回退渲染时同一岗位会发
+    2 次请求，两次都计。
+    """
+    return _budget_consume(n, DAILY_DETAIL_BUDGET)
+
+
 def incr_request(kind="list"):
     """递增全局请求计数（分账统计），达到上限时抛出异常
 
@@ -855,13 +882,23 @@ RISK_PROBE_JS = """
     );
     var cards = document.querySelectorAll('li.job-card-box, .job-card-wrap');
     var rateRe = /操作频繁|访问频繁|请求频繁|稍后再试|频率限制/;
+    // 「访问受限」页（2026-10-21 实测）：HTTP 200、正文是限制页、无岗位卡片。
+    // 文案形如「访问受限 抱歉，您暂时无法访问此页面 您的 IP 存在异常行为……
+    // 您的账户存在异常行为，已暂时被限制访问！将于 YYYY-MM-DD HH:MM 恢复正常」。
+    var blockedRe = /访问受限|暂时被限制访问|账户存在异常行为|账号存在异常行为|IP 存在异常行为/;
+    var restoreRe = /将于\\s*(\\d{4}-\\d{2}-\\d{2}\\s+\\d{1,2}:\\d{2})\\s*恢复正常/;
+    var loginReqRe = /请登录后使用|立即登录/;
+    var restoreM = bodyText.match(restoreRe);
     return JSON.stringify({
         url: url,
         title: title,
         hasSlider: !!slider,
         hasLoginWall: bodyText.indexOf('登录查看完整内容') !== -1,
         cardCount: cards.length,
-        rateLimited: rateRe.test(bodyText)
+        rateLimited: rateRe.test(bodyText),
+        blocked: blockedRe.test(bodyText) || blockedRe.test(title),
+        blockedRestore: restoreM ? restoreM[1] : '',
+        blockedLoginRequired: loginReqRe.test(bodyText)
     });
 })()
 """
@@ -920,6 +957,50 @@ def probe_risk_page(cdp, sid):
     return probe if isinstance(probe, dict) else {}
 
 
+def _restore_minutes_from_now(restore_text):
+    """把「将于 2026-10-21 20:14 恢复正常」解析成距今分钟数；无/解析失败 → 0。"""
+    text = str(restore_text or "").strip()
+    if not text:
+        return 0
+    match = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})", text)
+    if not match:
+        return 0
+    try:
+        stamp = time.mktime(time.strptime(
+            f"{match.group(1)} {int(match.group(2)):02d}:{match.group(3)}",
+            "%Y-%m-%d %H:%M"))
+    except (ValueError, OverflowError):
+        return 0
+    delta = (stamp - time.time()) / 60.0
+    return int(delta) if delta > 0 else 0
+
+
+def _classify_blocked(restore_text, login_required, page_text=""):
+    """「访问受限」页分级：**账号级**（account_risk）/ **请求级**（env_risk）。
+
+    账号级判据（任一）：页面要求重新登录；声明的恢复时间 > 30 分钟；
+    正文提到「账户/账号存在异常行为」（平台自己的措辞）。
+    请求级：平台只是拦了当前请求，冷却 5-10 分钟即可续（对标 BossHunter 的
+    "BOSS 当前采集页连续检测到请求拦截（不代表账号封禁）"处置）。
+    """
+    minutes = _restore_minutes_from_now(restore_text)
+    body = str(page_text or "")
+    account_words = ("账户存在异常行为", "账号存在异常行为", "暂时被限制访问")
+    if login_required or minutes > 30 or any(w in body for w in account_words):
+        return "account_risk", minutes
+    return "env_risk", minutes
+
+
+def _risk_cooldown_seconds(category, restore_text=""):
+    """按风控档位给冷却时长（秒）：账号级到声明的恢复时刻，请求级 5-10 分钟。"""
+    if category == "account_risk":
+        minutes = _restore_minutes_from_now(restore_text)
+        return max(minutes * 60, 30 * 60) if minutes else 30 * 60
+    if category == "env_risk":
+        return random.randint(300, 600)
+    return 0
+
+
 def classify_risk_page(probe):
     """判断页面探测结果是否命中风控/验证码判据。
 
@@ -944,6 +1025,16 @@ def classify_risk_page(probe):
         return True, "访问到验证/安全页面", "captcha"
     if probe.get("hasSlider"):
         return True, "检测到滑块验证元素", "captcha"
+    # 「访问受限」页是**强结构证据**（无岗位卡片 + 正文是限制页），不受
+    # cardCount==0 的空列表豁免影响——否则会被当成"空页面"放过。
+    if probe.get("blocked"):
+        category, minutes = _classify_blocked(
+            probe.get("blockedRestore"), probe.get("blockedLoginRequired"))
+        restore = probe.get("blockedRestore") or ""
+        if category == "account_risk":
+            return True, (f"页面提示账号/IP 被限制访问（恢复时间 {restore or '未声明'}），"
+                          "需人工确认登录态后再继续"), category
+        return True, "页面提示访问受限（请求级拦截），进入冷却", category
     card_count = probe.get("cardCount")
     if isinstance(card_count, int) and card_count == 0:
         return False, "", ""
@@ -1871,6 +1962,13 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
         # 全局限速：HTML 直取同样消耗真实请求配额，**不得绕过限速**
         # （CONTRIBUTING 红线：去掉限速与预算帽的改动不接受）。与渲染版
         # 共用同一把令牌桶，节律口径完全一致。
+        # 日预算：详情页请求前先记一次（超限立即停）
+        allowed, used, limit = _consume_detail_page_budget()
+        if not allowed:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "daily_budget_exhausted",
+                    "message": f"详情页日预算已用满（{used}/{limit}），停止本轮",
+                    "channel": "html"}
         if limiter is not None:
             limiter.acquire()
         js = HTML_DETAIL_JS.replace("__URL__", json.dumps(link))
@@ -1902,13 +2000,27 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
         }
         # 「访问受限」页优先判风控：HTTP 200 但正文是限制页，不能当解析失败
         page_text = extracted["page_text"] or ""
-        for marker in DETAIL_BLOCKED_MARKERS:
-            if marker in page_text:
-                return {"ok": False, "detail": None, "job_id": job_id,
-                        "reason": "risk_timeout",
-                        "message": f"详情页返回访问受限页（{marker}）："
-                                   "账号/IP 被临时限制，已停止本轮",
-                        "category": "account_risk", "channel": "html"}
+        if any(marker in page_text for marker in DETAIL_BLOCKED_MARKERS):
+            restore = ""
+            restore_m = re.search(
+                r"将于\s*(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2})\s*恢复正常",
+                page_text)
+            if restore_m:
+                restore = restore_m.group(1)
+            login_required = bool(
+                re.search(r"请登录后使用|立即登录", page_text))
+            category, minutes = _classify_blocked(
+                restore, login_required, page_text)
+            if category == "account_risk":
+                message = (f"详情页返回访问受限页：账号/IP 被限制访问"
+                           f"（恢复时间 {restore or '未声明'}），"
+                           "需人工确认登录态后再继续")
+            else:
+                message = "详情页返回访问受限页（请求级拦截），冷却后可继续"
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "risk_timeout", "message": message,
+                    "category": category, "channel": "html",
+                    "cooldown_seconds": _risk_cooldown_seconds(category, restore)}
         # 与渲染版共用同一套 JD 清洗/校验（职位描述切分、招聘者尾部剥离、噪声行剥离、
         # 空白归一、最小长度校验、HR 活跃度兜底）
         fields = extract_detail_fields(extracted)
@@ -4849,6 +4961,13 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                 _apply_asset_blocking(ws, sid)
 
         detail_url = build_detail_url(job)
+        # 日预算：详情页请求前先记一次（超限立即停，不浪费一次真实请求）
+        allowed, used, limit = _consume_detail_page_budget()
+        if not allowed:
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "daily_budget_exhausted",
+                    "message": f"详情页日预算已用满（{used}/{limit}），停止本轮",
+                    "channel": "dom"}
         # 并发模式全局限速：导航（真实请求）前申请配额
         if limiter is not None:
             limiter.acquire()
@@ -4866,14 +4985,18 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入；
         # 频率受限（rate_limit）跳过人工等待——人滑了也没用，直接冷却停手
         t_risk = time.time()
-        is_risk, risk_reason, risk_category = classify_risk_page(
-            probe_risk_page(ws, sid))
+        risk_probe = probe_risk_page(ws, sid)
+        is_risk, risk_reason, risk_category = classify_risk_page(risk_probe)
         _dom_stage("风控探测", time.time() - t_risk)
-        if is_risk and risk_category == "rate_limit":
+        if is_risk and risk_category in ("rate_limit", "env_risk", "account_risk"):
             capture_debug_screenshot(ws, sid, "risk")
+            # 既有类别词：rate_limited（频率）/ env_risk（请求级拦截）/ account_risk（账号级）
+            category = "rate_limited" if risk_category == "rate_limit" else risk_category
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "risk_timeout", "message": risk_reason,
-                    "category": "rate_limited", "channel": "dom"}
+                    "category": category, "channel": "dom",
+                    "cooldown_seconds": _risk_cooldown_seconds(
+                        risk_category, risk_probe.get("blockedRestore", ""))}
         if is_risk and not wait_for_risk_clear(ws, sid):
             capture_debug_screenshot(ws, sid, "risk")
             return {"ok": False, "detail": None, "job_id": job_id,
@@ -5461,7 +5584,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
             print(f"  ⚠️ {result['message']}")
-            if result.get("category") not in RETRYABLE_CATEGORIES:
+            cooldown = result.get("cooldown_seconds") or 0
+            if cooldown:
+                # 分级冷却：请求级 5-10 分钟；账号级到平台声明的恢复时刻
+                mark_cdp_cooldown(seconds=cooldown)
+            elif result.get("category") not in RETRYABLE_CATEGORIES:
                 # 环境/账号/安全风控：进入冷却，防"停手后立即重开→再触"
                 mark_cdp_cooldown()
             _note_detail_risk_blocked(list_output_path,
@@ -5759,9 +5886,11 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             # 踩线 → 反复触 code 37 → 全停，产出反而更少。
             limiter = BurstThrottle()
         else:
-            # DOM 路径：单条加载/滚动 20-30s 天然限速，令牌桶仅提供弱错峰
-            # （容量=并发，错开同时导航的瞬时突发）；失败率升高时降半/暂停兜底。
-            limiter = AdaptiveRateLimiter(base_rate=max(concurrency * 0.5, 0.5))
+            # DOM 路径：绝对速率上限（req/s），**与并发数解耦**——并发只决定同时
+            # 在飞几个，请求速率由令牌桶统一控制（失败率升高时降半/暂停兜底）。
+            # 依据：平台对详情页访问次数有日累计预算，超速拿不到更多记录、只提高
+            # 风控档位（详见 DETAIL_PAGE_RATE_PER_SECOND 注释）。
+            limiter = AdaptiveRateLimiter(base_rate=DETAIL_PAGE_RATE_PER_SECOND)
         # 熔断恢复期：冷却结束后渐变恢复，恢复期内限速减半（不跳回全速）
         recovery = check_cdp_recovery()
         if recovery > 0:
@@ -5818,7 +5947,11 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             # message 含实际风控形态（如 code=37），必须打印（可观测性）
             print(f"  ⚠️ {result['message']}")
             stop_event.set()
-            if result.get("category") not in RETRYABLE_CATEGORIES:
+            cooldown = result.get("cooldown_seconds") or 0
+            if cooldown:
+                # 分级冷却：请求级 5-10 分钟；账号级到平台声明的恢复时刻
+                mark_cdp_cooldown(seconds=cooldown)
+            elif result.get("category") not in RETRYABLE_CATEGORIES:
                 # 环境/账号/安全风控：进入冷却，防"停手后立即重开→再触"
                 mark_cdp_cooldown()
             _note_detail_risk_blocked(list_output_path, city_name=city, keyword=keyword)
@@ -6347,6 +6480,16 @@ def run_status(cdp_port=DEFAULT_CDP_PORT, result_dir=DEFAULT_RESULT_DIR):
         print(f"  熔断恢复期      : ⏳ 剩余约 {recovery:.0f}s（限速减半）")
     else:
         print("  熔断冷却        : 无")
+    # 详情页日预算（跨 run 累计的详情页请求次数）
+    try:
+        used_today = _daily_budget.read_state()["detail"]
+        if DAILY_DETAIL_BUDGET:
+            print(f"  详情页日预算    : 今日已用 {used_today}/{DAILY_DETAIL_BUDGET}"
+                  f"（剩余 {max(DAILY_DETAIL_BUDGET - used_today, 0)} 次请求）")
+        else:
+            print(f"  详情页日预算    : 今日已用 {used_today}（未设上限）")
+    except Exception:
+        print("  详情页日预算    : 读取失败（不影响抓取）")
     print("  登录态          : 未探测（跑 --check 探测；会发一次请求）")
 
     # ── 缓存态 ──
@@ -6959,12 +7102,18 @@ def build_parser():
     g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                           help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
-    g_detail.add_argument("--detail-channel", default="html",
+    g_detail.add_argument("--detail-channel", default="dom",
                            choices=["auto", "api", "dom", "html", "panel", "encrypt"],
-                           help="详情通道（默认 html）：html=详情页 HTML 直取（DOM 家族快路径：同源 fetch 首屏 SSR HTML、不渲染，实测 ~180ms/岗，JD 与渲染版字符重合 99.7%%+，失败自动回退渲染）；dom=强制整页渲染；auto=有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM（旧默认，需显式指定）；api=强制详情 API（严格 securityId）；encrypt=强制 encryptJobId API（不依赖 securityId 有效期，串行）；panel=复用停靠搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
+                           help="详情通道（默认 dom）：dom=整页渲染详情页（document 导航，唯一有生产证据的形态——2026-09-23 用它跑出 1005 条/天、只撞可人工解开的滑块验证码）；html=详情页 HTML 直取（DOM 家族快路径：同源 fetch 首屏 SSR HTML、不渲染，单岗 ~180ms，JD 与渲染版字符重合 99.7%%+，失败自动回退渲染；请求形态与 dom 不同，尚无生产证据）；auto=有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM（旧默认）；api/encrypt=详情 API 通道（已封存：该接口被平台限流并升级为短时账号封禁，见 tangzhiyao/boss-show-time#42）；panel=复用停靠搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
+    g_detail.add_argument("--detail-rate", type=float, default=1.0, metavar="RPS",
+                           help="详情页请求速率上限（次/秒，绝对值、与并发数解耦；默认 1.0）。平台对详情页访问次数有日累计预算，超速拿不到更多记录、只提高风控档位（2026-09-23 1 条/秒 → 只撞可解的滑块验证码；2026-10-21 2.6 条/秒 → 撞账号限时限制）")
+    g_detail.add_argument("--daily-detail-budget", type=int, default=700, metavar="N",
+                           help="详情页访问日预算（请求次数，跨 run 累计，默认 700；0=不限）。计数文件在仓库外 ~/.boss-zhipin-scraper/daily_budget.json，BOSS_DAILY_BUDGET_PATH 可覆盖")
     g_detail.add_argument("--dom-gap", default=None, metavar="MIN,MAX",
                           help="DOM 族详情岗位间隔秒数（串行 DOM 与右面板共用；"
-                               "默认 4,9。实验参数（#31）：默认值变更需实测边界拍板）")
+                               "默认 0.8,1.4 ≈ 1 条/秒。2026-10-21 起速率与"
+                               "并发解耦：日预算 700 才是总量约束，速率只决定"
+                               "配额烧得多快与风控档位")
     g_detail.add_argument("--cool-every", type=int, default=0, metavar="N",
                           help="每完成 N 条详情主动批次冷却（默认 0=关闭；"
                                "大批量建议 250——主动冷却比被风控停更安全，"
@@ -7250,6 +7399,27 @@ def _run_cli_impl(p, args):
     DOM_BLOCK_ASSETS_ENABLED = bool(getattr(args, "dom_block_assets", False))
     if DOM_BLOCK_ASSETS_ENABLED:
         print("🚫 已启用 --dom-block-assets：DOM 详情页将拦截 media/font 资源（保图片）")
+
+    # 详情页速率上限（绝对值，与并发解耦）
+    global DETAIL_PAGE_RATE_PER_SECOND
+    DETAIL_PAGE_RATE_PER_SECOND = max(
+        float(getattr(args, "detail_rate", 1.0) or 0.0), 0.0)
+    if DETAIL_PAGE_RATE_PER_SECOND > 0:
+        print(f"⏱️  详情页速率上限：{DETAIL_PAGE_RATE_PER_SECOND:g} 次/秒"
+              "（与并发数解耦；日预算才是总量约束）")
+    else:
+        print("⏱️  详情页速率上限：不限（--detail-rate 0）⚠️ 极易触发风控")
+
+    # 详情页访问日预算（跨 run 累计）
+    global DAILY_DETAIL_BUDGET
+    DAILY_DETAIL_BUDGET = max(
+        int(getattr(args, "daily_detail_budget", 700) or 0), 0)
+    if DAILY_DETAIL_BUDGET:
+        remaining = _budget_remaining(DAILY_DETAIL_BUDGET)
+        print(f"🗓️  详情页日预算：今日已用 {DAILY_DETAIL_BUDGET - remaining}"
+              f"/{DAILY_DETAIL_BUDGET}（剩余 {remaining} 次请求）")
+    else:
+        print("🗓️  详情页日预算：未设上限（--daily-detail-budget 0）⚠️ 极易触发风控")
 
     # DOM 拟人动作：默认关闭（--dom-human-motion 开启）
     global DOM_HUMAN_MOTION_ENABLED

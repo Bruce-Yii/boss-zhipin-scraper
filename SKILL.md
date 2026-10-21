@@ -180,8 +180,10 @@ python3 -m py_compile scripts/boss_cdp_raw.py scripts/ratelimit.py scripts/expor
 | `--no-detail` | - | 不抓取详情页（关闭默认行为） |
 | `--max-details` | 全部 | 详情页数量上限 |
 | `--analysis` | 关闭 | 输出分析报告 |
-| `--concurrency N` | 1 | 详情抓取并发度（2-3 推荐；API 通道使用共享 tab 池，但请求由 `BurstThrottle(center=2.25)` 全局串行节流，目标约 0.44 req/s；不按 worker 固定间隔，也不按 N 线性放大。DOM 通道含 html 直取，自适应限速；panel 串行） |
-| `--detail-channel` | html | 详情通道：html（默认，详情页 HTML 直取，不渲染）/ dom（强制整页渲染）/ auto/api/encrypt/panel；meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts`（panel=复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84） |
+| `--concurrency N` | 1 | 详情抓取并发度。**并发只决定同时在飞几个，不决定请求速率**（速率见 `--detail-rate`）。API 通道用 `BurstThrottle(center=2.25)` 全局串行节流；DOM 通道用自适应限速器；panel 串行 |
+| `--detail-rate RPS` | 1.0 | 详情页请求速率上限（次/秒，绝对值、与并发解耦）。日预算才是总量约束，超速只提高风控档位 |
+| `--daily-detail-budget N` | 700 | 详情页访问日预算（请求次数，跨 run 累计；0=不限）。计数文件在仓库外 `~/.boss-zhipin-scraper/daily_budget.json` |
+| `--detail-channel` | dom | 详情通道：dom（默认，整页渲染，document 导航，唯一有生产证据的形态）/ html（HTML 直取，单岗 ~180ms，尚无生产证据）/ auto/api/encrypt/panel（api·encrypt 已封存）；meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
 | `--max-concurrent N` | 1 | 并发抓取任务数上限（规格硬防线；仅指令显式开启，任一任务风控即全停） |
 | `--keep-without-jd` | 关闭 | 保留无 JD 岗位（默认口径一：详情抓完后剔除无 JD 岗位） |
 | `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |
