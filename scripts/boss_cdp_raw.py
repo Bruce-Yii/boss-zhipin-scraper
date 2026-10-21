@@ -373,6 +373,7 @@ LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
 # 被动捕获（--list-mode passive，上游 #55）等待页面自身首个 joblist 响应的上限：
 # 导航 + SPA 发请求通常 <8s，留足余量
 PROBE_CAPTURE_TIMEOUT = 25
+_PASSIVE_RISK = object()
 LOGIN_RESTRICTED_CODES = {31, 35, 36, 37, 38}  # boss-jd-scraper 实测 BOSS 常用风控码
 
 # BOSS wapi 业务码 → (类别, 人话)。类别统一判定"参数错 / 限流 / 环境风控 / 安全拦截"。
@@ -3431,8 +3432,9 @@ def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
             print("❌ 被动捕获：未检测到 BOSS直聘登录状态。请先在 Chrome 中登录 zhipin.com。")
             return None
         if login.status is LoginProbeStatus.RESTRICTED:
+            set_scrape_lock_risk()
             print(f"❌ 被动捕获：{describe_login_probe_result(login)}，已停止抓取。")
-            return None
+            return _PASSIVE_RISK
 
         out = [map_api_jobs(first)]
         for _ in range(2, pages + 1):
@@ -3631,11 +3633,14 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
     # 被动捕获模式（--list-mode passive，上游 #55）：改为导航真实搜索页 + 滚动，
     # 旁听页面自身 joblist 响应（零注入 XHR），与 --pages-parallel 互斥（自动回串行）。
     prefetched_pages = None
+    prefetched_risk = False
     if list_mode == "passive" and not allow_dom_fallback:
         print("  ⚡ 被动捕获模式：导航真实搜索页 + 滚动，旁听页面自身请求（零注入 XHR）")
         prefetched_pages = _fetch_pages_passive(
             cdp_port, keyword, city_code, max_pages, filters)
-        if prefetched_pages is None:
+        if prefetched_pages is _PASSIVE_RISK:
+            prefetched_risk = True
+        elif prefetched_pages is None:
             print("  ⚠️ 被动捕获未成功，回退串行 XHR")
         else:
             print(f"  ⚡ 被动捕获：{max_pages} 页 "
@@ -3651,6 +3656,12 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                   f"{sum(len(b) for b in prefetched_pages)} 条")
 
     try:
+        if prefetched_risk:
+            print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+            send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+            return {"keyword": keyword, "city": city_name,
+                    "total": len(all_jobs), "jobs": all_jobs,
+                    "security_map": security_map, "city_code": city_code}
         exhausted = False  # 本 run 是否翻到底（规格侧抽样感知下架判定依据：契约 v2 顶层字段）
         for pg in range(1, max_pages + 1):
             # 并发熔断检查：其他任务已广播风控 → 本任务立即全停（不降并发续跑）
@@ -3723,6 +3734,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                         time.sleep(random.uniform(6, 10) * (2 ** (attempt - 1)))
                         is_risk, reason, category = classify_risk_page(probe_risk_page(cdp, sid))
                         if is_risk:
+                            set_scrape_lock_risk()
                             if category == "rate_limit":
                                 print(f"⚠️ 刷新后 {reason}，跳过人工等待直接停止...")
                             else:
@@ -3730,8 +3742,11 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                             if category == "rate_limit" or not wait_for_risk_clear(cdp, sid):
                                 print("风控未解除，停止抓取（保留已抓数据）。")
                                 warnings.append(f"刷新后风控未解除: {reason}")
-                                jobs = []
-                                break
+                                print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                                send_alert("抓取失败", f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
+                                return {"keyword": keyword, "city": city_name,
+                                        "total": len(all_jobs), "jobs": all_jobs,
+                                        "security_map": security_map, "city_code": city_code}
 
             # DOM 提取的薪资可能是加密字体，默认禁用；只有显式允许时才降级。
             if should_use_dom_fallback(jobs, allow_dom_fallback):
@@ -3760,6 +3775,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                 if empty_pages >= 2:
                     is_risk, reason, category = classify_risk_page(probe_risk_page(cdp, sid))
                     if is_risk:
+                        set_scrape_lock_risk()
                         print(f"⚠️ 连续多页无数据且页面命中风控（{reason}），停止抓取（保留已抓数据）。")
                         warnings.append(f"连续多页无数据+风控页确认: {reason}")
                         print(f"EXPORT_FAIL reason=risk_blocked city={city_name} keyword={keyword}")
@@ -3771,6 +3787,9 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                             "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                 print(f"  ⚠️ 无数据（第 {empty_pages} 页空）")
                 continue
+
+            # 只有连续空页才代表静默降级；任意非空页都重新开始计数。
+            empty_pages = 0
 
             # 重复页指纹停：本页 job 集合与之前某页完全相同 → 翻页失效（新版列表 page=N 无效），提前结束
             page_fp = page_fingerprint(jobs)
@@ -4228,14 +4247,18 @@ def _list_has_detail_risk(list_path):
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
               detail=True, detail_concurrency=1, keep_without_jd=False,
               pages_parallel=1, list_mode="xhr", detail_channel="auto",
-              lock_already_held=False):
+              lock_already_held=False, fmt="json", allow_dom_fallback=False,
+              max_jobs=None, max_seconds=None, filter_inactive=False):
     """批量入口；默认持有一次 run 锁，任务内显式复用该锁。"""
     if lock_already_held:
         return _run_batch_impl(
             config_path, cdp_port=cdp_port, max_concurrent=max_concurrent,
             detail=detail, detail_concurrency=detail_concurrency,
             keep_without_jd=keep_without_jd, pages_parallel=pages_parallel,
-            list_mode=list_mode, detail_channel=detail_channel)
+            list_mode=list_mode, detail_channel=detail_channel,
+            fmt=fmt, allow_dom_fallback=allow_dom_fallback,
+            max_jobs=max_jobs, max_seconds=max_seconds,
+            filter_inactive=filter_inactive)
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
         print("❌ 已有抓取任务在运行（并发已达上限），批量任务拒绝启动。")
         print("EXPORT_FAIL reason=lock_held")
@@ -4249,14 +4272,19 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
             config_path, cdp_port=cdp_port, max_concurrent=max_concurrent,
             detail=detail, detail_concurrency=detail_concurrency,
             keep_without_jd=keep_without_jd, pages_parallel=pages_parallel,
-            list_mode=list_mode, detail_channel=detail_channel)
+            list_mode=list_mode, detail_channel=detail_channel,
+            fmt=fmt, allow_dom_fallback=allow_dom_fallback,
+            max_jobs=max_jobs, max_seconds=max_seconds,
+            filter_inactive=filter_inactive)
     finally:
         release_scrape_lock()
 
 
 def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                     detail=True, detail_concurrency=1, keep_without_jd=False,
-                    pages_parallel=1, list_mode="xhr", detail_channel="auto"):
+                    pages_parallel=1, list_mode="xhr", detail_channel="auto",
+                    fmt="json", allow_dom_fallback=False, max_jobs=None,
+                    max_seconds=None, filter_inactive=False):
     """逐任务执行批量抓取（默认列表 + 详情；`--no-detail` 或任务级 detail=false 仅列表）。
 
     与单任务路径一致遵循"默认抓完整"：列表抓完即接详情（详情走 API 通道，
@@ -4296,8 +4324,9 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
         try:
             list_data = scrape_list(
                 task["keyword"], task["city"], task["pages"], filters, None,
-                cdp_port=cdp_port, max_jobs=None,
-                max_concurrent=max_concurrent,
+                cdp_port=cdp_port, fmt=fmt,
+                allow_dom_fallback=allow_dom_fallback,
+                max_jobs=max_jobs, max_concurrent=max_concurrent,
                 pages_parallel=pages_parallel,
                 list_mode=list_mode,
                 lock_already_held=True,
@@ -4320,9 +4349,11 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
             try:
                 details_result = scrape_details(
                     list_data, output_path=_detail_path_for_list(list_path),
-                    cdp_port=cdp_port, concurrency=detail_concurrency,
+                    cdp_port=cdp_port, fmt=fmt,
+                    concurrency=detail_concurrency,
                     list_output_path=list_path or None,
                     security_map=list_data.get("security_map"),
+                    max_seconds=max_seconds,
                     detail_channel=detail_channel,
                     channel_stats=channel_stats,
                 )
@@ -4346,6 +4377,11 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                     kept, dropped = merged_export
                     print(f"  ✅ 口径一：{task['keyword']}@{task['city']} 导出 {kept} 条"
                           + (f"，剔除无 JD {dropped} 条" if dropped else ""))
+            if filter_inactive and list_path and isinstance(details_result, list):
+                inactive_ids = inactive_job_ids(details_result, list_data.get("jobs", []))
+                if inactive_ids:
+                    kept, dropped = filter_inactive_in_export(list_path, inactive_ids)
+                    print(f"  🧟 --filter-inactive：HR 长期未活跃剔除 {dropped} 条（列表 {kept}）")
 
         if i < len(tasks) - 1:
             gap = task.get("sleep") or random.uniform(30, 60)
@@ -6313,7 +6349,10 @@ def run_status(cdp_port=DEFAULT_CDP_PORT, result_dir=DEFAULT_RESULT_DIR):
     # ── 缓存态 ──
     print(f"\n[缓存态] {result_dir}")
     jobs = sorted(glob.glob(os.path.join(result_dir, "boss_jobs_*.json")))
-    details = sorted(glob.glob(os.path.join(result_dir, "boss_details_*.json")))
+    details = sorted(
+        path for path in glob.glob(os.path.join(result_dir, "boss_details_*.json"))
+        if not path.endswith(".pending.json")
+    )
     pending = sorted(glob.glob(os.path.join(result_dir, "*.pending.json")))
     archive = glob.glob(os.path.join(result_dir, "archive", "*.json"))
     if jobs:
@@ -7160,8 +7199,28 @@ def _run_cli_impl(p, args):
 
     # --batch 模式（批量抓取；默认列表 + 详情，--no-detail 可仅列表）
     if args.batch:
-        if args.db:
-            print("⚠️  --db 暂未接入 --batch（本版仅单 run 流程生效）；本次忽略 --db。")
+        incompatible = []
+        if args.input is not None:
+            incompatible.append("--input")
+        if args.merge is not None:
+            incompatible.append("--merge")
+        if args.output is not None:
+            incompatible.append("--output")
+        if args.detail_output is not None:
+            incompatible.append("--detail-output")
+        if args.retry_job:
+            incompatible.append("--retry-job")
+        if args.db is not None:
+            incompatible.append("--db")
+        if args.max_details is not None:
+            incompatible.append("--max-details")
+        if args.analysis:
+            incompatible.append("--analysis")
+        if args.close_chrome:
+            incompatible.append("--close-chrome")
+        if incompatible:
+            p.error("--batch 不支持与单 run 绑定的参数: "
+                    + ", ".join(incompatible))
         if not require_runtime_dependencies("requests", "websocket"):
             sys.exit(1)
         sys.exit(run_batch(args.batch, cdp_port=args.cdp_port,
@@ -7170,7 +7229,12 @@ def _run_cli_impl(p, args):
                            keep_without_jd=args.keep_without_jd,
                            pages_parallel=args.pages_parallel,
                            list_mode=args.list_mode,
-                           detail_channel=args.detail_channel))
+                           detail_channel=args.detail_channel,
+                           fmt=args.format,
+                           allow_dom_fallback=args.allow_dom_fallback,
+                           max_jobs=args.max_jobs,
+                           max_seconds=args.max_seconds,
+                           filter_inactive=args.filter_inactive))
 
     if args.smoke_test:
         sys.exit(run_smoke_test(args.cdp_port))
