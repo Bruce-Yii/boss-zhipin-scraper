@@ -418,11 +418,42 @@ def flush_jobs(path, meta, jobs):
     _atomic_write_json(path, _sanitize_payload(meta))
 
 
+# 详情页的 HR 活跃状态比列表**更精细**：列表侧只有「在线」/空，详情侧有
+# 「刚刚活跃 / 今日活跃 / 本周活跃 / 3日内活跃 / 2周内活跃 / 本月活跃」。
+# 2026-10-21 实测：合并只并 `jd`，把详情侧更精细的值丢掉了（75 条被列表的粗值
+# 覆盖或直接留空）——「HR 还活跃吗」正是求职端最需要的信号，不能在合并时降级。
+_ACTIVITY_RANK = {
+    "": 0,
+    "在线": 1,
+    "本月活跃": 2,
+    "2周内活跃": 3,
+    "本周活跃": 4,
+    "3日内活跃": 5,
+    "今日活跃": 6,
+    "刚刚活跃": 7,
+}
+
+
+def _more_specific_activity(list_value, detail_value):
+    """取更精细的 HR 活跃状态（详情侧优先，列表侧兜底）。"""
+    list_text = str(list_value or "").strip()
+    detail_text = str(detail_value or "").strip()
+    if not detail_text:
+        return list_text
+    if not list_text:
+        return detail_text
+    if _ACTIVITY_RANK.get(detail_text, 0) > _ACTIVITY_RANK.get(list_text, 0):
+        return detail_text
+    return list_text
+
+
 def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
                           extra_meta=None):
     """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
 
     - 每条 job 追加 `jd` 字段（有详情时）
+    - `boss_active_status` 取**更精细**的一侧（详情页的「刚刚活跃/今日活跃…」优先于
+      列表的「在线」/空），不因合并而降级
     - `keep_without_jd=False`（默认）：**剔除无 JD 的岗位**——用户口径"没 JD 的
       岗位毫无意义"，避免下游再筛
     - meta 记录 `jd_coverage`（with_jd/total_before/dropped_no_jd）与 `dropped_no_jd`
@@ -452,9 +483,12 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         return None
 
     jd_map = {}
+    activity_map = {}
     for d in details or []:
         if isinstance(d, dict) and d.get("job_id") and str(d.get("jd") or "").strip():
-            jd_map[str(d["job_id"])] = d["jd"]
+            jid = str(d["job_id"])
+            jd_map[jid] = d["jd"]
+            activity_map[jid] = d.get("boss_active_status")
 
     jobs = data["jobs"]
     kept, dropped_ids = [], []
@@ -466,6 +500,10 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         jd = jd_map.get(jid)
         if jd:
             job = {**job, "jd": jd}
+            activity = _more_specific_activity(
+                job.get("boss_active_status"), activity_map.get(jid))
+            if activity:
+                job["boss_active_status"] = activity
             kept.append(job)
             with_jd += 1
         elif keep_without_jd:

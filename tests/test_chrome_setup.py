@@ -1163,6 +1163,41 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(data["dropped_no_jd"], ["b"])
             self.assertTrue(any("口径一" in w for w in data.get("warnings", [])))
 
+    def test_merge_jd_keeps_more_specific_boss_active_status(self):
+        """合并时保留**详情侧更精细**的 HR 活跃状态，别被列表的粗值降级。
+
+        2026-10-21 实测：列表侧只有「在线」/空，详情侧有「刚刚活跃/今日活跃/本周活跃/
+        3日内活跃/2周内活跃/本月活跃」。合并只并 `jd` 时，75 条被列表粗值覆盖或留空。
+        """
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "jobs.json")
+            base = {"jobs": [
+                {"job_id": "a", "title": "T", "location": "杭州", "job_link": "u",
+                 "company_name": "C", "boss_active_status": "在线"},
+                {"job_id": "b", "title": "T", "location": "杭州", "job_link": "u",
+                 "company_name": "C", "boss_active_status": ""},
+                {"job_id": "c", "title": "T", "location": "杭州", "job_link": "u",
+                 "company_name": "C", "boss_active_status": "刚刚活跃"},
+            ]}
+            module._atomic_write_export_json(target, base)
+            module._merge_jd_into_export(target, [
+                {"job_id": "a", "jd": "JD-A", "boss_active_status": "刚刚活跃"},
+                {"job_id": "b", "jd": "JD-B", "boss_active_status": "今日活跃"},
+                {"job_id": "c", "jd": "JD-C", "boss_active_status": "在线"},
+            ])
+            with open(target, encoding="utf-8") as handle:
+                merged = json.load(handle)
+        by_id = {j["job_id"]: j for j in merged["jobs"]}
+        # 详情更精细 → 用详情的
+        self.assertEqual(by_id["a"]["boss_active_status"], "刚刚活跃")
+        # 列表为空 → 用详情的
+        self.assertEqual(by_id["b"]["boss_active_status"], "今日活跃")
+        # 列表更精细 → 保留列表的（不被详情降级）
+        self.assertEqual(by_id["c"]["boss_active_status"], "刚刚活跃")
+        # jd 仍然并入
+        self.assertEqual(by_id["a"]["jd"], "JD-A")
+
     def test_merge_jd_into_export_keep_without_jd(self):
         """--keep-without-jd：保留无 JD 岗位（仅标注），in_jd 统计仍准。"""
         module = load_module()
