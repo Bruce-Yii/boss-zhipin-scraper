@@ -71,6 +71,33 @@ def classify_post_type(job):
     return "direct"
 
 
+# 平台 jobType 的取值（2026-10-22 用 294 条真实数据交叉验证，不靠猜）：
+#   jobType=4 → 实习岗：24/24 条是日薪制、24/24 条经验要求为空、17/24 条标题含"实习"
+#   jobType=5 → 校招岗：**11/11 条经验要求 = "在校/应届"**
+#   jobType 空 → 社招岗：259 条全是月薪制、经验要求有值
+# 与 post_type 同一个病：平台标了我们抄了从不用 → 实习/校招岗（实测 35 条、8.5%）
+# 混在社招岗里，薪资口径也不可比。
+RECRUIT_TYPE_BY_JOB_TYPE = {
+    "4": "intern",
+    "5": "campus",
+}
+
+
+def classify_recruit_type(job):
+    """招聘类型：``social``（社招）/ ``intern``（实习）/ ``campus``（校招）。
+
+    以平台 ``jobType`` 为准；无标注按社招处理（实测社招岗的 jobType 一律为空）。
+    """
+    if not isinstance(job, dict):
+        return "social"
+    raw = str(job.get("job_type") or "").strip()
+    if raw:
+        mapped = RECRUIT_TYPE_BY_JOB_TYPE.get(raw)
+        if mapped:
+            return mapped
+    return "social"
+
+
 def is_agency_like(job):
     """猎头代发或匿名发布（薪资带虚高、公司不可核，求职端需区别对待）。"""
     return classify_post_type(job) in ("agency", "anonymous")

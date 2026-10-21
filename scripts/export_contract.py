@@ -500,7 +500,7 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
             activity_map[jid] = d.get("boss_active_status")
             semantic_map[jid] = {
                 key: d.get(key) for key in
-                ("post_type", "title_key", "link_verified_at",
+                ("post_type", "title_key", "link_verified_at", "recruit_type",
                  # 详情侧独有、列表侧没有的字段（2026-10-22 发现被丢弃）：
                  #   page_update_date = 岗位侧最后编辑日期（判断岗位新鲜度）
                  #   skill_tags       = 详情页技能标签（比列表侧 skills 更准）

@@ -145,6 +145,21 @@ class FourFixesTests(unittest.TestCase):
     def setUp(self):
         self.s = load_module("semantics", ROOT / "scripts" / "semantics.py")
 
+    # ---------- 招聘类型（平台的 jobType）----------
+    def test_classify_recruit_type_uses_platform_job_type(self):
+        """平台 jobType 的含义是**实证**出来的，不是猜的：
+
+        - jobType=4 → 实习岗：294 条实测里 24/24 是日薪制、24/24 经验要求为空、
+          17/24 标题含"实习"
+        - jobType=5 → 校招岗：**11/11 经验要求 = "在校/应届"**
+        - jobType 空 → 社招岗：259 条全是月薪制、经验要求有值
+        """
+        self.assertEqual(self.s.classify_recruit_type({"job_type": "4"}), "intern")
+        self.assertEqual(self.s.classify_recruit_type({"job_type": "5"}), "campus")
+        self.assertEqual(self.s.classify_recruit_type({"job_type": ""}), "social")
+        self.assertEqual(self.s.classify_recruit_type({}), "social")
+        self.assertEqual(self.s.classify_recruit_type(None), "social")
+
     # ---------- ① 失败指纹归类 ----------
     def test_classify_extract_failure_fingerprints(self):
         """抽取失败按**页面特征**归类，而不是笼统的 invalid_detail。"""
