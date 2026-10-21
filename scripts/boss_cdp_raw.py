@@ -19,13 +19,14 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.18.4"
+__version__ = "2.18.5"
 
 import argparse
 import base64
 import csv
 import glob
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -46,7 +47,7 @@ import uuid
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -7121,6 +7122,84 @@ def _run_cli_with_db_cleanup(p, args):
         _close_db_run_state(args)
 
 
+RUNNER_TRACE_PATH = os.path.expanduser("~/.boss-zhipin-scraper/runner_trace.jsonl")
+TRACE_PATH_ENV = "BOSS_TRACE_PATH"  # 测试/多环境覆盖（与 BOSS_AUDIT_PATH 同款）
+
+
+def runner_trace_path():
+    """当前运行指纹路径（``BOSS_TRACE_PATH`` 环境变量可覆盖，供测试/多环境）。
+
+    此前是 import 期常量，测试跑一次就会往真实 ``~/.boss-zhipin-scraper/``
+    追加 runner_trace.jsonl——与 2026-09-23 审计日志那次污染同类。
+    """
+    return os.environ.get(TRACE_PATH_ENV) or RUNNER_TRACE_PATH
+
+
+def _parent_chain(n=4):
+    """（尽力而为）返回父进程链 [(pid, name, cmdline), ...]；失败返回 []。
+
+    仅 Windows：一次 PowerShell 查询（Get-CimInstance Win32_Process）。
+    """
+    if not sys.platform.startswith("win"):
+        return []
+    ps = (
+        "$p=" + str(os.getppid()) + ";$out=@();"
+        "for($i=0;$i -lt " + str(n) + " -and $p -gt 0;$i++){"
+        "$pr=Get-CimInstance Win32_Process -Filter \"ProcessId=$p\" "
+        "-ErrorAction SilentlyContinue;"
+        "if(-not $pr){break};"
+        "$out+=[pscustomobject]@{pid=$pr.ProcessId;name=$pr.Name;cmd=$pr.CommandLine};"
+        "$p=$pr.ParentProcessId};"
+        "$out|ConvertTo-Json -Compress"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=8,
+            encoding="utf-8", errors="replace")
+        if out.returncode != 0 or not (out.stdout or "").strip():
+            return []
+        data = json.loads(out.stdout)
+        if isinstance(data, dict):
+            data = [data]
+        return [{"pid": d.get("pid"), "name": d.get("name"),
+                 "cmd": (d.get("cmd") or "")[:300]}
+                for d in data if isinstance(d, dict)]
+    except (OSError, ValueError, json.JSONDecodeError,
+            subprocess.SubprocessError):
+        return []
+
+
+def log_runner_trace(tag="start", extra=None):
+    """记录本次运行的"指纹"（谁起的、什么命令）→ 追加 runner_trace.jsonl。
+
+    用途：抓"来源不明的循环抓取"——下次它一跑，就能看到 argv + 父进程链，
+    当场指名道姓。**旁路诊断，永不抛异常**。
+    """
+    try:
+        rec = {
+            "ts_utc": datetime.now(UTC).isoformat(),
+            "tag": tag,
+            "pid": os.getpid(),
+            "ppid": os.getppid(),
+            "cwd": os.getcwd(),
+            "argv": sys.argv[:12],
+            "parents": _parent_chain(),
+            # 调用栈：若本次 run_cli 是被测试/脚本**进程内**调用，这里会直接
+            # 暴露调用者（如 tests\test_chrome_setup.py:NNNN:test_xxx）
+            "stack": [f"{fr.filename}:{fr.lineno}:{fr.function}"
+                      for fr in inspect.stack()[:14]],
+        }
+        if extra:
+            rec.update(extra)
+        path = runner_trace_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def run_cli():
     """解析 CLI，并在单个 live run 的列表、详情与收尾阶段全程持锁。"""
     p = build_parser()
@@ -7375,6 +7454,8 @@ def _run_cli_impl(p, args):
                 print("ℹ️  未找到 securityId sidecar，详情将先试 encryptJobId API 通道，"
                       "未命中再走 DOM 慢通道")
     else:
+        # 运行指纹：记录 argv + 父进程链（抓"来源不明的循环抓取"，见 runner_trace.jsonl）
+        log_runner_trace("cli_scrape")
         # 登录状态检测
         print("检测登录状态...")
         login_result = check_login_state(args.cdp_port)
