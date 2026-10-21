@@ -238,3 +238,111 @@ def invariant_failures(invariants):
     """把自检结果里不通过的项摘出来（给日志/告警用）。"""
     return [f"{name}: {info.get('detail')}" for name, info in (invariants or {}).items()
             if not info.get("ok")]
+
+# ---------------------------------------------------------------------------
+# 6) 失败指纹（坏页归类）+ 活跃度三态 + 重复组标记
+# ---------------------------------------------------------------------------
+
+# 详情抽取失败的指纹分类。根因不是"数据缺失"，而是"这类页面的解析路径不适用"，
+# 因此要按指纹归类沉淀（而不是每天重试同样失败的页面、白花额度）。
+_EXTRACT_FAILURE_PATTERNS = (
+    ("login_wall", ("登录查看", "登录后可见", "请先登录", "扫码登录")),
+    ("risk_page", ("访问受限", "暂时被限制访问", "账户存在异常行为", "验证码")),
+    ("shell_only", ("BOSS正在加载中", "正在加载", "javascript is required")),
+    ("no_section", ("职位描述",)),          # 有标题但取不到正文块 → 选择器/结构不匹配
+    ("too_short", ("too short", "字，", "职位描述")),   # 抽到了但过短
+)
+
+
+def classify_extract_failure(message, page_text=""):
+    """把抽取失败归成**失败指纹**，用于沉淀"已知坏页"。
+
+    返回形如 ``too_short`` / ``no_section`` / ``shell_only`` / ``login_wall`` /
+    ``risk_page`` / ``unknown`` 的字符串。
+    """
+    text = f"{message or ''}\n{page_text or ''}"
+    if "too short" in text or "职位描述" not in text and "no_section" not in text:
+        if "too short" in text:
+            return "too_short"
+    if "职位描述" in text and "too short" not in text:
+        # 有"职位描述"却抽不出正文 → 结构/选择器不匹配
+        return "no_section"
+    for name, markers in _EXTRACT_FAILURE_PATTERNS:
+        for marker in markers:
+            if marker and marker in text:
+                return name
+    if "too short" in text:
+        return "too_short"
+    return "unknown"
+
+
+def active_state(status):
+    """HR 活跃度三态：``active`` / ``inactive`` / ``unknown``。
+
+    **"平台没给"不等于"不活跃"**——2026-10-22 实测有 14 条岗位的列表侧与详情侧都没有
+    活跃标签（招聘方长期未活跃 → 页面不显示），若把空值当成"不活跃"会误杀，
+    反之当成"活跃"会误导。导出里显式给三态，消费端才分得清。
+    """
+    text = str(status or "").strip()
+    if not text:
+        return "unknown"
+    if re.search(r"(?:\d+\s*)?(?:个?月|周|年)\s*前活跃", text):
+        return "inactive"
+    if text == "在线" or text.endswith("活跃"):
+        return "active"
+    return "unknown"
+
+
+def mark_duplicate_groups(jobs):
+    """就地给每条记录打重复组标记：``dup_group`` / ``dup_size`` / ``is_primary``。
+
+    根因：平台允许同一岗位**多条发布**（同公司同岗、不同 job_id），job_id 去重抓不到，
+    只能靠内容指纹识别。标记出来（而不是删掉——猎头岗有时是唯一渠道），让消费端
+    能一眼看出重复。
+    """
+    fingerprint_by_id, sizes = group_duplicates(jobs)
+    groups = {}
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        jid = job.get("job_id")
+        fp = fingerprint_by_id.get(jid)
+        if not fp:
+            job["dup_group"] = ""
+            job["dup_size"] = 1
+            job["is_primary"] = True
+            continue
+        if fp not in groups:
+            groups[fp] = []
+        groups[fp].append(job)
+    for fp, members in groups.items():
+        if len(members) < 2:
+            for job in members:
+                job["dup_group"] = ""
+                job["dup_size"] = 1
+                job["is_primary"] = True
+            continue
+        group_id = f"dup-{abs(hash(fp)) % 10 ** 8:08d}"
+        for index, job in enumerate(members):
+            job["dup_group"] = group_id
+            job["dup_size"] = len(members)
+            job["is_primary"] = index == 0
+    return groups
+
+
+def title_group_counts(jobs):
+    """按归一化标题键统计（识别"同一岗位的多种写法"）。
+
+    平台原样回传标题 → `AI产品经理` 67 / `ai产品经理` 55 / `AI 产品经理` 6，
+    按字符串分组会漏；归一化键把它们并成一组。
+    """
+    counts = {}
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        key = job.get("title_key") or normalize_title(job.get("title"))
+        if not key:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
