@@ -1008,7 +1008,7 @@ class ChromeSetupTests(unittest.TestCase):
                                            "boss_jobs_new2.json"],
                                       ]):
                 rc.side_effect = lambda city: (city, "101020100")
-                code = module.run_batch(path)
+                code = module.run_batch(path, lock_already_held=True)
             self.assertEqual(code, 0)
             self.assertEqual(len(calls), 2, "两个任务各抓一次列表")
             self.assertEqual(calls[0][0][0], "AI")
@@ -1035,7 +1035,7 @@ class ChromeSetupTests(unittest.TestCase):
                                           ["old1.json", "boss_jobs_new1.json"],
                                       ]):
                 rc.side_effect = lambda city: (city, "101020100")
-                code = module.run_batch(path, max_concurrent=2)
+                code = module.run_batch(path, max_concurrent=2, lock_already_held=True)
             self.assertEqual(code, 0)
             self.assertEqual(calls[0][1]["max_concurrent"], 2,
                              "batch 任务应透传 max_concurrent")
@@ -1063,7 +1063,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module.os, "listdir",
                                       side_effect=[["old.json"],
                                                    ["old.json", "boss_jobs_new1.json"]]):
-                code = module.run_batch(path)
+                code = module.run_batch(path, lock_already_held=True)
             self.assertEqual(code, 0)
             self.assertEqual(len(detail_calls), 1, "默认应抓详情")
             _, kwargs = detail_calls[0]
@@ -1090,7 +1090,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch.object(module.os, "listdir",
                                       side_effect=[["old.json"],
                                                    ["old.json", "boss_jobs_new1.json"]]):
-                code = module.run_batch(path, detail=False)
+                code = module.run_batch(path, detail=False, lock_already_held=True)
             self.assertEqual(code, 0)
             sd.assert_not_called()
 
@@ -1115,7 +1115,7 @@ class ChromeSetupTests(unittest.TestCase):
                                       side_effect=[["old.json"],
                                                    ["old.json", "boss_jobs_a.json",
                                                     "boss_jobs_b.json"]]):
-                code = module.run_batch(path)
+                code = module.run_batch(path, lock_already_held=True)
             self.assertEqual(code, 0)
             self.assertEqual(len(calls), 1, "仅第二个任务抓详情")
 
@@ -1429,7 +1429,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch("sys.stdout",
                                new_callable=__import__("io").StringIO) as out:
                 rc.side_effect = lambda city: (city, "101020100")
-                code = module.run_batch(path)
+                code = module.run_batch(path, lock_already_held=True)
             printed = out.getvalue()
             self.assertEqual(code, 0)
             self.assertIn("完整性校验通过", printed)
@@ -1454,7 +1454,7 @@ class ChromeSetupTests(unittest.TestCase):
                     mock.patch("sys.stdout",
                                new_callable=__import__("io").StringIO) as out:
                 rc.side_effect = lambda city: (city, "101020100")
-                code = module.run_batch(path)
+                code = module.run_batch(path, lock_already_held=True)
             printed = out.getvalue()
             self.assertEqual(code, 1)
             self.assertIn("EXPORT_FAIL reason=batch_shortfall", printed)
@@ -2126,6 +2126,9 @@ class ChromeSetupTests(unittest.TestCase):
                                   return_value=("上海", "101020100")), \
                 mock.patch.object(module, "cleanup_stale_tmp_files") as cleanup_tmp, \
                 mock.patch.object(module, "cleanup_security_sidecars") as cleanup_sidecars, \
+                mock.patch.object(module, "acquire_scrape_lock", return_value=True), \
+                mock.patch.object(module, "release_scrape_lock"), \
+                mock.patch.object(module, "check_cdp_cooldown", return_value=None), \
                 mock.patch.object(module, "check_login_state",
                                   return_value=UNAUTH), \
                 mock.patch.object(module, "send_alert"), \
@@ -2156,6 +2159,9 @@ class ChromeSetupTests(unittest.TestCase):
                                           return_value=("上海", "101020100")), \
                         mock.patch.object(module, "cleanup_stale_tmp_files") as cleanup_tmp, \
                         mock.patch.object(module, "cleanup_security_sidecars") as cleanup_sidecars, \
+                        mock.patch.object(module, "acquire_scrape_lock", return_value=True), \
+                        mock.patch.object(module, "release_scrape_lock"), \
+                        mock.patch.object(module, "check_cdp_cooldown", return_value=None), \
                         mock.patch.object(module, "check_login_state",
                                           return_value=result), \
                         mock.patch.object(module, "send_alert") as alert, \
@@ -3559,6 +3565,9 @@ class ChromeSetupTests(unittest.TestCase):
                                return_value=True), \
              mock.patch.object(module, "cleanup_stale_tmp_files") as cleanup_tmp, \
              mock.patch.object(module, "cleanup_security_sidecars") as cleanup_sidecars, \
+             mock.patch.object(module, "acquire_scrape_lock", return_value=True), \
+             mock.patch.object(module, "release_scrape_lock"), \
+             mock.patch.object(module, "check_cdp_cooldown", return_value=None), \
              mock.patch.object(module, "resolve_city",
                                side_effect=module.CityResolutionError("无法解析城市")), \
              mock.patch.object(module, "check_login_state") as login_probe, \
@@ -5866,6 +5875,203 @@ class BestPracticesBatch3Tests(unittest.TestCase):
         self.assertEqual(module._request_budget["probe"], before["probe"] + 1)
         self.assertEqual(module._request_budget["detail"], before["detail"] + 1)
         self.assertEqual(module._request_budget["list"], before["list"])
+
+
+class RunLifecycleTests(unittest.TestCase):
+    """run 级锁、冷却与 sidecar 生命周期回归。"""
+
+    def _list_data(self, output_path):
+        return {
+            "keyword": "AI",
+            "city": "上海",
+            "city_code": "101020100",
+            "jobs": [{
+                "job_id": "j1",
+                "title": "AI 产品经理",
+                "location": "上海",
+                "job_link": "https://www.zhipin.com/job_detail/j1.html",
+                "company_name": "某科技",
+            }],
+            "output_path": output_path,
+            "security_map": {"j1": "security-fixture"},
+        }
+
+    def _run_cli_patches(self, module, output_path):
+        return (
+            mock.patch.object(sys, "argv", [
+                "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
+                "--pages", "1", "--output", output_path,
+            ]),
+            mock.patch.object(module, "require_runtime_dependencies", return_value=True),
+            mock.patch.object(module, "cleanup_stale_tmp_files"),
+            mock.patch.object(module, "cleanup_security_sidecars"),
+            mock.patch.object(module, "resolve_city", return_value=("上海", "101020100")),
+            mock.patch.object(module, "check_cdp_cooldown", return_value=None),
+            mock.patch.object(module, "close_orphan_dock_tabs", return_value=0),
+            mock.patch.object(module, "close_orphan_detail_tabs", return_value=0),
+        )
+
+    def test_run_cli_holds_lock_through_detail_and_releases_once(self):
+        module = load_module()
+        events = []
+        list_calls = []
+        output = "boss_jobs_test.json"
+
+        with tempfile_profile() as paths:
+            def fake_list(*args, **kwargs):
+                events.append("list")
+                list_calls.append(kwargs)
+                return self._list_data(str(paths["cdp_profile"] / output))
+
+            patches = self._run_cli_patches(module, str(paths["cdp_profile"] / output))
+            (argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown,
+             dock_cleanup, detail_cleanup) = patches
+            with argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown, \
+                    dock_cleanup, detail_cleanup, \
+                    mock.patch.object(module, "acquire_scrape_lock",
+                                      side_effect=lambda **kwargs: events.append("acquire") or True), \
+                    mock.patch.object(module, "release_scrape_lock",
+                                      side_effect=lambda: events.append("release")), \
+                    mock.patch.object(module, "check_login_state",
+                                      side_effect=lambda *a, **k: events.append("login") or module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE)), \
+                    mock.patch.object(module, "scrape_list", side_effect=fake_list), \
+                    mock.patch.object(module, "scrape_details",
+                                      side_effect=lambda *a, **k: events.append("details") or [{"job_id": "j1", "jd": "JD"}]), \
+                    mock.patch.object(module, "write_security_sidecar", return_value="sidecar"), \
+                    mock.patch.object(module, "delete_security_sidecar") as delete_sidecar, \
+                    mock.patch.object(module, "_merge_jd_into_export",
+                                      side_effect=lambda *a, **k: events.append("merge") or (1, 0)):
+                module.run_cli()
+        self.assertEqual(events.count("acquire"), 1)
+        self.assertEqual(events.count("release"), 1)
+        self.assertLess(events.index("acquire"), events.index("login"))
+        self.assertLess(events.index("login"), events.index("list"))
+        self.assertLess(events.index("list"), events.index("details"))
+        self.assertLess(events.index("details"), events.index("merge"))
+        self.assertLess(events.index("merge"), events.index("release"))
+        self.assertTrue(all(call.get("lock_already_held") for call in list_calls))
+        delete_sidecar.assert_called_once()
+
+    def test_run_cli_cooldown_blocks_before_login_probe(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            patches = self._run_cli_patches(module, str(paths["cdp_profile"] / "boss_jobs_test.json"))
+            (argv, deps, cleanup_tmp, cleanup_sidecars, city, _cooldown,
+             dock_cleanup, detail_cleanup) = patches
+            with argv, deps, cleanup_tmp, cleanup_sidecars, city, \
+                    mock.patch.object(module, "resolve_city",
+                                      side_effect=AssertionError("cooldown 前不应解析城市")) as city_probe, \
+                    mock.patch.object(module, "check_cdp_cooldown", return_value=60), \
+                    dock_cleanup, detail_cleanup, \
+                    mock.patch.object(module, "acquire_scrape_lock", return_value=True), \
+                    mock.patch.object(module, "release_scrape_lock"), \
+                    mock.patch.object(module, "check_login_state") as login, \
+                    mock.patch.object(module, "scrape_list", return_value={
+                        "keyword": "AI", "city": "上海", "jobs": [],
+                    }) as scrape:
+                with self.assertRaises(SystemExit) as ctx:
+                    module.run_cli()
+        self.assertEqual(ctx.exception.code, 1)
+        city_probe.assert_not_called()
+        login.assert_not_called()
+        scrape.assert_not_called()
+
+    def test_run_cli_no_detail_does_not_write_security_sidecar(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            output = str(paths["cdp_profile"] / "boss_jobs_test.json")
+            patches = self._run_cli_patches(module, output)
+            (argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown,
+             dock_cleanup, detail_cleanup) = patches
+            with argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown, \
+                    dock_cleanup, detail_cleanup, \
+                    mock.patch.object(module, "acquire_scrape_lock", return_value=True), \
+                    mock.patch.object(module, "release_scrape_lock"), \
+                    mock.patch.object(module, "check_login_state",
+                                      return_value=module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE)), \
+                    mock.patch.object(module, "scrape_list", return_value=self._list_data(output)), \
+                    mock.patch.object(module, "write_security_sidecar") as write_sidecar, \
+                    mock.patch.object(module, "scrape_details") as details:
+                with mock.patch.object(sys, "argv", [
+                        "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
+                        "--pages", "1", "--output", output, "--no-detail",
+                ]):
+                    module.run_cli()
+        write_sidecar.assert_not_called()
+        details.assert_not_called()
+
+    def test_run_cli_deletes_owned_sidecar_when_details_raise(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            output = str(paths["cdp_profile"] / "boss_jobs_test.json")
+            patches = self._run_cli_patches(module, output)
+            (argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown,
+             dock_cleanup, detail_cleanup) = patches
+            with argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown, \
+                    dock_cleanup, detail_cleanup, \
+                    mock.patch.object(module, "acquire_scrape_lock", return_value=True), \
+                    mock.patch.object(module, "release_scrape_lock"), \
+                    mock.patch.object(module, "check_login_state",
+                                      return_value=module.LoginProbeResult(module.LoginProbeStatus.AVAILABLE)), \
+                    mock.patch.object(module, "scrape_list", return_value=self._list_data(output)), \
+                    mock.patch.object(module, "write_security_sidecar", return_value="sidecar"), \
+                    mock.patch.object(module, "delete_security_sidecar") as delete_sidecar, \
+                    mock.patch.object(module, "scrape_details", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    module.run_cli()
+        delete_sidecar.assert_called_once()
+
+    def test_run_batch_holds_one_lock_across_tasks(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            config = paths["cdp_profile"] / "batch.json"
+            config.parent.mkdir(parents=True, exist_ok=True)
+            config.write_text(json.dumps([
+                {"keyword": "AI", "city": "上海", "pages": 1},
+                {"keyword": "Java", "city": "上海", "pages": 1},
+            ]), encoding="utf-8")
+            calls = []
+            with mock.patch.object(module, "acquire_scrape_lock", return_value=True) as acquire, \
+                    mock.patch.object(module, "release_scrape_lock") as release, \
+                    mock.patch.object(module, "check_cdp_cooldown", return_value=None), \
+                    mock.patch.object(module, "scrape_list",
+                                      side_effect=lambda *a, **k: calls.append(k) or {"jobs": []}), \
+                    mock.patch.object(module.time, "sleep"), \
+                    mock.patch.object(module, "resolve_city",
+                                      side_effect=lambda city: (city, "101020100")), \
+                    mock.patch.object(module.os, "listdir", side_effect=[
+                        ["old.json"],
+                        ["old.json", "boss_jobs_new1.json", "boss_jobs_new2.json"],
+                    ]):
+                code = module.run_batch(str(config), detail=False)
+        self.assertEqual(code, 0)
+        acquire.assert_called_once()
+        release.assert_called_once()
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(call.get("lock_already_held") for call in calls))
+
+    def test_run_cli_lock_refusal_exits_nonzero_before_login(self):
+        module = load_module()
+        with tempfile_profile() as paths:
+            output = str(paths["cdp_profile"] / "boss_jobs_test.json")
+            patches = self._run_cli_patches(module, output)
+            (argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown,
+             dock_cleanup, detail_cleanup) = patches
+            with argv, deps, cleanup_tmp, cleanup_sidecars, city, cooldown, \
+                    dock_cleanup, detail_cleanup, \
+                    mock.patch.object(module, "resolve_city",
+                                      side_effect=AssertionError("锁拒绝后不应解析城市")) as city_probe, \
+                    mock.patch.object(module, "acquire_scrape_lock", return_value=False), \
+                    mock.patch.object(module, "check_login_state") as login, \
+                    mock.patch.object(module, "scrape_list", return_value={
+                        "keyword": "AI", "city": "上海", "jobs": [],
+                    }) as scrape:
+                with self.assertRaises(SystemExit) as ctx:
+                    module.run_cli()
+        self.assertEqual(ctx.exception.code, 1)
+        city_probe.assert_not_called()
+        login.assert_not_called()
+        scrape.assert_not_called()
 
 
 class tempfile_profile:
