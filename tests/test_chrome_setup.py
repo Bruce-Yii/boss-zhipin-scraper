@@ -51,13 +51,23 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
 
         self.assertNotEqual(module.DEFAULT_CDP_DATA_DIR, module.DEFAULT_PROFILE_DIR)
-        self.assertNotIn("/tmp/", module.DEFAULT_CDP_DATA_DIR)
+        # 默认 profile 必须是「用户主目录/.boss-zhipin-scraper/chrome-profile」这种
+        # 持久用户态，而不是 tempfile.gettempdir()（临时目录会被系统清理）。
+        # 判定用 home 相对路径的等价式，而不是「路径里不含 /tmp」字面量：
+        # 隔离守卫会把 HOME 指向临时目录，字面量判定在 Linux CI 上会误报，
+        # 在 Windows 上更是恒不成立的空断言（Windows 路径不含 "/tmp/"）。
+        self.assertEqual(
+            module.DEFAULT_CDP_DATA_DIR,
+            os.path.expanduser("~/.boss-zhipin-scraper/chrome-profile"))
         self.assertTrue(module.DEFAULT_CDP_DATA_DIR.endswith(".boss-zhipin-scraper/chrome-profile"))
 
     def test_default_result_dir_is_persistent_user_state(self):
         module = load_module()
 
-        self.assertNotIn("/tmp/", module.DEFAULT_RESULT_DIR)
+        # 同上：默认结果目录按 home 相对路径判定，不用 "/tmp/" 字面量。
+        self.assertEqual(
+            module.DEFAULT_RESULT_DIR,
+            os.path.expanduser("~/.boss-zhipin-scraper/job-result"))
         self.assertTrue(module.DEFAULT_RESULT_DIR.endswith(".boss-zhipin-scraper/job-result"))
         self.assertTrue(module.default_output_path("jobs").startswith(module.DEFAULT_RESULT_DIR))
         self.assertTrue(module.default_output_path("details").startswith(module.DEFAULT_RESULT_DIR))
