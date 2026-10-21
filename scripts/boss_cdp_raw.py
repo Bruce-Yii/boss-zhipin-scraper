@@ -1359,7 +1359,69 @@ class DetailRiskError(DetailExtractionError):
         self.category = category
 
 
-EXTRACT_DETAIL_JS = """
+# ============================================================
+# JD 正文提取（渲染版与 HTML 直取版共用口径）
+#
+# 页面结构实测（2026-10-22，真页面 DOM）：
+#   .job-detail-section 容器
+#     ├ .detail-content-header            "职位描述"
+#     ├ .job-keyword-list                 技能标签
+#     ├ .job-sec-text                     ← 真正的 JD 正文
+#     ├ .detail-section-item.salary-info  薪资详情/社保类型/提成方式
+#     └ .job-boss-info                    HR 名 + 活跃度 + 公司·职位
+#
+# 现行取法（"含『职位描述』的最长块"）选的是**外层容器**——因为 `.job-sec-text`
+# 里并没有"职位描述"四个字（那四个字在 header 里）→ 容器胜出 → 薪资模块与 HR
+# 活跃块被一起带进 JD 正文（2026-10-21 实测：294 条里 40 条尾部被污染：
+# 12 条带薪资详情、28 条带 HR 活跃块、17 条带"公司·招聘专员"后缀）。
+#
+# 改法：优先取"职位描述"标题之后的第一个 `.job-sec-text`（真正的 JD 正文）；
+# 找不到才回退现行取法（保证不丢内容）。
+# ============================================================
+JD_PICK_JS = """
+function pickJdText(textOf) {
+    var jd = '';
+    var headers = document.querySelectorAll('.detail-content-header');
+    for (var h = 0; h < headers.length; h++) {
+        if ((textOf(headers[h]) || '').indexOf('职位描述') === -1) { continue; }
+        var box = headers[h].parentElement;
+        if (box) {
+            // 容器内**最长的非 fold 块** = 真正的 JD 正文
+            //   （同容器里还有：薪资块 ~60 字、公司介绍 .fold-text）
+            // 用"最长"而不是"第一个"：推荐位/相似岗位的 .job-sec-text 可能排在前面
+            var blocks = box.querySelectorAll('.job-sec-text:not(.fold-text)');
+            for (var i = 0; i < blocks.length; i++) {
+                var t = (textOf(blocks[i]) || '').trim();
+                if (t.length > jd.length) { jd = t; }
+            }
+        }
+        if (!jd) {
+            // 次选：标题之后的第一个 .job-sec-text
+            var sib = headers[h].nextElementSibling;
+            while (sib) {
+                if (sib.classList && sib.classList.contains('job-sec-text')) {
+                    jd = (textOf(sib) || '').trim();
+                    break;
+                }
+                sib = sib.nextElementSibling;
+            }
+        }
+        if (jd) { break; }
+    }
+    if (jd.length < 40) {
+        // 回退：含「职位描述」的最长块（现行行为，保证不丢内容）
+        var sections = document.querySelectorAll(
+            '.job-detail-section, .job-sec, .job-detail-body, .job-sec-text');
+        for (var i = 0; i < sections.length; i++) {
+            var s = (textOf(sections[i]) || '').trim();
+            if (s.indexOf('职位描述') !== -1 && s.length > jd.length) { jd = s; }
+        }
+    }
+    return jd;
+}
+"""
+
+EXTRACT_DETAIL_JS = JD_PICK_JS + """
 (function(){
     var pageText = document.body ? document.body.innerText : '';
     var tags = [];
@@ -1384,14 +1446,7 @@ EXTRACT_DETAIL_JS = """
         if(t && !isBenefit(t)) tags.push(t);
     });
     // 刻意用 innerText（而非 textContent）：跳过 <style>/<script> 源码与 display:none 诱饵文本
-    var jd = '';
-    var sections = document.querySelectorAll('.job-detail-section, .job-sec, .job-detail-body, .job-sec-text');
-    for (var i = 0; i < sections.length; i++) {
-        var text = (sections[i].innerText || '').trim();
-        if (text.indexOf('职位描述') !== -1 && text.length > jd.length) {
-            jd = text;
-        }
-    }
+    var jd = pickJdText(function(el) { return el.innerText || ''; });
     var hrActive = '';
     var hrEl = document.querySelector('.boss-active-time');
     if (hrEl && hrEl.innerText) hrActive = hrEl.innerText.trim();
@@ -1421,7 +1476,7 @@ EXTRACT_DETAIL_JS = """
 #   - 与 DOM 渲染通道同源同页，只是不执行页面 JS。
 #   - 风控处置不变：命中验证码/风控码仍走既有的全停 + 冷却路径。
 # ============================================================
-HTML_DETAIL_JS = """
+HTML_DETAIL_JS = JD_PICK_JS + """
 (function(){
     var url = __URL__;
     return fetch(url, {credentials: 'include'}).then(function(r){
@@ -1434,14 +1489,9 @@ HTML_DETAIL_JS = """
                 var el = doc.querySelector(sel);
                 return el ? (el.textContent || '').trim() : '';
             }
-            // JD：与渲染版同口径——取含「职位描述」的最长区块
-            var jd = '';
-            var sections = doc.querySelectorAll(
-                '.job-detail-section, .job-sec, .job-detail-body, .job-sec-text');
-            for (var i = 0; i < sections.length; i++) {
-                var s = (sections[i].textContent || '').trim();
-                if (s.indexOf('职位描述') !== -1 && s.length > jd.length) { jd = s; }
-            }
+            // JD：与渲染版同口径（pickJdText）——取真正的 .job-sec-text 正文，
+            // 不把薪资详情 / HR 活跃块带进来
+            var jd = pickJdText(function(el) { return el.textContent || ''; });
             if (!jd) {
                 var fallback = doc.querySelector('.job-sec-text, .job-detail-section');
                 if (fallback) jd = (fallback.textContent || '').trim();
@@ -1463,10 +1513,22 @@ HTML_DETAIL_JS = """
             body.querySelectorAll('[style*="display:none"],[style*="display: none"]'
             ).forEach(function(n){ n.remove(); });
             var pageText = (body.textContent || '').replace(/\\s+/g, ' ').trim();
+            // 标题：`.job-name` 在 SSR HTML 里**恒为空**（实测），真正的岗位名在
+            // `.job-banner .name / h1 / .job-title`（首行是岗位名，其后是薪资）
+            var bannerRaw = (function(){
+                var el = doc.querySelector('.job-banner .name, h1, .job-title');
+                if (!el) return '';
+                var parts = (el.textContent || '').split(/\\n+/);
+                for (var p = 0; p < parts.length; p++) {
+                    var v = parts[p].replace(/\\s+/g, ' ').trim();
+                    if (v) return v;
+                }
+                return '';
+            })();
             return JSON.stringify({
                 ok: true,
                 jd: jd,
-                title: txt('.job-name'),
+                title: bannerRaw,
                 salary: txt('.salary'),
                 company: txt('.company-name'),
                 hr_active_time: txt('.boss-active-time'),
@@ -1945,6 +2007,11 @@ def _park_html_tab(ws, sid, url=HTML_PARK_URL, timeout=20):
     return False
 
 
+def _norm_title(text):
+    """岗位标题归一化（去空白 + 小写），用于"取回页面是否目标岗位"的一致性比对。"""
+    return re.sub(r"\s+", "", str(text or "")).lower()
+
+
 def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
                                  limiter=None):
     """详情页 HTML 直取（DOM 通道快路径）：同源 fetch 详情页 → 解析 → 抽 JD。
@@ -1990,6 +2057,19 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
             payload = json.loads(raw)
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             raise DetailExtractionError(f"HTML 直取响应不可解析: {exc}") from exc
+        # 取回的页面必须与目标岗位一致：实测平台会间歇性对 fetch 请求返回
+        # **别的岗位**的内容（同一批链接不同时间返回过完全不同的 JD 段）。
+        # 标题对不上 → 判直取失败（上层自动回退渲染版），**绝不把别的岗位的 JD
+        # 记成目标岗位的 JD**。
+        want_title = str(job.get("title") or "").strip()
+        got_title = str(payload.get("title") or "").strip()
+        if want_title and got_title and _norm_title(got_title) != _norm_title(want_title):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "invalid_detail",
+                    "message": (f"直取页面与目标岗位不一致"
+                                f"（目标「{want_title}」/取回「{got_title}」），"
+                                "疑似平台返回了其它岗位，改走渲染版"),
+                    "channel": "html"}
         if not payload.get("ok"):
             reason = payload.get("reason")
             if reason == "http":
@@ -7125,7 +7205,7 @@ def build_parser():
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
     g_detail.add_argument("--detail-channel", default="dom",
                            choices=["auto", "api", "dom", "html", "panel", "encrypt"],
-                           help="详情通道（默认 dom）：dom=整页渲染详情页（document 导航，唯一有生产证据的形态——2026-09-23 用它跑出 1005 条/天、只撞可人工解开的滑块验证码）；html=详情页 HTML 直取（DOM 家族快路径：同源 fetch 首屏 SSR HTML、不渲染，单岗 ~180ms，JD 与渲染版字符重合 99.7%%+，失败自动回退渲染；请求形态与 dom 不同，尚无生产证据）；auto=有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM（旧默认）；api/encrypt=详情 API 通道（已封存：该接口被平台限流并升级为短时账号封禁，见 tangzhiyao/boss-show-time#42）；panel=复用停靠搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
+                           help="详情通道（默认 dom）：dom=整页渲染详情页（document 导航，唯一有生产证据的形态——2026-09-23 用它跑出 1005 条/天、只撞可人工解开的滑块验证码）；html=**已封存**：详情页 HTML 直取（同源 fetch 首屏 SSR HTML、不渲染）。封存依据（2026-10-22 真机实测）：(1) 平台会间歇性对 fetch 请求返回**别的岗位**的 JD（实测一个「AI产品销售经理」岗取回的是房产岗的 JD）；(2) 该路径用 textContent 抽取，会把 SSR 里的 display:none 诱饵文本一起带进 JD；且在 --detail-rate 绝对限速下**零吞吐收益**（限速器才是瓶颈，渲染路径 3 并发即可撑满 1 req/s）。**默认用 dom**；auto=有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM（旧默认）；api/encrypt=详情 API 通道（已封存：该接口被平台限流并升级为短时账号封禁，见 tangzhiyao/boss-show-time#42）；panel=复用停靠搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
     g_detail.add_argument("--detail-rate", type=float, default=1.0, metavar="RPS",
                            help="详情页请求速率上限（次/秒，绝对值、与并发数解耦；默认 1.0）。平台对详情页访问次数有日累计预算，超速拿不到更多记录、只提高风控档位（2026-09-23 1 条/秒 → 只撞可解的滑块验证码；2026-10-21 2.6 条/秒 → 撞账号限时限制）")
     g_detail.add_argument("--daily-detail-budget", type=int, default=700, metavar="N",
