@@ -98,6 +98,20 @@ _budget_consume = _daily_budget.consume
 _budget_remaining = _daily_budget.remaining
 
 try:
+    from scripts import semantics as _semantics
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import semantics as _semantics
+
+classify_post_type = _semantics.classify_post_type
+normalize_title = _semantics.normalize_title
+content_fingerprint = _semantics.content_fingerprint
+group_duplicates = _semantics.group_duplicates
+supply_plan = _semantics.supply_plan
+supply_gap = _semantics.supply_gap
+check_invariants = _semantics.check_invariants
+invariant_failures = _semantics.invariant_failures
+
+try:
     from scripts import db_store as _db_store
 except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
     import db_store as _db_store
@@ -3303,9 +3317,71 @@ def merge_jobs(external_path, new_jobs):
 
     old_jobs = old_data.get("jobs", [])
     merged = merge_unique(old_jobs, new_jobs)
+    # 链接凭证取新（2026-10-22）：平台 job_detail URL = securityId + **短时效 token**，
+    # 旧链接隔天会指向别的岗位（实测：昨天的链接今天取回银雁科技/德佑等）。
+    # 同一 job_id 再次出现时**新链接覆盖旧链接**（凭证取新不取旧），其余字段保持旧记录。
+    refreshed = _refresh_links_in_jobs(merged, new_jobs)
+    if refreshed:
+        print(f"🔗 链接刷新: {refreshed} 条改用本次的新链接（平台 URL 是短时效凭证）")
     added = len(merged) - len(old_jobs)
     print(f"合并: 旧文件 {len(old_jobs)} 条 + 新抓取 {len(new_jobs)} 条 = {len(merged)} 条 (新增 {added})")
     return merged
+
+
+def _refresh_links_in_jobs(jobs, fresh_jobs):
+    """把同 job_id 的**新链接**覆盖到旧记录上，返回更新条数。
+
+    平台 `job_detail` URL = securityId + 短时效 token（实测隔天会指向别的岗位；
+    只用 job_id 拼 URL 会 404）→ 链接是"抓取时刻有效的一次性入口"，耐久主键是 job_id。
+    """
+    fresh = {}
+    for job in fresh_jobs or []:
+        if not isinstance(job, dict):
+            continue
+        jid = job.get("job_id")
+        link = job.get("job_link") or job.get("link")
+        if jid and link:
+            fresh[jid] = link
+    changed = 0
+    stamp = datetime.now().isoformat(timespec="seconds")
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        jid = job.get("job_id")
+        if jid in fresh and job.get("job_link") != fresh[jid]:
+            job["job_link"] = fresh[jid]
+            job["link"] = fresh[jid]
+            job["link_verified_at"] = stamp
+            changed += 1
+    return changed
+
+
+def refresh_links_in_export(export_path, fresh_jobs):
+    """按 job_id 用新鲜链接刷新导出里的 job_link（链接失效后的恢复手段）。
+
+    返回 ``(updated, missing)``：``updated`` = 刷新的条数；``missing`` = 列表里已不再
+    出现（岗位下架或换了关键词）的 job_id 数量。
+    """
+    try:
+        with open(export_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise DetailExtractionError(f"导出文件读取失败: {exc}") from exc
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        raise DetailExtractionError("导出文件里没有 jobs 列表")
+    updated = _refresh_links_in_jobs(jobs, fresh_jobs)
+    fresh_ids = {j.get("job_id") for j in (fresh_jobs or [])
+                 if isinstance(j, dict) and j.get("job_id")}
+    missing = [j.get("job_id") for j in jobs
+               if isinstance(j, dict) and j.get("job_id") not in fresh_ids]
+    if isinstance(data, dict):
+        data["links_refreshed_at"] = datetime.now().isoformat(timespec="seconds")
+        data["links_missing_count"] = len(missing)
+        if missing:
+            data["links_missing_job_ids"] = missing[:200]
+        _atomic_write_export_json(export_path, data)
+    return updated, len(missing)
 
 
 def merge_details(external_path, new_details):
@@ -4150,6 +4226,18 @@ def build_detail_record(job, extracted):
         "brand_scale_name": extracted.get("brand_scale_name", ""),
         "brand_industry_name": extracted.get("brand_industry_name", ""),
         "brand_active_time": extracted.get("brand_active_time", ""),
+        # ── 语义层标注（2026-10-22）──
+        # post_type: 发布主体类型（direct 企业直招 / agency 猎头代发 / anonymous 匿名）。
+        #   平台在列表侧已用 proxy_job/proxy_type 标注，此前我们从不语义化使用 →
+        #   猎头代发岗（公司名匿名、薪资带虚高：实测 25 条代理岗 11 条上限 ≥50K，
+        #   企业直招岗 0 条）混在结果里，求职端无法分辨。
+        "post_type": classify_post_type(job),
+        # title_key: 标题归一化键（分组/匹配用，展示仍用平台原值）
+        "title_key": normalize_title(job.get("title", "")),
+        # link_verified_at: 该链接在**抓取时刻**被验证有效。平台 URL = securityId +
+        #   短时效 token（实测隔天会返回别的岗位；只用 job_id 拼 URL 会 404），
+        #   所以链接是"临时入口"而非耐久标识，耐久主键是 job_id。
+        "link_verified_at": datetime.now().isoformat(timespec="seconds"),
     }
 
 
@@ -5326,6 +5414,47 @@ def _detail_channel_metadata(list_data, requested_channel, channel_stats,
     if stats_supplied:
         metadata["detail_channel_counts"] = {}
     return metadata
+
+
+def _check_supply_vs_budget(list_data, detail_budget=None):
+    """比对「今天还没抓过的岗位数」与「今日剩余详情额度」，把**真实产出上限**算出来。
+
+    为什么需要（2026-10-22 根因定位）：平台单个「关键词×城市」组合的搜索深度上限约
+    10 页，且第 11 页起内容重复（实测请求 20 页 → "第 11 页与之前页内容重复（翻页失效）"
+    → 239 条），单组合最多约 240-300 个岗位；日额度 700 装不下。此前**详情额度（按次数）
+    与列表供给（按页数×组合）之间没有任何协调机制** → "额度没花完但没岗可抓"是结构性缺口。
+
+    这里把缺口算出来并给出补法（多关键词/多城市由 --keyword/--city 逗号分隔内建支持，
+    列表侧按 job_id 自动合并去重）。
+    """
+    budget = DAILY_DETAIL_BUDGET if detail_budget is None else detail_budget
+    jobs = (list_data or {}).get("jobs") or []
+    state = _daily_budget.read_state()
+    ledger = set(state["jobs"])
+    todo = [j for j in jobs
+            if isinstance(j, dict) and j.get("job_id") not in ledger]
+    if not budget:
+        info = {"list_jobs": len(jobs), "todo_today": len(todo),
+                "budget_remaining": None, "supply_gap": 0, "need_combos": 0,
+                "ceiling": len(todo)}
+        print(f"\n[供给 × 额度] 列表 {len(jobs)} 岗｜今天还没抓过 {len(todo)} 个｜未设额度上限")
+        return info
+    remaining = max(int(budget) - int(state["detail"]), 0)
+    gap, need_combos = supply_gap(remaining, len(todo))
+    ceiling = min(len(todo), remaining)
+    print(f"\n[供给 × 额度] 列表 {len(jobs)} 岗｜今天还没抓过 {len(todo)} 个｜额度剩余 {remaining}")
+    if gap > 0:
+        print(f"  ⚠️ 供给比额度少 {gap} 个岗位 → **今天实际产出上限 {ceiling} 条**"
+              f"（不是 {remaining} 条）")
+        print(f"     按单组合 ≈{_semantics.COMBO_CAPACITY} 岗算，还需 {need_combos} 个"
+              "「关键词×城市」组合，例如：")
+        print('     --keyword "AI产品经理,AIGC产品经理,大模型产品经理" --city "杭州"')
+        print("     （列表侧按 job_id 自动合并去重；列表请求不占详情页额度）")
+    else:
+        print(f"  ✅ 供给充足（{len(todo)} ≥ {remaining}），可以把额度跑满")
+    return {"list_jobs": len(jobs), "todo_today": len(todo),
+            "budget_remaining": remaining, "supply_gap": gap,
+            "need_combos": need_combos, "ceiling": ceiling}
 
 
 def scrape_details(list_data, max_details=None, output_path=None,
@@ -7145,6 +7274,10 @@ def build_parser():
     g_search.add_argument("--city", default=DEFAULT_CITY_INPUT,
                           help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
     g_search.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
+    g_search.add_argument("--refresh-links", metavar="EXPORT_PATH", default=None,
+                          help="按 job_id 用**新拉取的列表链接**刷新导出里的 job_link"
+                               "（平台 URL 是短时效凭证，隔天会指向别的岗位；本模式只发列表"
+                               "请求，不占详情页日额度）")
     g_search.add_argument("--max-jobs", type=int, default=None,
                           help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
     g_search.add_argument("--max-concurrent", type=int, default=1,
@@ -7808,6 +7941,19 @@ def _run_cli_impl(p, args):
             if args.format == "csv":
                 write_csv(merged_path.rsplit(".", 1)[0] + ".csv",
                           list_data.get("jobs") or [])
+        # ── --refresh-links：只刷新链接，不抓详情 ──
+        if args.refresh_links:
+            fresh_jobs = list_data.get("jobs") or []
+            updated, missing = refresh_links_in_export(
+                args.refresh_links, fresh_jobs)
+            print(f"🔗 链接刷新完成：{updated}/{len(fresh_jobs)} 条用上新链接"
+                  f"｜列表里已找不到的岗位 {missing} 个（已下架或换了关键词）")
+            print(f"   刷新目标：{args.refresh_links}")
+            if missing:
+                print("   ⚠️ 这些 job_id 在当前列表里查不到（岗位可能已下架）——"
+                      "耐久主键是 job_id，需要时可按它重新检索")
+            return 0
+
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
         if db_state is not None:
@@ -7852,6 +7998,8 @@ def _run_cli_impl(p, args):
             pending_ids = load_pending_ids(
                 args.detail_output or default_output_path("details"),
                 force_ids=args.retry_job)
+        # 供给 × 额度协调（2026-10-22）：额度是上限，供给才是真实产出天花板
+        supply_info = None
         # CDP 熔断冷却检查：冷却期内拒绝自动重开（防"熔断→立即重启→再熔断"循环）
         cooldown = check_cdp_cooldown()
         if cooldown is not None:
@@ -7867,6 +8015,8 @@ def _run_cli_impl(p, args):
                 preloaded_details = load_db_details(db_conn, _job_ids)
                 if preloaded_details:
                     print(f"🗄️  SQLite 命中 {len(preloaded_details)} 条历史详情（断点续抓）")
+            # 供给 × 额度协调检查：把"今天的真实产出上限"算出来（额度 ≠ 供给）
+            supply_info = _check_supply_vs_budget(list_data)
             sidecar_owned = None
             try:
                 # 仅 live list run 自建 sidecar，且只覆盖详情调用窗口。
@@ -7917,10 +8067,13 @@ def _run_cli_impl(p, args):
             detail_channel_meta = _detail_channel_metadata(
                 list_data, args.detail_channel, channel_stats, stats_supplied=True)
             if export_path:
+                extra_meta = dict(detail_channel_meta)
+                if supply_info:
+                    extra_meta["supply"] = supply_info
                 merged_export = _merge_jd_into_export(
                     export_path, details, base=list_data,
                     keep_without_jd=args.keep_without_jd,
-                    extra_meta=detail_channel_meta)
+                    extra_meta=extra_meta)
                 if merged_export:
                     kept, dropped = merged_export
                     print(f"✅ 口径一：导出 {kept} 条（含 jd）"

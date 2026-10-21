@@ -7,6 +7,14 @@
 """
 
 import json
+
+try:
+    from scripts import semantics as _semantics
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    try:
+        import semantics as _semantics
+    except ImportError:  # pragma: no cover - 独立拷贝时语义层不可用则降级
+        _semantics = None
 import logging
 import os
 import re
@@ -484,11 +492,17 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
 
     jd_map = {}
     activity_map = {}
+    semantic_map = {}
     for d in details or []:
         if isinstance(d, dict) and d.get("job_id") and str(d.get("jd") or "").strip():
             jid = str(d["job_id"])
             jd_map[jid] = d["jd"]
             activity_map[jid] = d.get("boss_active_status")
+            semantic_map[jid] = {
+                key: d.get(key) for key in
+                ("post_type", "title_key", "link_verified_at")
+                if d.get(key)
+            }
 
     jobs = data["jobs"]
     kept, dropped_ids = [], []
@@ -504,6 +518,8 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
                 job.get("boss_active_status"), activity_map.get(jid))
             if activity:
                 job["boss_active_status"] = activity
+            for key, value in (semantic_map.get(jid) or {}).items():
+                job[key] = value
             kept.append(job)
             with_jd += 1
         elif keep_without_jd:
@@ -526,6 +542,32 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         warnings.append(
             f"口径一：已剔除 {len(dropped_ids)} 条无 JD 岗位（见 meta.dropped_no_jd）")
         data["warnings"] = warnings
+    # ── 语义层统计与自检（2026-10-22）──────────────────────────────
+    # 把"逐条读数据才能发现的问题"变成机器检查：发布主体类型分布、同源重复投放、
+    # JD 污染/长度、关键字段空值率、链接时效标注。任一项不达标 → 写进 warnings。
+    if _semantics is not None:
+        try:
+            counts = {}
+            for job in kept:
+                key = str(job.get("post_type") or "unlabeled")
+                counts[key] = counts.get(key, 0) + 1
+            data["post_type_counts"] = counts
+            fingerprint_by_id, sizes = _semantics.group_duplicates(kept)
+            dup_groups = {fp: n for fp, n in sizes.items() if n > 1}
+            data["duplicate_groups"] = {
+                "group_count": len(dup_groups),
+                "records_in_groups": sum(dup_groups.values()),
+                "max_group": max(dup_groups.values()) if dup_groups else 0,
+            }
+            invariants = _semantics.check_invariants(kept, data)
+            data["invariants"] = invariants
+            failures = _semantics.invariant_failures(invariants)
+            if failures:
+                warns = list(data.get("warnings") or [])
+                warns.append("数据完整性自检未通过：" + "；".join(failures))
+                data["warnings"] = warns
+        except Exception as exc:  # pragma: no cover - 自检失败不得影响导出
+            data.setdefault("warnings", []).append(f"数据完整性自检异常：{exc}")
     if extra_meta:
         data.update(_sanitize_payload(extra_meta))
     _atomic_write_json(target_path, _sanitize_payload(data))

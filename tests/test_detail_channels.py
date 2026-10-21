@@ -396,10 +396,11 @@ class DetailChannelTests(unittest.TestCase):
                     mock.patch.object(module, "write_security_sidecar", return_value=None), \
                     mock.patch.object(module, "_merge_jd_into_export", side_effect=fake_merge):
                 module.run_cli()
-        self.assertEqual(merged["extra_meta"], {
-            "detail_channel": "mixed",
-            "detail_channel_counts": {"api": 1, "dom": 1, "panel": 1},
-        })
+        # 通道元数据必须原样带进导出（2026-10-22 起 extra_meta 还会带 supply：
+        # 供给 × 额度协调结果，故此处只断言通道相关键）
+        self.assertEqual(merged["extra_meta"]["detail_channel"], "mixed")
+        self.assertEqual(merged["extra_meta"]["detail_channel_counts"],
+                         {"api": 1, "dom": 1, "panel": 1})
 
 
 if __name__ == "__main__":
