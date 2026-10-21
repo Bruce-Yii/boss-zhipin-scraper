@@ -6935,3 +6935,188 @@ class ComplianceRedlineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DailyBudgetAndRiskTierTests(unittest.TestCase):
+    """日预算 + 风控分级（2026-10-21）。
+
+    背景：平台对**详情页访问次数**有日累计预算（09-23 实测 ~700/~994 两道墙，
+    同日另一轮在 693 处撞到「账户受限 + 定时恢复」）。本组用例锁住两条防线：
+    ① 请求前记日预算、超限立即停（不浪费一次真实请求）；
+    ② 「访问受限」页分级为账号级/请求级，冷却时长随之不同。
+    """
+
+    def _detail_job(self, job_id="job-1"):
+        return {
+            "job_id": job_id,
+            "title": "AI产品经理",
+            "boss_name": "某公司",
+            "salary": "30-60K",
+            "salary_source": "api",
+            "location": "杭州·滨江区",
+            "tags": "3-5年 | 本科",
+            "job_link": "https://www.zhipin.com/job_detail/abc.html",
+            "boss_active_status": "在线",
+        }
+
+    @contextlib.contextmanager
+    def _mock_detail_page(self, module, jd_text):
+        """构造 mock 的详情页环境（与 ChromeSetupTests 同款）。"""
+        ws = mock.Mock()
+        detail_url = "https://www.zhipin.com/job_detail/abc.html"
+        good = json.dumps({
+            "jd": f"职位描述\n{jd_text}",
+            "page_text": f"职位描述\n{jd_text}",
+            "tags": ["Python"],
+            "url": detail_url,
+        })
+        ws.eval_js.return_value = good
+        with mock.patch.object(module, "CDPSession", return_value=ws), \
+                mock.patch.object(module, "create_page_session",
+                                  return_value=("tid-1", "sid-1")), \
+                mock.patch.object(module, "probe_risk_page", return_value={}), \
+                mock.patch.object(module, "classify_risk_page", return_value=(False, "", "")), \
+                mock.patch.object(module.time, "sleep"), \
+                mock.patch.object(module.random, "uniform", return_value=1.0), \
+                mock.patch.object(module.random, "randint", return_value=3), \
+                mock.patch.object(module.random, "random", return_value=0.1):
+            yield ws, detail_url
+
+    def test_restore_minutes_parses_platform_text(self):
+        module = load_module()
+        future = time.time() + 3600
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(future))
+        minutes = module._restore_minutes_from_now(stamp)
+        self.assertGreater(minutes, 50)
+        self.assertLess(minutes, 70)
+
+    def test_restore_minutes_returns_zero_for_unparsable(self):
+        module = load_module()
+        self.assertEqual(module._restore_minutes_from_now(""), 0)
+        self.assertEqual(module._restore_minutes_from_now("未声明"), 0)
+
+    def test_blocked_classification_splits_account_and_request_level(self):
+        """账号级：要求重新登录 或 声明的恢复时间 > 30 分钟；否则为请求级。"""
+        module = load_module()
+        category, _ = module._classify_blocked("", True)
+        self.assertEqual(category, "account_risk")
+        category, _ = module._classify_blocked("", False)
+        self.assertEqual(category, "env_risk")
+        future = time.time() + 7200
+        stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(future))
+        category, minutes = module._classify_blocked(stamp, False)
+        self.assertEqual(category, "account_risk")
+        self.assertGreater(minutes, 100)
+
+    def test_risk_cooldown_seconds_by_tier(self):
+        """账号级冷却到声明的恢复时刻（至少 30 分钟）；请求级 5-10 分钟。"""
+        module = load_module()
+        self.assertGreaterEqual(module._risk_cooldown_seconds("env_risk"), 300)
+        self.assertLessEqual(module._risk_cooldown_seconds("env_risk"), 600)
+        self.assertGreaterEqual(module._risk_cooldown_seconds("account_risk"), 1800)
+        self.assertEqual(module._risk_cooldown_seconds("captcha"), 0)
+
+    def test_classify_risk_page_detects_restricted_page(self):
+        """「访问受限」页：cardCount==0 的空列表豁免**不得**放过它。"""
+        module = load_module()
+        probe = {
+            "url": "https://www.zhipin.com/job_detail/x.html",
+            "title": "BOSS直聘",
+            "hasSlider": False,
+            "hasLoginWall": False,
+            "cardCount": 0,
+            "rateLimited": False,
+            "blocked": True,
+            "blockedRestore": "",
+            "blockedLoginRequired": False,
+        }
+        is_risk, reason, category = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertEqual(category, "env_risk")
+        self.assertIn("访问受限", reason)
+
+    def test_classify_risk_page_restricted_page_is_account_level(self):
+        module = load_module()
+        probe = {
+            "url": "https://www.zhipin.com/job_detail/x.html",
+            "title": "BOSS直聘",
+            "hasSlider": False,
+            "hasLoginWall": False,
+            "cardCount": 0,
+            "rateLimited": False,
+            "blocked": True,
+            "blockedRestore": "2099-01-01 00:00",
+            "blockedLoginRequired": True,
+        }
+        is_risk, reason, category = module.classify_risk_page(probe)
+        self.assertTrue(is_risk)
+        self.assertEqual(category, "account_risk")
+
+    def test_dom_path_stops_when_daily_budget_exhausted(self):
+        """日预算用满 → 立即停，**不发起**页面导航。"""
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (ws, _url):
+            with mock.patch.object(module, "_consume_detail_page_budget",
+                                   return_value=(False, 700, 700)):
+                result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "daily_budget_exhausted")
+        # 不应发起页面导航（收尾的 Target.closeTarget 不算）
+        nav_calls = [c for c in ws.send.call_args_list
+                     if c.args and c.args[0] == "Page.navigate"]
+        self.assertEqual(nav_calls, [])
+
+    def test_html_path_stops_when_daily_budget_exhausted(self):
+        module = load_module()
+        ws = mock.Mock()
+        with mock.patch.object(module, "_consume_detail_page_budget",
+                               return_value=(False, 700, 700)):
+            result = module._scrape_one_detail_via_html(
+                self._detail_job(), ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "daily_budget_exhausted")
+        ws.eval_js_async.assert_not_called()
+
+    def test_html_path_blocked_page_reports_account_risk(self):
+        """受限页 → risk_timeout + account_blocked（不是普通解析失败）。"""
+        module = load_module()
+        ws = mock.Mock()
+        payload = json.dumps({
+            "ok": True,
+            "jd": "",
+            "page_text": ("访问受限 抱歉，您暂时无法访问此页面 您的 IP 存在异常行为，"
+                          "请登录后使用 您的账户存在异常行为，已暂时被限制访问！"
+                          "将于 2099-01-01 00:00 恢复正常"),
+            "tags": [],
+        }, ensure_ascii=False)
+        ws.eval_js_async.return_value = payload
+        with mock.patch.object(module, "_consume_detail_page_budget",
+                               return_value=(True, 1, 700)):
+            result = module._scrape_one_detail_via_html(
+                self._detail_job(), ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "risk_timeout")
+        self.assertEqual(result["category"], "account_risk")
+        self.assertGreaterEqual(result.get("cooldown_seconds", 0), 1800)
+
+    def test_default_detail_channel_is_dom(self):
+        """默认通道是整页渲染（document 导航，唯一有生产证据的形态）。"""
+        module = load_module()
+        parser = module.build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.detail_channel, "dom")
+
+    def test_default_rate_is_absolute_not_scaled_by_concurrency(self):
+        """速率上限是绝对值（1 req/s），不随并发线性放大。"""
+        module = load_module()
+        parser = module.build_parser()
+        args = parser.parse_args([])
+        self.assertAlmostEqual(args.detail_rate, 1.0)
+        self.assertAlmostEqual(module.DETAIL_PAGE_RATE_PER_SECOND, 1.0)
+
+    def test_default_daily_budget_is_700(self):
+        module = load_module()
+        parser = module.build_parser()
+        args = parser.parse_args([])
+        self.assertEqual(args.daily_detail_budget, 700)
+        self.assertEqual(module.DAILY_DETAIL_BUDGET, 700)
+

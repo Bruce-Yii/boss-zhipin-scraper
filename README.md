@@ -173,8 +173,10 @@ python3 scripts/job_summary.py --top 15
 | `--format` | json / csv；csv 会同时导出列表和详情 CSV |
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
-| `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐）。API 通道使用共享 tab 池，但请求由 `BurstThrottle(center=2.25)` 全局串行节流（目标约 0.44 req/s，含 burst 惩罚）；不按 worker 固定间隔，也不按并发 N 线性放大。DOM 通道（含 html 直取）使用自适应限速，panel 通道保持串行 |
-| `--detail-channel` | 详情通道：`html`（默认，DOM 家族快路径：同源 fetch 详情页首屏 SSR HTML、不渲染，实测 ~180ms/岗，JD 与渲染版字符重合 99.7%+，失败自动回退渲染）/ `dom`（强制整页渲染）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`（严格 securityId）/ `encrypt`（强制 encryptJobId API，不依赖 securityId 有效期，串行）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路）。meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
+| `--concurrency` | 详情抓取并发度（默认 1=串行）。**并发只决定同时在飞几个，不决定请求速率**——速率由 `--detail-rate` 统一控制。API 通道使用共享 tab 池，请求由 `BurstThrottle(center=2.25)` 全局串行节流（目标约 0.44 req/s）；DOM 通道用自适应限速器，panel 通道保持串行 |
+| `--detail-rate RPS` | 详情页请求速率上限（次/秒，**绝对值、与并发数解耦**；默认 1.0）。平台对详情页访问次数有日累计预算，超速拿不到更多记录、只提高风控档位（09-23 1 条/秒 → 只撞可解的滑块验证码；10-21 2.6 条/秒 → 撞账号限时限制） |
+| `--daily-detail-budget N` | 详情页访问日预算（请求次数，**跨 run 累计**，默认 700；0=不限）。计数文件在仓库外 `~/.boss-zhipin-scraper/daily_budget.json`，`BOSS_DAILY_BUDGET_PATH` 可覆盖 |
+| `--detail-channel` | 详情通道：`dom`（默认，整页渲染详情页，document 导航，**唯一有生产证据的形态**——2026-09-23 用它跑出 1005 条/天、只撞可人工解开的滑块验证码）/ `html`（详情页 HTML 直取：同源 fetch 首屏 SSR HTML、不渲染，单岗 ~180ms，JD 与渲染版字符重合 99.7%+，失败自动回退渲染；**请求形态与 dom 不同，尚无生产证据**）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`·`encrypt`（详情 API 通道，**已封存**：该接口被平台限流并升级为短时账号封禁，见 tangzhiyao/boss-show-time#42）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路）。meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |
 | `--foreground-capture` | 列表/登录探测/详情 DOM 改用前台 Target；用于 Chrome 在 Linux/Xvfb 下后台 Target 捕获不到搜索响应的环境（默认保持后台） |
