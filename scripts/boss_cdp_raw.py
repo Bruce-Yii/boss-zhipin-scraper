@@ -1839,7 +1839,8 @@ def _park_html_tab(ws, sid, url=HTML_PARK_URL, timeout=20):
     return False
 
 
-def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False):
+def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
+                                 limiter=None):
     """详情页 HTML 直取（DOM 通道快路径）：同源 fetch 详情页 → 解析 → 抽 JD。
 
     与渲染版同源同页，只是不执行页面 JS：
@@ -1857,6 +1858,11 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False):
     link = job.get("job_link", "")
     t0 = time.time()
     try:
+        # 全局限速：HTML 直取同样消耗真实请求配额，**不得绕过限速**
+        # （CONTRIBUTING 红线：去掉限速与预算帽的改动不接受）。与渲染版
+        # 共用同一把令牌桶，节律口径完全一致。
+        if limiter is not None:
+            limiter.acquire()
         js = HTML_DETAIL_JS.replace("__URL__", json.dumps(link))
         raw = ws.eval_js_async(js, sid, timeout=30)
         _dom_stage("HTML 取数", time.time() - t0)
@@ -5075,9 +5081,15 @@ def scrape_details(list_data, max_details=None, output_path=None,
     # 逐岗自建（保持本 PR 范围最小）。
     dom_session = None
     dom_tab_failed = False
-    if detail_channel == "dom" and jobs:
+    if detail_channel in ("dom", "html") and jobs:
         try:
             dom_session = _open_dom_tab(cdp_port)
+            if detail_channel == "html" and not _park_html_tab(
+                    dom_session[0], dom_session[2]):
+                # 停靠失败（源不对/页面起不来）→ 关掉，回退逐岗自建
+                _close_api_tab(dom_session)
+                dom_session = None
+                dom_tab_failed = True
         except _cdp_exception_types():
             log.warning("共享 DOM tab 建立失败，回退逐岗自建会话", exc_info=True)
             dom_tab_failed = True
@@ -5161,13 +5173,26 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 dom_tab_failed = True
                 dom_session = None
 
-        result = _scrape_one_detail(job, cdp_port, verbose=True,
+        if detail_channel == "html" and dom_session is not None:
+            result = _scrape_one_detail_via_html(
+                job, dom_session[0], dom_session[2])
+            if not result["ok"] and result["reason"] == "invalid_detail":
+                # HTML 直取没拿到 JD → 回退渲染版保数据完整
+                result = _scrape_one_detail(job, cdp_port, verbose=True,
                                     security_id=job_security,
                                     api_session=api_session,
                                     city_code=detail_city_code,
                                     search_keyword=detail_keyword,
                                     id_mode=job_id_mode,
                                     dom_session=dom_session)
+        else:
+            result = _scrape_one_detail(job, cdp_port, verbose=True,
+                                        security_id=job_security,
+                                        api_session=api_session,
+                                        city_code=detail_city_code,
+                                        search_keyword=detail_keyword,
+                                        id_mode=job_id_mode,
+                                        dom_session=dom_session)
         # 风控码二分：仅 token_expired（会话/令牌过期）值得换 tab 刷新后重试一次；
         # env_risk/account_risk/security_block 换 tab 无用 → 不重试，直接全停冷却
         if (result["reason"] == "risk_timeout" and job_security
@@ -5659,7 +5684,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 if detail_channel == "html" and dom_sess is not None:
                     # HTML 直取：停靠 tab 上同源 fetch 详情页（不渲染）
                     result = _scrape_one_detail_via_html(
-                        job, dom_sess[0], dom_sess[2], stop_event=stop_event)
+                        job, dom_sess[0], dom_sess[2], stop_event=stop_event,
+                        limiter=limiter)
                     if not result["ok"] and result["reason"] == "invalid_detail":
                         # HTML 直取没拿到 JD → 回退渲染版保数据完整
                         result = _scrape_one_detail(

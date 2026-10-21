@@ -5962,6 +5962,17 @@ class DomSpeedupTests(unittest.TestCase):
         # 关键：HTML 直取**不得**触发页面导航（Page.navigate）
         ws.send.assert_not_called()
 
+    def test_html_channel_acquires_global_rate_limiter(self):
+        """HTML 直取必须走全局限速器（红线：不得去掉限速与预算帽）。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js_async.return_value = self._html_payload()
+        limiter = mock.Mock()
+        job = {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html"}
+        result = module._scrape_one_detail_via_html(job, ws, "s", limiter=limiter)
+        self.assertTrue(result["ok"], result.get("message"))
+        limiter.acquire.assert_called_once()
+
     def test_html_channel_detects_access_restricted_page(self):
         """「访问受限」页（HTTP 200 但正文是限制页）→ 判风控并全停，不当解析失败。"""
         module = load_module()

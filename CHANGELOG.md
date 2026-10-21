@@ -10,6 +10,8 @@
   - JD 保真：首屏 HTML 已含完整 JD（`.job-sec-text`），与渲染版抽取的 JD **字符重合
     99.7%-100%**（HTML 侧还多带标签/技能）。
   - HTML 直取失败（JD 过短/解析失败）自动回退整页渲染，保数据完整。
+  - HTML 直取**接入全局限速器**（与渲染版同一把令牌桶）：不因换通道而抬高
+    请求频率，符合 CONTRIBUTING「不得去掉限速与预算帽」红线。
   - `--detail-channel` 默认值由 `auto` 改为 `html`（2026-10-21 用户拍板"默认 DOM"；
     详情 API 通道改为需显式 `--detail-channel api`）。
 - **就绪等待改为页面内 await**：`Runtime.evaluate` + `awaitPromise` 一次 CDP 往返替代
