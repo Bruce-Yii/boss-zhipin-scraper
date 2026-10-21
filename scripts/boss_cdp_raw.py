@@ -600,14 +600,19 @@ INDUSTRY_MAP = {
 _request_budget = {"probe": 0, "list": 0, "detail": 0}
 
 
-def _consume_detail_page_budget(n=1):
-    """记一次**详情页请求**到日预算；超限返回 (False, used, limit)。
+def _consume_detail_page_budget(n=1, job_id=""):
+    """记一次**详情页请求**到日预算；返回 ``(allowed, used, limit, reason)``。
 
     计数口径是**请求次数**而非岗位数（平台数的是请求）：DOM 渲染一次岗位 = 1 次
     页面导航；HTML 直取一次岗位 = 1 次 fetch；直取失败回退渲染时同一岗位会发
     2 次请求，两次都计。
+
+    ``job_id`` 传入时记入**今日已抓台账**：同一岗位当天第二次抓取返回
+    ``reason="duplicate"``，**不消耗额度**——日额度因此必然换来互不重复的岗位
+    （2026-10-21 实测教训：多 run 各写独立输出文件，按输出文件去重失效，
+    700 的额度只换来 97 个不同岗位）。
     """
-    return _budget_consume(n, DAILY_DETAIL_BUDGET)
+    return _budget_consume(n, DAILY_DETAIL_BUDGET, job_id=job_id or None)
 
 
 def incr_request(kind="list"):
@@ -1963,7 +1968,12 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
         # （CONTRIBUTING 红线：去掉限速与预算帽的改动不接受）。与渲染版
         # 共用同一把令牌桶，节律口径完全一致。
         # 日预算：详情页请求前先记一次（超限立即停）
-        allowed, used, limit = _consume_detail_page_budget()
+        allowed, used, limit, why = _consume_detail_page_budget(job_id=job_id)
+        if why == "duplicate":
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "skipped_today",
+                    "message": "今天已抓过该岗位（不重复消耗日额度）",
+                    "channel": "html"}
         if not allowed:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "daily_budget_exhausted",
@@ -4962,7 +4972,12 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
 
         detail_url = build_detail_url(job)
         # 日预算：详情页请求前先记一次（超限立即停，不浪费一次真实请求）
-        allowed, used, limit = _consume_detail_page_budget()
+        allowed, used, limit, why = _consume_detail_page_budget(job_id=job_id)
+        if why == "duplicate":
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "skipped_today",
+                    "message": "今天已抓过该岗位（不重复消耗日额度）",
+                    "channel": "dom"}
         if not allowed:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "daily_budget_exhausted",
@@ -5575,6 +5590,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 print(f"  已进入冷却期（{CDP_COOLDOWN_SECONDS}s），可运行 --stop-chrome 后重新 --setup-chrome 再继续。")
                 break
             continue
+        elif reason == "skipped_today":
+            # 当天已抓过 → 不算失败、不进 pending（额度没被浪费，不需要重试）
+            # **继续下一个岗位**（不是停手）
+            serial_done += 1
+            serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            continue
         elif reason == "stopped":
             break
         elif reason == "risk_timeout":
@@ -5936,8 +5957,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 pending.pop(job_id, None)
             return
         reason = result["reason"]
-        if reason in ("invalid_detail", "stopped"):
-            # 停止信号不是岗位失败，不应污染 pending 或触发失败降速。
+        if reason in ("invalid_detail", "stopped", "skipped_today"):
+            # 停止信号/当天已抓过，都不是岗位失败：不应污染 pending 或触发失败降速。
             return
         limiter.record_failure()
         if reason == "login_required":
