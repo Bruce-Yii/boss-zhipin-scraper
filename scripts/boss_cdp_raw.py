@@ -2904,7 +2904,7 @@ DETAIL_CSV_COLUMNS = [
     # 语义层与新鲜度（2026-10-22）：CSV 是用户实际拿到的表，语义标注必须进表，
     # 否则 post_type/active_state/dup_group 只在 JSON 里、CSV 上等于没有。
     "post_type", "active_state", "dup_group", "dup_size", "is_primary",
-    "title_key", "link_verified_at", "page_update_date",
+    "title_key", "link_verified_at", "page_update_date", "recruit_type",
 ]
 
 
@@ -4268,6 +4268,10 @@ def build_detail_record(job, extracted):
         "post_type": classify_post_type(job),
         # title_key: 标题归一化键（分组/匹配用，展示仍用平台原值）
         "title_key": normalize_title(job.get("title", "")),
+        # recruit_type: 招聘类型（social 社招 / intern 实习 / campus 校招）。
+        #   平台的 jobType 实证：4=实习（日薪制）、5=校招（经验=在校/应届）、
+        #   空=社招。实测 35 条实习/校招岗混在社招里（8.5%），薪资口径不可比。
+        "recruit_type": _semantics.classify_recruit_type(job),
         # link_verified_at: 该链接在**抓取时刻**被验证指向这个岗位。平台 URL 含
         #   securityId 段（只用 job_id 拼会 404）→ 链接不能由 job_id 重建，耐久主键是
         #   job_id；链接本身跨天稳定（实测隔天真导航打开仍是同一岗位）。

@@ -763,7 +763,7 @@ class SalaryAnalysisUpgradeTests(unittest.TestCase):
         # 代发岗的虚高区间会抬高混算口径的均值（样本小，中位可能持平）
         self.assertLess(direct["mean_k"], all_market["mean_k"])
         line = module._salary_market_line(summary)
-        self.assertIn("企业直招岗", line)
+        self.assertIn("企业直招", line)
         self.assertIn("猎头代发岗", line)
         self.assertIn("未计入行情", line)
 

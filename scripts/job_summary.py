@@ -220,6 +220,32 @@ def salary_stats(jobs, post_types=None):
     }
 
 
+def _recruit_type_counts(jobs):
+    """招聘类型分布（social/intern/campus）→ 让人知道结果里混了多少非社招岗。"""
+    counts = {}
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        key = _recruit_type_of(job)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _recruit_type_of(job):
+    """招聘类型（social/intern/campus）；没有标注时按社招处理。"""
+    if not isinstance(job, dict):
+        return "social"
+    value = str(job.get("recruit_type") or "").strip()
+    if value:
+        return value
+    raw = str(job.get("job_type") or "").strip()
+    if raw == "4":
+        return "intern"
+    if raw == "5":
+        return "campus"
+    return "social"
+
+
 def _post_type_of(job):
     """取岗位的发布主体类型（direct/agency/anonymous）；没有标注时按 direct 处理。"""
     if not isinstance(job, dict):
@@ -616,6 +642,12 @@ def _build_summary_from_retained(
     # 分层行情（2026-10-22）：直招 vs 代发分开报，避免代发岗的虚高面议区间带偏行情
     direct_market = salary_stats(jobs, post_types={"direct"})
     agency_market = salary_stats(jobs, post_types={"agency", "anonymous"})
+    # 再按招聘类型分层：实习（日薪制）与校招岗和社招**不是同一个薪资口径**，
+    # 主口径只算"社招直招"，其余单列。
+    social_direct = [j for j in jobs
+                      if _post_type_of(j) == "direct" and _recruit_type_of(j) == "social"]
+    social_direct_market = salary_stats(social_direct)
+    non_social_count = sum(1 for j in jobs if _recruit_type_of(j) != "social")
     return {
         "keyword": search_keyword,
         "city": city,
@@ -625,6 +657,9 @@ def _build_summary_from_retained(
         "salary_market": market,
         "salary_market_direct": direct_market,
         "salary_market_agency": agency_market,
+        "salary_market_social_direct": social_direct_market,
+        "recruit_type_counts": _recruit_type_counts(jobs),
+        "non_social_count": non_social_count,
         # 样本量警示：可解析薪资 <30 时结论仅供参考（第四轮统计口径）
         "sample_warning": (market.get("parsed", 0) > 0
                            and market.get("parsed", 0) < 30),
@@ -649,18 +684,35 @@ def _format_items(items, empty="暂无"):
 
 
 def _salary_market_line(summary):
-    """薪资行情行：**主行用直招口径**，代发岗单列说明（其区间是面议、偏高）。"""
+    """薪资行情行：**主行用"社招直招"口径**，代发岗与实习/校招单列说明。
+
+    - 猎头代发岗的薪资带是"面议区间"不是真实区间（偏高）
+    - 实习岗是**日薪制**、校招岗是应届口径 → 与社招**不是同一个薪资口径**
+    """
     direct = summary.get("salary_market_direct") or {}
     agency = summary.get("salary_market_agency") or {}
-    market = direct if direct.get("parsed") else (summary.get("salary_market") or {})
+    social = summary.get("salary_market_social_direct") or {}
+    if social.get("parsed"):
+        market, scope = social, "社招·企业直招"
+    elif direct.get("parsed"):
+        market, scope = direct, "企业直招岗"
+    else:
+        market, scope = (summary.get("salary_market") or {}), "全部岗位"
     if not market.get("parsed"):
         return f"薪资行情: 无法解析（未标注 {market.get('unparsed', 0)} 条）"
-    scope = "企业直招岗" if direct.get("parsed") else "全部岗位"
     line = (f"薪资行情（{scope}）: {market['parsed']} 条可解析，中位 {market['median_k']}K，"
             f"均值 {market['mean_k']}K，区间 {market['low_k']}-{market['high_k']}K")
     if agency.get("parsed"):
         line += (f"；另有 {agency['parsed']} 条猎头代发岗（面议区间、偏高，"
                  f"中位 {agency['median_k']}K，未计入行情）")
+    counts = summary.get("recruit_type_counts") or {}
+    extra = []
+    if counts.get("intern"):
+        extra.append(f"{counts['intern']} 条实习岗（日薪制）")
+    if counts.get("campus"):
+        extra.append(f"{counts['campus']} 条校招岗")
+    if extra:
+        line += "；" + "、".join(extra) + "（口径不同，未计入行情）"
     return line
 
 
