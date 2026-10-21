@@ -217,7 +217,13 @@ def parse_dom_gap(value):
     return (lo, hi)
 LOGIN_PROBE_CACHE_TTL = 600     # 登录探测结果会话内缓存时长（秒，10 分钟）
 # FORMAT_VERSION 已抽出到 scripts/export_contract.py（见顶部导入兼容层）
-SCRAPE_LOCK_PATH = os.path.expanduser("~/.boss-zhipin-scraper/scrape.lock")  # 单进程互斥锁（规格 §3.6）
+# 状态目录（锁 / 冷却 / 缓存都挂在这下面）。BOSS_STATE_DIR 可覆盖，供测试与
+# 多环境隔离——此前单测里只要有一处忘了 mock 路径，就会往真实状态目录写
+# cdp.cooldown：既挡住真实运行（下次实跑直接"冷却中"），也让隔离守卫误报。
+STATE_DIR_ENV = "BOSS_STATE_DIR"
+STATE_DIR = os.environ.get(STATE_DIR_ENV) or os.path.expanduser(
+    "~/.boss-zhipin-scraper")
+SCRAPE_LOCK_PATH = os.path.join(STATE_DIR, "scrape.lock")  # 单进程互斥锁（规格 §3.6）
 
 def get_default_chrome_path():
     system = platform.system()
