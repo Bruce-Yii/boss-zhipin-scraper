@@ -2653,6 +2653,7 @@ class ChromeSetupTests(unittest.TestCase):
     def test_scrape_one_detail_verbose_prints_progress(self):
         module = load_module()
         with self._mock_detail_page(module, "Build AI agents " * 20) as (_ws, _url), \
+                mock.patch.object(module, "DOM_HUMAN_MOTION_ENABLED", True), \
                 mock.patch("builtins.print") as print_mock:
             module._scrape_one_detail(self._detail_job(), cdp_port=9222, verbose=True)
         texts = " ".join(
@@ -2660,6 +2661,17 @@ class ChromeSetupTests(unittest.TestCase):
         )
         self.assertIn("加载页面", texts)
         self.assertIn("模拟滚动", texts)
+
+    def test_scrape_one_detail_skips_human_motion_by_default(self):
+        """拟人动作默认关闭：JD 区就绪后滚动/移鼠对提取无贡献，纯属延时。"""
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (_ws, _url), \
+                mock.patch("builtins.print") as print_mock:
+            module._scrape_one_detail(self._detail_job(), cdp_port=9222, verbose=True)
+        texts = " ".join(
+            str(c[0][0]) for c in print_mock.call_args_list if c[0]
+        )
+        self.assertNotIn("模拟滚动", texts)
 
     def test_scrape_one_detail_non_verbose_stays_quiet(self):
         module = load_module()
@@ -3309,7 +3321,8 @@ class ChromeSetupTests(unittest.TestCase):
                               existing_results=None, output_path=None,
                               write_every=5, list_output_path=None,
                               keyword="", city="", security_map=None,
-                              city_code="", max_seconds=None):
+                              city_code="", max_seconds=None,
+                              detail_channel="dom"):
                 # 模拟真实并发层的落盘行为（写盘在并行层内部完成）
                 captured["concurrency"] = concurrency
                 merged = list(existing_results or []) + [fake_detail]
@@ -5922,6 +5935,78 @@ def _normalize_version(raw):
 
 class DomSpeedupTests(unittest.TestCase):
     """DOM 详情提速（专题落地）：就绪轮询 / dialog 清理 / 选择器兜底 / ACT_RE / 页间隔。"""
+
+    def _html_payload(self, **overrides):
+        payload = {
+            "ok": True,
+            "jd": "职位描述：负责 AI 产品需求分析与设计，推动版本交付，" * 12,
+            "page_text": "AI产品经理 杭州 20-40K 职位描述 负责 AI 产品需求分析",
+            "tags": ["AI产品", "B端"],
+            "hr_active_time": "刚刚活跃",
+        }
+        payload.update(overrides)
+        return json.dumps(payload, ensure_ascii=False)
+
+    def test_html_channel_extracts_jd_without_rendering(self):
+        """HTML 直取：同源 fetch 首屏 → 解析 → 出 JD（不导航不渲染）。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js_async.return_value = self._html_payload()
+        job = {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html",
+               "title": "AI产品经理"}
+        result = module._scrape_one_detail_via_html(job, ws, "s")
+        self.assertTrue(result["ok"], result.get("message"))
+        self.assertEqual(result["channel"], "html")
+        self.assertIn("需求分析", result["detail"]["jd"])
+        self.assertEqual(result["detail"]["skill_tags"], ["AI产品", "B端"])
+        # 关键：HTML 直取**不得**触发页面导航（Page.navigate）
+        ws.send.assert_not_called()
+
+    def test_html_channel_acquires_global_rate_limiter(self):
+        """HTML 直取必须走全局限速器（红线：不得去掉限速与预算帽）。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js_async.return_value = self._html_payload()
+        limiter = mock.Mock()
+        job = {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html"}
+        result = module._scrape_one_detail_via_html(job, ws, "s", limiter=limiter)
+        self.assertTrue(result["ok"], result.get("message"))
+        limiter.acquire.assert_called_once()
+
+    def test_html_channel_detects_access_restricted_page(self):
+        """「访问受限」页（HTTP 200 但正文是限制页）→ 判风控并全停，不当解析失败。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js_async.return_value = self._html_payload(
+            jd="",
+            page_text="访问受限 抱歉，您暂时无法访问此页面 您的 IP 存在异常行为 "
+                      "您的账户存在异常行为，已暂时被限制访问！")
+        job = {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html"}
+        result = module._scrape_one_detail_via_html(job, ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "risk_timeout")
+        self.assertEqual(result.get("category"), "account_risk")
+
+    def test_html_channel_short_jd_is_invalid_detail(self):
+        """JD 过短（真实渲染失败）→ invalid_detail，由上层决定是否回退渲染。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js_async.return_value = self._html_payload(jd="太短")
+        job = {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html"}
+        result = module._scrape_one_detail_via_html(job, ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "invalid_detail")
+
+    def test_html_channel_http_403_is_login_required(self):
+        """HTTP 403 → 登录墙（login_required），不是普通失败。"""
+        module = load_module()
+        ws = mock.Mock()
+        ws.eval_js_async.return_value = json.dumps(
+            {"ok": False, "reason": "http", "code": 403})
+        job = {"job_id": "j1", "job_link": "https://www.zhipin.com/job_detail/x.html"}
+        result = module._scrape_one_detail_via_html(job, ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "login_required")
 
     def test_wait_for_detail_ready_returns_true_when_ready(self):
         module = load_module()

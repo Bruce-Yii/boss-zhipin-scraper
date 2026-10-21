@@ -164,7 +164,7 @@ python3 "$SUMMARY_PATH" \
 | `--max-details` | 全部 | 详情页数量上限 |
 | `--analysis` | 关闭 | 输出分析报告 |
 | `--concurrency N` | 1 | 详情抓取并发度（2-3 推荐；越高成功率越低，含全局限速与错误率自适应降速） |
-| `--detail-channel` | auto | 详情通道：auto/api/dom/panel（panel=复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84） |
+| `--detail-channel` | html | 详情通道：html（默认，详情页 HTML 直取，不渲染）/ dom（强制整页渲染）/ auto/api/encrypt/panel |
 | `--max-concurrent N` | 1 | 并发抓取任务数上限（规格硬防线；仅指令显式开启，任一任务风控即全停） |
 | `--keep-without-jd` | 关闭 | 保留无 JD 岗位（默认口径一：详情抓完后剔除无 JD 岗位） |
 | `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |

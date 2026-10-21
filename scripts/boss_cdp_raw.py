@@ -133,6 +133,19 @@ COOL_RESTART_CHROME = False
 # 只拦 media+font、**保 image**——"从不拉图的浏览器"请求瀑布无真人形态（行为
 # 指纹，Playwright 社区共识）；字体拦截不影响 innerText（取码点非字形）。
 DOM_BLOCK_ASSETS_ENABLED = False
+
+# DOM 拟人动作（滚动 / 鼠标移动）：**默认关闭**（--dom-human-motion 开）。
+# 这两个动作发生在 JD 区「已经就绪」之后，对提取 JD 没有任何作用，纯属延时
+# （滚动 1-2 次 × 0.3-0.9s + 鼠标 50% × 0.3-0.8s ≈ 0.3-2.6s/岗）。
+# 2026-10-21 实测：关闭后单岗墙钟下降，且 JD 长度与开启时一致（内容本就渲染完）。
+DOM_HUMAN_MOTION_ENABLED = False
+
+# DOM 阶段耗时统计（--detail-timing 开）：导航 / 就绪 / 抽取 / 拟人动作 分段计时，
+# 用于定位提速空间（实测并发 10 时单岗 ~6.3s，其中页面加载占绝大部分）。
+DOM_TIMING_ENABLED = False
+_DOM_STAGE_LOCK = threading.Lock()
+_DOM_STAGE_SECONDS = {}
+
 DOM_BLOCK_URL_PATTERNS = [
     "*.mp4", "*.webm", "*.mp3", "*.ogg", "*.wav",
     "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
@@ -741,6 +754,18 @@ class CDPSession:
         r = self.send("Runtime.evaluate", {"expression": js, "returnByValue": True}, sid)
         return r.get("result", {}).get("result", {}).get("value", None)
 
+    def eval_js_async(self, js, sid, timeout=20):
+        """在页面内 await 一个 Promise，**一次 CDP 往返**取回结果。
+
+        用于「等 DOM 就绪」这类轮询：页内自己等，CDP 侧只发一次命令，
+        省掉每轮一次往返（就绪 3s / 轮询 0.4s ≈ 8 次往返）。
+        """
+        r = self.send(
+            "Runtime.evaluate",
+            {"expression": js, "returnByValue": True, "awaitPromise": True},
+            sid, timeout=timeout)
+        return r.get("result", {}).get("result", {}).get("value", None)
+
     def close(self):
         self._dead = True
         try:
@@ -1274,12 +1299,123 @@ EXTRACT_DETAIL_JS = """
 })()
 """
 
+# ============================================================
+# 详情页 HTML 直取（DOM 通道的快路径，2026-10-21）
+#
+# 实测依据（真机，2026-10-21）：
+#   - 详情页首屏 SSR 的 HTML **已包含完整 JD**（`.job-sec-text`），
+#     与渲染后 DOM 抽取的 JD 字符重合 99.7%-100%（HTML 侧还多带标签/技能）；
+#   - 同源 fetch 取该 HTML：**151-179ms**；而整页渲染就绪 **~2.05s/岗**，
+#     且阶段分解显示 97.8% 的单岗耗时都在"导航+就绪"。
+#   → 不渲染、只取 HTML，单岗成本可降一个数量级。
+#
+# 与其它通道的边界：
+#   - **不是**详情 API 通道：请求的是详情页 document（带登录 cookie），
+#     不需要 securityId / lid / token，不走 /wapi/zpgeek/job/detail.json；
+#   - 与 DOM 渲染通道同源同页，只是不执行页面 JS。
+#   - 风控处置不变：命中验证码/风控码仍走既有的全停 + 冷却路径。
+# ============================================================
+HTML_DETAIL_JS = """
+(function(){
+    var url = __URL__;
+    return fetch(url, {credentials: 'include'}).then(function(r){
+        if (!r.ok) {
+            return JSON.stringify({ok: false, reason: 'http', code: r.status});
+        }
+        return r.text().then(function(t){
+            var doc = new DOMParser().parseFromString(t, 'text/html');
+            function txt(sel){
+                var el = doc.querySelector(sel);
+                return el ? (el.textContent || '').trim() : '';
+            }
+            // JD：与渲染版同口径——取含「职位描述」的最长区块
+            var jd = '';
+            var sections = doc.querySelectorAll(
+                '.job-detail-section, .job-sec, .job-detail-body, .job-sec-text');
+            for (var i = 0; i < sections.length; i++) {
+                var s = (sections[i].textContent || '').trim();
+                if (s.indexOf('职位描述') !== -1 && s.length > jd.length) { jd = s; }
+            }
+            if (!jd) {
+                var fallback = doc.querySelector('.job-sec-text, .job-detail-section');
+                if (fallback) jd = (fallback.textContent || '').trim();
+            }
+            var tags = [];
+            doc.querySelectorAll(
+                '.job-tags .tag-all span, .job-keyword-list span, .job-keyword-list li'
+            ).forEach(function(s){
+                var x = (s.textContent || '').trim();
+                if (x && tags.indexOf(x) === -1) { tags.push(x); }
+            });
+            // 可见文本近似 innerText：SSR HTML 的 textContent 会带 <script>/<style>
+            // 源码与 display:none 诱饵文本（项目纪律：必须用 innerText 语义）。
+            // 这里克隆 body 后剔除脚本/样式/隐藏节点再取文本。
+            var body = doc.body.cloneNode(true);
+            body.querySelectorAll(
+                'script,style,noscript,template,[hidden]'
+            ).forEach(function(n){ n.remove(); });
+            body.querySelectorAll('[style*="display:none"],[style*="display: none"]'
+            ).forEach(function(n){ n.remove(); });
+            var pageText = (body.textContent || '').replace(/\\s+/g, ' ').trim();
+            return JSON.stringify({
+                ok: true,
+                jd: jd,
+                title: txt('.job-name'),
+                salary: txt('.salary'),
+                company: txt('.company-name'),
+                hr_active_time: txt('.boss-active-time'),
+                tags: tags.slice(0, 30),
+                page_text: pageText.slice(0, 12000),
+                html_len: t.length
+            });
+        });
+    }).catch(function(e){
+        return JSON.stringify({ok: false, reason: 'fetch', error: String(e)});
+    });
+})()
+"""
+
+# 停靠页：HTML 直取需要页面处于 www.zhipin.com 源（同源 fetch 才带 cookie）。
+# 用搜索页（真实列表页，与右面板通道同一形态），停靠后整轮只 fetch 不再导航。
+HTML_PARK_URL = "https://www.zhipin.com/web/geek/job"
+
+# 详情页「访问受限」页判据（2026-10-21 实测命中）：
+#   访问受限 抱歉，您暂时无法访问此页面 您的 IP 存在异常行为 …
+#   您的账户存在异常行为，已暂时被限制访问！将于 … 恢复正常
+# 该页 HTTP 仍是 200、正文里也没有 JD，**必须**判成风控（risk_timeout +
+# account_risk）而不是普通解析失败——否则账号已被限制时工具会继续硬打，
+# 把"暂时限制"拖成更长的封禁。
+DETAIL_BLOCKED_MARKERS = (
+    "访问受限",
+    "暂时被限制访问",
+    "账户存在异常行为",
+    "账号存在异常行为",
+    "IP 存在异常行为",
+)
+
+
 # DOM 详情"就绪判定"：JD 区出现即视为渲染完成（替代固定 sleep，提速核心）
 DETAIL_READY_JS = """
 (function(){
     return document.querySelector(
         '.job-detail-section, .job-sec, .job-detail-body, .job-sec-text') !== null;
 })()
+"""
+
+# 页面内等待 JD 区就绪（awaitPromise）：**一次 CDP 往返**替代每 0.4s 一次的轮询。
+# 就绪 3s ≈ 8 次往返 → 1 次；页面侧轮询间隔 30ms（比 CDP 往返便宜得多）。
+DETAIL_READY_WAIT_JS = """
+new Promise(function(resolve){
+    var sel = '.job-detail-section, .job-sec, .job-detail-body, .job-sec-text';
+    var limit = __LIMIT_MS__;
+    var t0 = Date.now();
+    function tick(){
+        if (document.querySelector(sel)) { resolve(true); return; }
+        if (Date.now() - t0 >= limit) { resolve(false); return; }
+        setTimeout(tick, 30);
+    }
+    tick();
+})
 """
 
 # 移除可能遮挡 JD 的弹窗/遮罩（Snseam 手法：dialog-wrap/boss-layer/boss-popup）
@@ -1672,6 +1808,117 @@ def _open_dom_tab(cdp_port):
     if DOM_BLOCK_ASSETS_ENABLED:
         _apply_asset_blocking(ws, sid)
     return [ws, tid, sid, 0]
+
+
+def _park_html_tab(ws, sid, url=HTML_PARK_URL, timeout=20):
+    """把 tab 停靠到 www.zhipin.com（同源 fetch 才带登录 cookie）。
+
+    停靠一次后整轮只 fetch、不再导航。返回是否停靠成功。
+    """
+    try:
+        ws.send("Page.navigate", {"url": url}, sid)
+    except _cdp_exception_types():
+        log.warning("HTML 停靠页导航失败", exc_info=True)
+        return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            state = ws.eval_js("document.readyState", sid)
+        except _cdp_exception_types():
+            return False
+        if state in ("interactive", "complete"):
+            # 文档已就绪再确认源正确（同源 fetch 的前提）
+            try:
+                origin = ws.eval_js("location.origin", sid)
+            except _cdp_exception_types():
+                return False
+            if origin and "zhipin.com" in str(origin):
+                return True
+            return False
+        time.sleep(0.2)
+    return False
+
+
+def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
+                                 limiter=None):
+    """详情页 HTML 直取（DOM 通道快路径）：同源 fetch 详情页 → 解析 → 抽 JD。
+
+    与渲染版同源同页，只是不执行页面 JS：
+      - 实测 fetch 详情页 151-179ms，渲染整页 ~2.05s/岗（97.8% 耗时在"导航+就绪"）；
+      - 首屏 SSR HTML 已含完整 JD，与渲染版字符重合 99.7%-100%。
+
+    风控语义不变：HTTP 401/403 视为登录墙，其余失败按 invalid_detail 归类，
+    由上层决定回退渲染还是继续。
+    """
+    job_id = job.get("job_id", "")
+    if stop_event is not None and stop_event.is_set():
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "stopped", "message": "已收到停止信号",
+                "channel": "html"}
+    link = job.get("job_link", "")
+    t0 = time.time()
+    try:
+        # 全局限速：HTML 直取同样消耗真实请求配额，**不得绕过限速**
+        # （CONTRIBUTING 红线：去掉限速与预算帽的改动不接受）。与渲染版
+        # 共用同一把令牌桶，节律口径完全一致。
+        if limiter is not None:
+            limiter.acquire()
+        js = HTML_DETAIL_JS.replace("__URL__", json.dumps(link))
+        raw = ws.eval_js_async(js, sid, timeout=30)
+        _dom_stage("HTML 取数", time.time() - t0)
+        if not isinstance(raw, str):
+            raise DetailExtractionError("HTML 直取无响应")
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise DetailExtractionError(f"HTML 直取响应不可解析: {exc}") from exc
+        if not payload.get("ok"):
+            reason = payload.get("reason")
+            if reason == "http":
+                code = payload.get("code")
+                if code in (401, 403):
+                    return {"ok": False, "detail": None, "job_id": job_id,
+                            "reason": "login_required",
+                            "message": f"HTML 直取 HTTP {code}（疑似登录墙）",
+                            "channel": "html"}
+                raise DetailExtractionError(f"HTML 直取 HTTP {code}")
+            raise DetailExtractionError(
+                f"HTML 直取失败: {payload.get('error') or reason}")
+        extracted = {
+            "jd": payload.get("jd", ""),
+            "page_text": payload.get("page_text", ""),
+            "tags": payload.get("tags", []),
+            "hr_active_time": payload.get("hr_active_time", ""),
+        }
+        # 「访问受限」页优先判风控：HTTP 200 但正文是限制页，不能当解析失败
+        page_text = extracted["page_text"] or ""
+        for marker in DETAIL_BLOCKED_MARKERS:
+            if marker in page_text:
+                return {"ok": False, "detail": None, "job_id": job_id,
+                        "reason": "risk_timeout",
+                        "message": f"详情页返回访问受限页（{marker}）："
+                                   "账号/IP 被临时限制，已停止本轮",
+                        "category": "account_risk", "channel": "html"}
+        # 与渲染版共用同一套 JD 清洗/校验（职位描述切分、招聘者尾部剥离、噪声行剥离、
+        # 空白归一、最小长度校验、HR 活跃度兜底）
+        fields = extract_detail_fields(extracted)
+        extracted["jd"] = fields["jd"]
+        extracted["boss_active_status"] = fields["boss_active_status"]
+        extracted["page_update_date"] = fields["page_update_date"]
+        return {"ok": True, "detail": build_detail_record(job, extracted),
+                "job_id": job_id, "reason": "", "message": "",
+                "channel": "html"}
+    except DetailLoginRequiredError as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "login_required", "message": str(exc),
+                "channel": "html"}
+    except DetailExtractionError as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "invalid_detail", "message": str(exc),
+                "channel": "html"}
+    except _cdp_exception_types() as exc:
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "cdp_session", "message": str(exc), "channel": "html"}
 
 
 def _parse_detail_api_value(val, job):
@@ -4311,11 +4558,53 @@ def progress_line(completed, total, ok_count):
 # 由文件顶部导入兼容层 re-export（见 P1 架构重构 2026-09-22）。
 
 
+def _dom_stage(name, seconds):
+    """累计一个 DOM 阶段的耗时（--detail-timing 开时生效）。"""
+    if not DOM_TIMING_ENABLED:
+        return
+    with _DOM_STAGE_LOCK:
+        acc = _DOM_STAGE_SECONDS.setdefault(name, {"n": 0, "total": 0.0})
+        acc["n"] += 1
+        acc["total"] += seconds
+
+
+def _dom_stage_reset():
+    with _DOM_STAGE_LOCK:
+        _DOM_STAGE_SECONDS.clear()
+
+
+def print_dom_stage_timings(count):
+    """打印 DOM 阶段耗时分解（供提速定位）。"""
+    with _DOM_STAGE_LOCK:
+        stages = dict(_DOM_STAGE_SECONDS)
+    if not stages:
+        return
+    print(f"\n⏱️  DOM 阶段耗时分解（{count} 岗）：")
+    total = sum(s["total"] for s in stages.values())
+    for name, s in sorted(stages.items(), key=lambda kv: -kv[1]["total"]):
+        avg = s["total"] / s["n"] if s["n"] else 0.0
+        share = (s["total"] / total * 100) if total else 0.0
+        print(f"   {name:<12} 合计 {s['total']:7.1f}s  均 {avg:5.2f}s/岗  占比 {share:4.1f}%")
+
+
 def _wait_for_detail_ready(ws, sid, timeout=DETAIL_DOM_READY_TIMEOUT, poll=0.4):
-    """轮询等待详情页 JD 区渲染就绪（就绪即返回 True；超时返回 False）。
+    """等待详情页 JD 区渲染就绪（就绪即返回 True；超时返回 False）。
 
     DOM 详情提速核心：替代原来"导航后固定 sleep 5-10s"——绝大多数页面 1-3s 就绪。
+
+    优先走**页面内等待**（awaitPromise，一次 CDP 往返）；CDP 不支持 awaitPromise
+    或页面报错时回退到原来的宿主侧轮询（行为不变，只是多几次往返）。
     """
+    try:
+        js = DETAIL_READY_WAIT_JS.replace(
+            "__LIMIT_MS__", str(int(timeout * 1000)))
+        value = ws.eval_js_async(js, sid, timeout=timeout + 8)
+        # 只认真正的布尔结果：非 bool（None / 异常包装 / 桩对象）一律回退轮询，
+        # 避免把"拿不到答案"误判成"已就绪"。
+        if isinstance(value, bool):
+            return value
+    except _cdp_exception_types():
+        log.debug("页面内就绪等待不可用，回退宿主侧轮询", exc_info=True)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -4449,19 +4738,23 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
         # 并发模式全局限速：导航（真实请求）前申请配额
         if limiter is not None:
             limiter.acquire()
+        t_nav = time.time()
         ws.send("Page.navigate", {"url": detail_url}, sid)
         if verbose:
             print("  加载页面...")
         # 就绪等待（替代固定 sleep 5-10s）：JD 区出现即继续；就绪后先清弹窗遮罩
         ready = _wait_for_detail_ready(ws, sid)
+        _dom_stage("导航+就绪", time.time() - t_nav)
         _dismiss_dialogs(ws, sid)
         if verbose:
             print(f"  就绪={'是' if ready else '超时'}，抽取中...")
 
         # 页面级风控检测：滑块/验证页/登录墙命中时等待人工介入；
         # 频率受限（rate_limit）跳过人工等待——人滑了也没用，直接冷却停手
+        t_risk = time.time()
         is_risk, risk_reason, risk_category = classify_risk_page(
             probe_risk_page(ws, sid))
+        _dom_stage("风控探测", time.time() - t_risk)
         if is_risk and risk_category == "rate_limit":
             capture_debug_screenshot(ws, sid, "risk")
             return {"ok": False, "detail": None, "job_id": job_id,
@@ -4473,29 +4766,36 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                     "reason": "risk_timeout", "message": risk_reason,
                     "channel": "dom"}
 
-        # 轻量滚动（提速：1-2 次、0.3-0.9s；就绪等待已保证内容渲染，滚动仅作拟人）
-        scroll_count = random.randint(1, 2)
-        if verbose:
-            print(f"  模拟滚动 ({scroll_count} 次)...")
-        for _ in range(scroll_count):
-            if stop_event is not None and stop_event.is_set():
-                return {"ok": False, "detail": None, "job_id": job_id,
-                        "reason": "stopped", "message": "已收到停止信号",
-                        "channel": "dom"}
-            delta = random.randint(200, 500)
-            ws.eval_js(f"window.scrollBy(0,{delta})", sid)
-            time.sleep(random.uniform(0.3, 0.9))
+        # 拟人动作（滚动 / 鼠标）：默认关闭（--dom-human-motion 开）。
+        # JD 区已就绪后再滚动/移鼠对提取没有贡献，只是纯延时。
+        t_motion = time.time()
+        if DOM_HUMAN_MOTION_ENABLED:
+            # 轻量滚动（提速：1-2 次、0.3-0.9s；就绪等待已保证内容渲染，滚动仅作拟人）
+            scroll_count = random.randint(1, 2)
+            if verbose:
+                print(f"  模拟滚动 ({scroll_count} 次)...")
+            for _ in range(scroll_count):
+                if stop_event is not None and stop_event.is_set():
+                    return {"ok": False, "detail": None, "job_id": job_id,
+                            "reason": "stopped", "message": "已收到停止信号",
+                            "channel": "dom"}
+                delta = random.randint(200, 500)
+                ws.eval_js(f"window.scrollBy(0,{delta})", sid)
+                time.sleep(random.uniform(0.3, 0.9))
 
-        # 偶尔模拟鼠标移动（保留但缩短）
-        if random.random() < 0.5:
-            ws.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved",
-                "x": random.randint(200, 800),
-                "y": random.randint(200, 600)
-            }, sid)
-            time.sleep(random.uniform(0.3, 0.8))
+            # 偶尔模拟鼠标移动（保留但缩短）
+            if random.random() < 0.5:
+                ws.send("Input.dispatchMouseEvent", {
+                    "type": "mouseMoved",
+                    "x": random.randint(200, 800),
+                    "y": random.randint(200, 600)
+                }, sid)
+                time.sleep(random.uniform(0.3, 0.8))
+        _dom_stage("拟人动作", time.time() - t_motion)
 
+        t_extract = time.time()
         d = eval_detail_with_retry(ws, sid, detail_url)
+        _dom_stage("抽取", time.time() - t_extract)
         try:
             fields = extract_detail_fields(d)
             d["jd"] = fields["jd"]
@@ -4698,11 +4998,17 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if pending:
         print(f"ℹ️  {len(pending)} 个详情上次抓取失败，本次自动重试")
 
-    # 详情通道选择（--detail-channel）：dom=强制 DOM；panel=右面板；
+    # 详情通道选择（--detail-channel）：dom=强制 DOM 渲染；html=详情页 HTML 直取
+    # （不渲染，见 HTML_DETAIL_JS 说明）；panel=右面板；
     # encrypt=强制 encryptJobId API（串行）；auto/api=按 securityId
     # （auto 缺凭证的岗位先试 encryptJobId API 再落 DOM；api 严格 securityId）
     if detail_channel == "dom":
         security_map = None
+    if detail_channel == "html":
+        # HTML 直取不需要 securityId：走详情页 document，不是详情 API
+        security_map = None
+        print("⚡ HTML 直取通道：同源 fetch 详情页首屏（不渲染），"
+              "单岗实测 ~180ms（渲染版 ~2.05s）")
 
     # 右面板 JD 通道（专题 §1.4 / 上游 #84）：不跳页，复用停靠的真实搜索页，
     # 点卡片 → 读右侧面板（零新增请求；逐条串行，忽略并发设置）
@@ -4730,7 +5036,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             security_map=security_map or {},
             city=list_data.get("city", ""),
             city_code=list_data.get("city_code", ""),
-            max_seconds=max_seconds)
+            max_seconds=max_seconds,
+            detail_channel=detail_channel)
         if pending:
             print(resume_hint(pending, output_path))
         print(f"\n详情已保存: {output_path}")
@@ -4774,9 +5081,15 @@ def scrape_details(list_data, max_details=None, output_path=None,
     # 逐岗自建（保持本 PR 范围最小）。
     dom_session = None
     dom_tab_failed = False
-    if detail_channel == "dom" and jobs:
+    if detail_channel in ("dom", "html") and jobs:
         try:
             dom_session = _open_dom_tab(cdp_port)
+            if detail_channel == "html" and not _park_html_tab(
+                    dom_session[0], dom_session[2]):
+                # 停靠失败（源不对/页面起不来）→ 关掉，回退逐岗自建
+                _close_api_tab(dom_session)
+                dom_session = None
+                dom_tab_failed = True
         except _cdp_exception_types():
             log.warning("共享 DOM tab 建立失败，回退逐岗自建会话", exc_info=True)
             dom_tab_failed = True
@@ -4860,13 +5173,26 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 dom_tab_failed = True
                 dom_session = None
 
-        result = _scrape_one_detail(job, cdp_port, verbose=True,
+        if detail_channel == "html" and dom_session is not None:
+            result = _scrape_one_detail_via_html(
+                job, dom_session[0], dom_session[2])
+            if not result["ok"] and result["reason"] == "invalid_detail":
+                # HTML 直取没拿到 JD → 回退渲染版保数据完整
+                result = _scrape_one_detail(job, cdp_port, verbose=True,
                                     security_id=job_security,
                                     api_session=api_session,
                                     city_code=detail_city_code,
                                     search_keyword=detail_keyword,
                                     id_mode=job_id_mode,
                                     dom_session=dom_session)
+        else:
+            result = _scrape_one_detail(job, cdp_port, verbose=True,
+                                        security_id=job_security,
+                                        api_session=api_session,
+                                        city_code=detail_city_code,
+                                        search_keyword=detail_keyword,
+                                        id_mode=job_id_mode,
+                                        dom_session=dom_session)
         # 风控码二分：仅 token_expired（会话/令牌过期）值得换 tab 刷新后重试一次；
         # env_risk/account_risk/security_block 换 tab 无用 → 不重试，直接全停冷却
         if (result["reason"] == "risk_timeout" and job_security
@@ -5003,6 +5329,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if serial_done:
         print(run_summary(time.time() - start_time,
                           serial_done, serial_ok, serial_reasons))
+        print_dom_stage_timings(serial_done)
     if pending:
         print(resume_hint(pending, output_path))
     print(f"\n详情已保存: {output_path}")
@@ -5187,7 +5514,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              existing_results=None, output_path=None,
                              write_every=5, list_output_path=None,
                              keyword="", city="", security_map=None,
-                             city_code="", max_seconds=None):
+                             city_code="", max_seconds=None,
+                             detail_channel="dom"):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -5345,11 +5673,32 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                             log.warning("DOM 槽位 tab 建立失败，回退逐岗自建",
                                         exc_info=True)
                             dom_sess = None
-                result = _scrape_one_detail(
-                    job, cdp_port, stop_event, limiter,
-                    security_id=job_security, api_session=session,
-                    city_code=city_code, search_keyword=keyword,
-                    dom_session=dom_sess)
+                        else:
+                            # HTML 直取通道：tab 需停靠在 www.zhipin.com（同源 fetch）
+                            if detail_channel == "html" and not _park_html_tab(
+                                    dom_sess[0], dom_sess[2]):
+                                log.warning("HTML 停靠页失败，该槽位回退逐岗自建",
+                                            exc_info=True)
+                                _close_api_tab(dom_sess)
+                                dom_sess = None
+                if detail_channel == "html" and dom_sess is not None:
+                    # HTML 直取：停靠 tab 上同源 fetch 详情页（不渲染）
+                    result = _scrape_one_detail_via_html(
+                        job, dom_sess[0], dom_sess[2], stop_event=stop_event,
+                        limiter=limiter)
+                    if not result["ok"] and result["reason"] == "invalid_detail":
+                        # HTML 直取没拿到 JD → 回退渲染版保数据完整
+                        result = _scrape_one_detail(
+                            job, cdp_port, stop_event, limiter,
+                            security_id=job_security, api_session=session,
+                            city_code=city_code, search_keyword=keyword,
+                            dom_session=dom_sess)
+                else:
+                    result = _scrape_one_detail(
+                        job, cdp_port, stop_event, limiter,
+                        security_id=job_security, api_session=session,
+                        city_code=city_code, search_keyword=keyword,
+                        dom_session=dom_sess)
                 # 风控码二分：仅 token_expired 才换 tab 刷新后重试一次（其余换 tab 无用）
                 if (result["reason"] == "risk_timeout" and job_security
                         and session is not None
@@ -5438,6 +5787,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         if completed:
             print(run_summary(time.time() - start_time,
                               completed, parallel_ok, parallel_reasons))
+            print_dom_stage_timings(completed)
     finally:
         pool.shutdown(wait=True)
         # 关闭详情 API 共享会话池（**异常/崩溃也保证关闭**，防 tab 泄漏）
@@ -6379,13 +6729,9 @@ def build_parser():
     g_detail.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                           help=f"详情抓取并发度（默认 {DEFAULT_CONCURRENCY}=串行；2-3 推荐，"
                                "并发越高成功率越低，含全局限速与错误率自适应降速）")
-    g_detail.add_argument("--detail-channel", default="auto",
-                          choices=["auto", "api", "dom", "panel", "encrypt"],
-                          help="详情通道：auto=有 securityId 走 API，缺凭证先试 "
-                               "encryptJobId API 再落 DOM（默认）；api/dom=强制对应"
-                               "通道（api 严格 securityId）；encrypt=强制 encryptJobId "
-                               "API（不依赖 securityId 有效期，串行）；panel=复用停靠"
-                               "搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
+    g_detail.add_argument("--detail-channel", default="html",
+                           choices=["auto", "api", "dom", "html", "panel", "encrypt"],
+                           help="详情通道（默认 html）：html=详情页 HTML 直取（DOM 家族快路径：同源 fetch 首屏 SSR HTML、不渲染，实测 ~180ms/岗，JD 与渲染版字符重合 99.7%%+，失败自动回退渲染）；dom=强制整页渲染；auto=有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM（旧默认，需显式指定）；api=强制详情 API（严格 securityId）；encrypt=强制 encryptJobId API（不依赖 securityId 有效期，串行）；panel=复用停靠搜索页点卡片读右侧面板 JD（零新增请求、串行；上游 #84 思路）")
     g_detail.add_argument("--dom-gap", default=None, metavar="MIN,MAX",
                           help="DOM 族详情岗位间隔秒数（串行 DOM 与右面板共用；"
                                "默认 4,9。实验参数（#31）：默认值变更需实测边界拍板）")
@@ -6463,6 +6809,13 @@ def build_parser():
     g_general.add_argument("--dom-block-assets", action="store_true",
                            help="DOM 详情页拦截 media/font 资源（保图片维持真人请求形态，"
                                 "提速整页加载；innerText 提取不受字体影响）。默认关闭")
+    g_general.add_argument("--dom-human-motion", action="store_true",
+                           help="DOM 详情页模拟滚动/鼠标移动（拟人动作）。"
+                                "默认关闭：JD 区就绪后再滚动对提取无贡献，纯属延时"
+                                "（约 0.3-2.6s/岗）")
+    g_general.add_argument("--detail-timing", action="store_true",
+                           help="打印 DOM 详情各阶段耗时分解（导航+就绪/风控探测/"
+                                "拟人动作/抽取），用于定位提速空间")
 
     return p
 
@@ -6502,6 +6855,18 @@ def run_cli():
     DOM_BLOCK_ASSETS_ENABLED = bool(getattr(args, "dom_block_assets", False))
     if DOM_BLOCK_ASSETS_ENABLED:
         print("🚫 已启用 --dom-block-assets：DOM 详情页将拦截 media/font 资源（保图片）")
+
+    # DOM 拟人动作：默认关闭（--dom-human-motion 开启）
+    global DOM_HUMAN_MOTION_ENABLED
+    DOM_HUMAN_MOTION_ENABLED = bool(getattr(args, "dom_human_motion", False))
+    if DOM_HUMAN_MOTION_ENABLED:
+        print("🖱️  已启用 --dom-human-motion：DOM 详情页将模拟滚动/鼠标移动（更慢）")
+
+    # DOM 阶段耗时统计：默认关闭（--detail-timing 开启）
+    global DOM_TIMING_ENABLED
+    DOM_TIMING_ENABLED = bool(getattr(args, "detail_timing", False))
+    if DOM_TIMING_ENABLED:
+        _dom_stage_reset()
 
     # 批次冷却（#78）：主动冷却（+可选 Chrome 重启）
     global COOL_EVERY, COOL_SECONDS, COOL_RESTART_CHROME

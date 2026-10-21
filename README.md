@@ -174,7 +174,7 @@ python3 scripts/job_summary.py --top 15
 | `--detail` | 抓取详情页 JD（默认开启） |
 | `--no-detail` | 不抓取详情页 |
 | `--concurrency` | 详情抓取并发度（默认 1=串行；2-3 推荐，含全局限速与错误率自适应降速）。**API 通道并发复用共享 tab 池**，节律约每 worker 15s（`DETAIL_API_PACE_SECONDS`），并发 N 时全局约 N/15 次/秒 |
-| `--detail-channel` | 详情通道：`auto`（默认，有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`（严格 securityId）/ `dom` / `encrypt`（强制 encryptJobId API，不依赖 securityId 有效期，串行）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路） |
+| `--detail-channel` | 详情通道：`html`（默认，DOM 家族快路径：同源 fetch 详情页首屏 SSR HTML、不渲染，实测 ~180ms/岗，JD 与渲染版字符重合 99.7%+，失败自动回退渲染）/ `dom`（强制整页渲染）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`（严格 securityId）/ `encrypt`（强制 encryptJobId API，不依赖 securityId 有效期，串行）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路） |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |
 | `--foreground-capture` | 列表/登录探测/详情 DOM 改用前台 Target；用于 Chrome 在 Linux/Xvfb 下后台 Target 捕获不到搜索响应的环境（默认保持后台） |
