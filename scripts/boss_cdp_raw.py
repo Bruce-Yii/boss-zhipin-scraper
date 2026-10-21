@@ -7123,6 +7123,16 @@ def _run_cli_with_db_cleanup(p, args):
 
 
 RUNNER_TRACE_PATH = os.path.expanduser("~/.boss-zhipin-scraper/runner_trace.jsonl")
+TRACE_PATH_ENV = "BOSS_TRACE_PATH"  # 测试/多环境覆盖（与 BOSS_AUDIT_PATH 同款）
+
+
+def runner_trace_path():
+    """当前运行指纹路径（``BOSS_TRACE_PATH`` 环境变量可覆盖，供测试/多环境）。
+
+    此前是 import 期常量，测试跑一次就会往真实 ``~/.boss-zhipin-scraper/``
+    追加 runner_trace.jsonl——与 2026-09-23 审计日志那次污染同类。
+    """
+    return os.environ.get(TRACE_PATH_ENV) or RUNNER_TRACE_PATH
 
 
 def _parent_chain(n=4):
@@ -7182,8 +7192,9 @@ def log_runner_trace(tag="start", extra=None):
         }
         if extra:
             rec.update(extra)
-        os.makedirs(os.path.dirname(RUNNER_TRACE_PATH), exist_ok=True)
-        with open(RUNNER_TRACE_PATH, "a", encoding="utf-8") as f:
+        path = runner_trace_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass

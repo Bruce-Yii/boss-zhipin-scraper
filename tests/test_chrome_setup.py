@@ -37,6 +37,13 @@ os.environ["BOSS_AUDIT_PATH"] = os.path.join(_TEST_AUDIT_TMP.name, "risk_events.
 # 守卫误报"单测改了真实状态"。import 期整体指到临时目录。
 os.environ["BOSS_STATE_DIR"] = _TEST_AUDIT_TMP.name
 
+# 同款处理：运行指纹（runner_trace.jsonl）此前是 import 期常量，测试跑一次就会
+# 往真实 ~/.boss-zhipin-scraper/ 追加行——实测一次全量单测能写进几十行，
+# 让"来源不明的循环抓取"排查被测试产物污染。改为 import 期重定向到临时目录。
+_TEST_TRACE_TMP = tempfile.TemporaryDirectory(prefix="boss-trace-test-")
+atexit.register(_TEST_TRACE_TMP.cleanup)
+os.environ["BOSS_TRACE_PATH"] = os.path.join(_TEST_TRACE_TMP.name, "runner_trace.jsonl")
+
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "boss_cdp_raw.py"
 
@@ -2318,12 +2325,23 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         self.assertIn(module.TargetCrashedError, module._cdp_exception_types())
 
+    def test_runner_trace_path_env_override(self):
+        """BOSS_TRACE_PATH 可覆盖运行指纹路径（测试/多环境隔离用）。"""
+        module = load_module()
+        with mock.patch.dict(os.environ, {"BOSS_TRACE_PATH": "/tmp/x.jsonl"}):
+            self.assertEqual(module.runner_trace_path(), "/tmp/x.jsonl")
+        env = dict(os.environ)
+        env.pop("BOSS_TRACE_PATH", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(module.runner_trace_path(),
+                             module.RUNNER_TRACE_PATH)
+
     def test_log_runner_trace_writes_fingerprint(self):
         """运行指纹：argv/父进程链写入 runner_trace.jsonl（抓来源不明的循环抓取）。"""
         module = load_module()
         with tempfile_profile() as paths:
             p = str(paths["cdp_profile"] / "runner_trace.jsonl")
-            with mock.patch.object(module, "RUNNER_TRACE_PATH", p), \
+            with mock.patch.object(module, "runner_trace_path", return_value=p), \
                     mock.patch.object(module, "_parent_chain", return_value=[]):
                 module.log_runner_trace("t", extra={"why": "x"})
                 module.log_runner_trace("t2")
