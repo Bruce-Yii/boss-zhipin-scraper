@@ -76,10 +76,12 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
 
 FORMAT_VERSION = _export_contract.FORMAT_VERSION
 _scrub_secrets = _export_contract._scrub_secrets
+_sanitize_payload = _export_contract._sanitize_payload
 _sanitize_job = _export_contract._sanitize_job
 _missing_required_fields = _export_contract._missing_required_fields
 merge_unique = _export_contract.merge_unique
 _atomic_write_json = _export_contract._atomic_write_json
+_atomic_write_export_json = _export_contract._atomic_write_export_json
 cleanup_stale_tmp_files = _export_contract.cleanup_stale_tmp_files
 flush_jobs = _export_contract.flush_jobs
 _merge_jd_into_export = _export_contract._merge_jd_into_export
@@ -1814,7 +1816,7 @@ def filter_inactive_in_export(path, inactive_ids):
         warnings = list(data.get("warnings") or [])
         warnings.append(f"--filter-inactive：已剔除 {dropped} 条 HR 长期未活跃岗位")
         data["warnings"] = warnings
-        _atomic_write_json(path, data)
+        _atomic_write_export_json(path, data)
     return len(kept), dropped
 
 
@@ -2402,26 +2404,32 @@ DETAIL_CSV_COLUMNS = [
 
 
 def write_csv(csv_path, jobs):
-    """将 jobs 列表写入 CSV 文件"""
+    """将 jobs 列表写入 CSV 文件（写出前递归脱敏）。"""
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    cleaned_jobs = _sanitize_payload(jobs or [])
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
-        for j in jobs:
+        for job in cleaned_jobs:
+            if not isinstance(job, dict):
+                continue
             # 确保每列都有值
-            row = {col: j.get(col, "") for col in CSV_COLUMNS}
+            row = {col: job.get(col, "") for col in CSV_COLUMNS}
             writer.writerow(row)
     print(f"CSV 已保存: {csv_path}")
 
 
 def write_detail_csv(csv_path, details):
-    """将岗位详情列表写入 CSV 文件"""
+    """将岗位详情列表写入 CSV 文件（写出前递归脱敏）。"""
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+    cleaned_details = _sanitize_payload(details or [])
     with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=DETAIL_CSV_COLUMNS, extrasaction="ignore")
         writer.writeheader()
-        for d in details:
-            row = {col: d.get(col, "") for col in DETAIL_CSV_COLUMNS}
+        for detail in cleaned_details:
+            if not isinstance(detail, dict):
+                continue
+            row = {col: detail.get(col, "") for col in DETAIL_CSV_COLUMNS}
             if isinstance(row.get("skill_tags"), list):
                 row["skill_tags"] = " | ".join(row["skill_tags"])
             writer.writerow(row)
@@ -3740,7 +3748,7 @@ def save_pending_ids(output_path, ids):
             except OSError:
                 pass
         return
-    _atomic_write_json(path, [
+    _atomic_write_export_json(path, [
         {"job_id": job_id, "attempts": attempts}
         for job_id, attempts in sorted(ids.items())
     ])
@@ -4621,7 +4629,7 @@ def _note_detail_risk_blocked(list_output_path=None, city_name="", keyword=""):
         if not any("detail_risk_blocked" in w for w in warnings):
             warnings.append(
                 "detail_risk_blocked: 验证码命中，已全部停止（保留已抓数据）")
-            _atomic_write_json(list_output_path, meta)
+            _atomic_write_export_json(list_output_path, meta)
     except (OSError, json.JSONDecodeError, ValueError):
         pass
 
@@ -4906,7 +4914,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             print(f"  JD: {len(detail.get('jd',''))} 字 ({time.time()-t0:.0f}s)")
             # 每抓完一个详情就写入，异常退出也能保留
             if output_path:
-                _atomic_write_json(output_path, results)
+                _atomic_write_export_json(output_path, results)
         elif reason == "login_required":
             raise RuntimeError(
                 "BOSS detail login expired; stopped before writing truncated JD data"
@@ -4990,7 +4998,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         _close_api_tab(dom_session)
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
-    _atomic_write_json(output_path, results)
+    _atomic_write_export_json(output_path, results)
     save_pending_ids(output_path, pending)
     if serial_done:
         print(run_summary(time.time() - start_time,
@@ -5131,7 +5139,7 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
                     pending.pop(job_id, None)
                 print(f"  JD: {len(result['detail'].get('jd', ''))} 字")
                 if output_path:
-                    _atomic_write_json(output_path, results)
+                    _atomic_write_export_json(output_path, results)
             elif result["reason"] == "risk_timeout":
                 reasons["risk_timeout"] = reasons.get("risk_timeout", 0) + 1
                 print(f"  ⚠️ {result['message']}")
@@ -5163,7 +5171,7 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
         if dom_session is not None:
             _close_api_tab(dom_session)
     if output_path:
-        _atomic_write_json(output_path, results)
+        _atomic_write_export_json(output_path, results)
     save_pending_ids(output_path, pending)
     if pending:
         print(resume_hint(pending, output_path))
@@ -5242,7 +5250,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
 
     def persist():
         if output_path:
-            _atomic_write_json(output_path, results)
+            _atomic_write_export_json(output_path, results)
             save_pending_ids(output_path, pending)
 
     def handle_result(job, result):
@@ -6808,7 +6816,7 @@ def run_cli():
         # 若处于合并流程，把旧详情并入本次抓取结果并重新落盘，保证 --merge 后详情不丢失
         if merged_details and args.detail_output:
             details = merge_details_from_lists(merged_details, details)
-            _atomic_write_json(args.detail_output, details)
+            _atomic_write_export_json(args.detail_output, details)
             print(f"合并详情已保存: {args.detail_output}")
             if args.format == "csv":
                 detail_csv = args.detail_output.rsplit(".", 1)[0] + ".csv"
