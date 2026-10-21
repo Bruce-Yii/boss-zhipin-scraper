@@ -71,14 +71,43 @@ def split_tags(raw):
 
 
 def is_experience_tag(tag):
+    normalized = str(tag or "").strip()
     return (
-        "年" in tag
-        or tag in {"应届", "在校生", "经验不限", "不限经验"}
+        "年" in normalized
+        or "应届" in normalized
+        or "在校" in normalized
+        or normalized in {"经验不限", "不限经验"}
     )
+
+
+def company_label(job):
+    """Return the canonical company label, preferring the export contract field."""
+    if not isinstance(job, dict):
+        return ""
+    for key in ("company_name", "boss_name", "company"):
+        value = str(job.get(key) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def is_degree_tag(tag):
     return tag in {"初中及以下", "中专/中技", "高中", "大专", "本科", "硕士", "博士", "学历不限"}
+
+
+def experience_tag_for_job(job):
+    """Return the first authoritative experience label for a job.
+
+    The normalized export has an explicit ``experience`` field, while older
+    files and list-only callers may only carry it in ``tags``/``job_labels``.
+    """
+    if not isinstance(job, dict):
+        return ""
+    for field in ("experience", "tags", "job_labels"):
+        for tag in split_tags(job.get(field, "")):
+            if is_experience_tag(tag):
+                return tag
+    return ""
 
 
 def district_from_location(location):
@@ -187,7 +216,7 @@ def salary_stats(jobs):
 def experience_bucket(tag):
     """把经验要求标签归一为档位（用于薪资×经验交叉统计）。"""
     tag = str(tag or "").strip()
-    if tag in {"应届", "在校生"}:
+    if "应届" in tag or "在校" in tag:
         return "应届/在校"
     if tag in {"1年以内", "1-3年"}:
         return "1-3年"
@@ -217,11 +246,7 @@ def salary_by_experience(jobs):
     for job in jobs:
         if not isinstance(job, dict):
             continue
-        bucket = "未标注"
-        for tag in split_tags(job.get("tags", "")):
-            if is_experience_tag(tag):
-                bucket = experience_bucket(tag)
-                break
+        bucket = experience_bucket(experience_tag_for_job(job)) or "未标注"
         parsed = parse_salary_monthly(job.get("salary"))
         if parsed is None:
             unparsed[bucket] += 1
@@ -258,7 +283,7 @@ def top_salary_jobs(jobs, n=10):
         ranked.append({
             "title": str(job.get("title") or "").strip(),
             "salary": str(job.get("salary") or "").strip(),
-            "company": str(job.get("boss_name") or job.get("company") or "").strip(),
+            "company": company_label(job),
             "location": str(job.get("location") or "").strip(),
             "_high": parsed[1],
         })
@@ -310,6 +335,109 @@ def is_sales_job(job, detail=None):
         jd = str(job.get("jd") or "")
     jd_lower = jd.lower()
     return any(t in jd_lower for t in SALES_JD_TERMS)
+
+
+def _record_text_key(value):
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def _record_link_keys(record):
+    return {
+        str(record.get(field) or "").strip()
+        for field in ("job_link", "link")
+        if str(record.get(field) or "").strip()
+    }
+
+
+def _record_title_keys(record):
+    return {
+        _record_text_key(record.get(field))
+        for field in ("title", "job_name")
+        if _record_text_key(record.get(field))
+    }
+
+
+def filter_summary_inputs(jobs, details=None):
+    """Filter sales jobs and their details as one retained input set.
+
+    The list is the source of truth.  A detail is associated by ``job_id``
+    first, then by a unique job link/title for legacy files without IDs.
+    Ambiguous unassociated details are dropped rather than allowed to
+    contaminate the retained statistics.  When no list jobs exist,
+    standalone detail files remain usable (the existing summary CLI behavior).
+    Returns ``(retained_jobs, retained_details, sales_filtered)``.
+    """
+    jobs = [job for job in (jobs or []) if isinstance(job, dict)]
+    details = [detail for detail in (details or []) if isinstance(detail, dict)]
+    if not jobs:
+        return [], details, 0
+
+    ids_by_job = {}
+    links_by_job = {}
+    titles_by_job = {}
+    for index, job in enumerate(jobs):
+        job_id = str(job.get("job_id") or "").strip()
+        if job_id:
+            ids_by_job.setdefault(job_id, set()).add(index)
+        for key in _record_link_keys(job):
+            links_by_job.setdefault(key, set()).add(index)
+        for key in _record_title_keys(job):
+            titles_by_job.setdefault(key, set()).add(index)
+
+    detail_job_indices = []
+    for detail in details:
+        job_id = str(detail.get("job_id") or "").strip()
+        if job_id:
+            candidates = set(ids_by_job.get(job_id, ()))
+        else:
+            candidates = set()
+            for key in _record_link_keys(detail):
+                candidates.update(links_by_job.get(key, ()))
+                if candidates:
+                    break
+            if not candidates:
+                for key in _record_title_keys(detail):
+                    candidates.update(titles_by_job.get(key, ()))
+                    if candidates:
+                        break
+            if not candidates:
+                # A lone legacy job is the only safe positional-free
+                # association available for an unkeyed detail.
+                unkeyed = [
+                    index for index, job in enumerate(jobs)
+                    if not str(job.get("job_id") or "").strip()
+                ]
+                if len(unkeyed) == 1:
+                    candidates.add(unkeyed[0])
+        detail_job_indices.append(candidates)
+
+    details_by_job = {index: [] for index in range(len(jobs))}
+    for detail, candidates in zip(details, detail_job_indices, strict=True):
+        for index in candidates:
+            details_by_job[index].append(detail)
+
+    sales_flags = []
+    for index, job in enumerate(jobs):
+        is_sales = is_sales_job(job)
+        if not is_sales:
+            is_sales = any(
+                is_sales_job(job, detail) for detail in details_by_job[index]
+            )
+        sales_flags.append(is_sales)
+
+    retained_jobs = [
+        job for index, job in enumerate(jobs) if not sales_flags[index]
+    ]
+    sales_filtered = sum(sales_flags)
+    retained_indices = {
+        index for index, is_sales in enumerate(sales_flags) if not is_sales
+    }
+    retained_details = [
+        detail
+        for detail, candidates in zip(details, detail_job_indices, strict=True)
+        if candidates and candidates.issubset(retained_indices)
+    ]
+    return retained_jobs, retained_details, sales_filtered
 
 
 def term_appears_in_jd(term, jd_text):
@@ -366,26 +494,23 @@ def is_jd_noise_term(term):
 
 
 def build_summary(jobs, details=None, search_keyword="", city="", top=10):
-    details = filter_details_for_jobs(jobs, details or [])
-    detail_by_id = {
-        str(d.get("job_id")).strip(): d
-        for d in details
-        if isinstance(d, dict) and str(d.get("job_id") or "").strip()
-    }
+    retained_jobs, retained_details, sales_filtered = filter_summary_inputs(
+        jobs, details or []
+    )
+    return _build_summary_from_retained(
+        retained_jobs,
+        retained_details,
+        search_keyword=search_keyword,
+        city=city,
+        top=top,
+        sales_filtered=sales_filtered,
+    )
 
-    # 销售岗过滤：关键词模糊匹配混入的非目标岗剔除（title/JD 特征判定）
-    sales_filtered = 0
-    kept = []
-    for job in jobs:
-        if not isinstance(job, dict):
-            continue
-        detail = detail_by_id.get(str(job.get("job_id") or "").strip())
-        if is_sales_job(job, detail):
-            sales_filtered += 1
-            continue
-        kept.append(job)
-    jobs = kept
 
+def _build_summary_from_retained(
+    jobs, details, search_keyword="", city="", top=10, sales_filtered=0
+):
+    """Build aggregate statistics from an already filtered input set."""
     salary_ranges = Counter()
     experience = Counter()
     degrees = Counter()
@@ -407,7 +532,7 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         if district:
             districts[district] += 1
 
-        company = str(job.get("boss_name") or job.get("company") or "").strip()
+        company = company_label(job)
         if company:
             companies[company] += 1
 
@@ -419,10 +544,14 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         if stage:
             company_stages[stage] += 1
 
+        experience_tag = experience_tag_for_job(job)
+        if experience_tag:
+            experience[experience_tag] += 1
+
         for tag in split_tags(job.get("tags", "")):
             if is_experience_tag(tag):
-                experience[tag] += 1
-            elif is_degree_tag(tag):
+                continue
+            if is_degree_tag(tag):
                 degrees[tag] += 1
             else:
                 cleaned = clean_skill_tag(tag)
@@ -649,11 +778,7 @@ def generate_charts(jobs, output_dir, filename_prefix="summary"):
         if parsed is None:
             continue
         low, high = parsed
-        bucket = "未标注"
-        for tag in split_tags(job.get("tags", "")):
-            if is_experience_tag(tag):
-                bucket = experience_bucket(tag)
-                break
+        bucket = experience_bucket(experience_tag_for_job(job)) or "未标注"
         rows.append({"mid_k": (low + high) / 2, "bucket": bucket})
     if not rows:
         return []
@@ -746,7 +871,15 @@ def main(argv=None):
         return 1
     keyword = args.keyword if args.keyword is not None else metadata.get("keyword", "")
     city = args.city if args.city is not None else metadata.get("city", "")
-    summary = build_summary(jobs, details, search_keyword=keyword, city=city, top=args.top)
+    jobs, details, sales_filtered = filter_summary_inputs(jobs, details)
+    summary = _build_summary_from_retained(
+        jobs,
+        details,
+        search_keyword=keyword,
+        city=city,
+        top=args.top,
+        sales_filtered=sales_filtered,
+    )
 
     # 详情文件路径：--details 优先，否则复用 boss 的自动查找逻辑（供提示词引用）
     details_path = args.details

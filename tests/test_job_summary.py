@@ -142,6 +142,156 @@ class JobSummaryTests(unittest.TestCase):
         text = module.format_summary(summary)
         self.assertIn("已剔除 2 条疑似销售岗", text, "摘要应标注剔除")
 
+    def test_filter_summary_inputs_removes_sales_details_together(self):
+        module = load_summary_module()
+        jobs = [
+            {
+                "job_id": "target",
+                "title": "AI产品经理",
+                "salary": "30-60K",
+                "location": "上海·浦东",
+                "tags": "在校/应届 | 本科",
+                "company_name": "目标公司",
+            },
+            {
+                "job_id": "sales",
+                "title": "AI产品经理",
+                "salary": "8-12K",
+                "location": "上海·徐汇",
+                "tags": "1-3年 | 大专",
+                "company_name": "销售公司",
+            },
+        ]
+        details = [
+            {"job_id": "target", "skill_tags": ["Python"], "jd": "负责 Python RAG 产品建设"},
+            {"job_id": "sales", "skill_tags": ["SalesCRM"], "jd": "负责提成和客户资源，使用 Kafka"},
+        ]
+
+        retained_jobs, retained_details, sales_filtered = module.filter_summary_inputs(jobs, details)
+
+        self.assertEqual([job["job_id"] for job in retained_jobs], ["target"])
+        self.assertEqual([detail["job_id"] for detail in retained_details], ["target"])
+        self.assertEqual(sales_filtered, 1)
+
+    def test_filter_summary_inputs_handles_legacy_unkeyed_inputs(self):
+        module = load_summary_module()
+        jobs = [
+            {"title": "AI产品经理", "salary": "30-60K", "tags": "在校/应届 | 本科",
+             "company_name": "目标公司"},
+            {"title": "AI产品销售经理", "salary": "8-12K", "tags": "1-3年 | 大专"},
+        ]
+        details = [
+            {"title": "AI产品销售经理", "skill_tags": ["SalesCRM"], "jd": "负责提成和客户资源"},
+            {"title": "AI产品经理", "skill_tags": ["Python"], "jd": "Python RAG 产品"},
+        ]
+
+        retained_jobs, retained_details, sales_filtered = module.filter_summary_inputs(jobs, details)
+
+        self.assertEqual(len(retained_jobs), 1)
+        self.assertEqual(len(retained_details), 1)
+        self.assertEqual(retained_details[0]["skill_tags"], ["Python"])
+        self.assertEqual(sales_filtered, 1)
+
+    def test_build_summary_uses_retained_inputs_and_actual_labels(self):
+        module = load_summary_module()
+        jobs = [
+            {
+                "job_id": "target",
+                "title": "AI产品经理",
+                "salary": "30-60K",
+                "location": "上海·浦东",
+                "tags": "在校/应届 | 本科",
+                "company_name": "目标公司",
+            },
+            {
+                "job_id": "sales",
+                "title": "AI产品经理",
+                "salary": "8-12K",
+                "location": "上海·徐汇",
+                "tags": "1-3年 | 大专",
+                "company_name": "销售公司",
+            },
+        ]
+        details = [
+            {"job_id": "target", "skill_tags": ["Python"], "jd": "负责 Python RAG 产品建设"},
+            {"job_id": "sales", "skill_tags": ["SalesCRM"], "jd": "负责提成和客户资源，使用 Kafka"},
+        ]
+
+        summary = module.build_summary(jobs, details, search_keyword="AI产品经理")
+
+        self.assertEqual(summary["total_jobs"], 1)
+        self.assertEqual(summary["total_details"], 1)
+        self.assertEqual(summary["sales_filtered"], 1)
+        self.assertEqual(summary["salary_ranges"], [("30-60K", 1)])
+        self.assertIn(("在校/应届", 1), summary["experience"])
+        self.assertIn("应届/在校", summary["salary_by_experience"])
+        self.assertIn(("目标公司", 1), summary["companies"])
+        self.assertEqual(summary["top_salary"][0]["company"], "目标公司")
+        self.assertNotIn(("SalesCRM", 1), summary["skill_tags"])
+        self.assertNotIn(("Kafka", 1), summary["jd_terms"])
+
+    def test_main_passes_retained_jobs_to_charts(self):
+        module = load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            result_dir = pathlib.Path(tmp)
+            list_path = result_dir / "boss_jobs_20260625_1200.json"
+            details_path = result_dir / "boss_details_20260625_1200.json"
+            list_path.write_text(json.dumps({
+                "keyword": "AI产品经理",
+                "city": "上海",
+                "jobs": [
+                    {"job_id": "target", "title": "AI产品经理", "salary": "30-60K",
+                     "tags": "在校/应届 | 本科", "company_name": "目标公司"},
+                    {"job_id": "sales", "title": "AI产品销售经理", "salary": "8-12K",
+                     "tags": "1-3年 | 大专", "company_name": "销售公司"},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            details_path.write_text(json.dumps([
+                {"job_id": "target", "jd": "Python RAG"},
+                {"job_id": "sales", "jd": "Kafka 提成"},
+            ], ensure_ascii=False), encoding="utf-8")
+            captured = {}
+
+            def fake_charts(jobs, output_dir, filename_prefix="summary"):
+                captured["jobs"] = jobs
+                return []
+
+            with mock.patch.object(module, "generate_charts", side_effect=fake_charts):
+                code = module.main([
+                    "--input", str(list_path),
+                    "--details", str(details_path),
+                    "--summary-only",
+                    "--charts-dir", str(result_dir / "charts"),
+                ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual([job["job_id"] for job in captured["jobs"]], ["target"])
+
+    def test_experience_bucket_recognizes_in_school_graduate_label(self):
+        module = load_summary_module()
+        self.assertEqual(module.experience_bucket("在校/应届"), "应届/在校")
+        self.assertEqual(module.experience_bucket("应届生"), "应届/在校")
+        self.assertTrue(module.is_experience_tag("在校/应届"))
+        self.assertEqual(module.clean_skill_tag("在校/应届"), "")
+
+    def test_structured_experience_and_company_fields_are_authoritative(self):
+        module = load_summary_module()
+        summary = module.build_summary([
+            {
+                "title": "AI产品经理",
+                "salary": "30-60K",
+                "experience": "在校/应届",
+                "company_name": "契约公司",
+                "boss_name": "旧公司",
+                "company": "更旧公司",
+            }
+        ])
+
+        self.assertIn(("在校/应届", 1), summary["experience"])
+        self.assertIn("应届/在校", summary["salary_by_experience"])
+        self.assertIn(("契约公司", 1), summary["companies"])
+        self.assertEqual(summary["top_salary"][0]["company"], "契约公司")
+
     def test_build_summary_uses_list_skills_without_details(self):
         module = load_summary_module()
         jobs = [
