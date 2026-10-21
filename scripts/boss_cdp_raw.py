@@ -2901,6 +2901,10 @@ CSV_COLUMNS = [
 DETAIL_CSV_COLUMNS = [
     "job_id", "title", "company", "salary", "salary_source", "location",
     "boss_active_status", "tags_list", "job_link", "skill_tags", "jd",
+    # 语义层与新鲜度（2026-10-22）：CSV 是用户实际拿到的表，语义标注必须进表，
+    # 否则 post_type/active_state/dup_group 只在 JSON 里、CSV 上等于没有。
+    "post_type", "active_state", "dup_group", "dup_size", "is_primary",
+    "title_key", "link_verified_at", "page_update_date",
 ]
 
 

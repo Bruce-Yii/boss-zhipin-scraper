@@ -171,11 +171,16 @@ def parse_salary_annual(salary):
     return round(low * months, 1), round(high * months, 1)
 
 
-def salary_stats(jobs):
+def salary_stats(jobs, post_types=None):
     """汇总岗位薪资行情：中位/均值/P10-P90 区间（月薪千元）与解析覆盖率。
 
     口径（第四轮调研修正）：区间用 P10/P90 分位替代 min/max（极值在
     小样本不稳定）；中位数取两中位均值（偶数样本）。
+
+    `post_types`（2026-10-22 新增）：只统计指定发布主体类型。**猎头代发岗的薪资带
+    是"面议区间"不是真实区间**（实测 25 条代发岗里 11 条上限 ≥50K，而直招岗 13/243），
+    混在一起算会把行情均值/虚高岗位数一起带偏（实测全量均值 28.2K vs 直招 26.1K，
+    ≥50K 的岗位 24 条 vs 13 条）→ 求职端该看的是**直招口径**。
 
     Returns:
         dict: {"parsed", "unparsed", "median_k", "mean_k", "low_k", "high_k"}；
@@ -187,6 +192,8 @@ def salary_stats(jobs):
     unparsed = 0
     for job in jobs:
         if not isinstance(job, dict):
+            continue
+        if post_types is not None and _post_type_of(job) not in post_types:
             continue
         parsed = parse_salary_monthly(job.get("salary"))
         if parsed is None:
@@ -211,6 +218,18 @@ def salary_stats(jobs):
         "low_k": round(float(low_series.quantile(0.1)), 1),
         "high_k": round(float(high_series.quantile(0.9)), 1),
     }
+
+
+def _post_type_of(job):
+    """取岗位的发布主体类型（direct/agency/anonymous）；没有标注时按 direct 处理。"""
+    if not isinstance(job, dict):
+        return "direct"
+    value = str(job.get("post_type") or "").strip()
+    if value:
+        return value
+    if str(job.get("proxy_job") or "").strip() or str(job.get("proxy_type") or "").strip():
+        return "agency"
+    return "direct"
 
 
 def experience_bucket(tag):
@@ -594,6 +613,9 @@ def _build_summary_from_retained(
                     seen_terms.add(key)
 
     market = salary_stats(jobs)
+    # 分层行情（2026-10-22）：直招 vs 代发分开报，避免代发岗的虚高面议区间带偏行情
+    direct_market = salary_stats(jobs, post_types={"direct"})
+    agency_market = salary_stats(jobs, post_types={"agency", "anonymous"})
     return {
         "keyword": search_keyword,
         "city": city,
@@ -601,6 +623,8 @@ def _build_summary_from_retained(
         "total_details": len([detail for detail in details if isinstance(detail, dict)]),
         "salary_ranges": _most_common(salary_ranges, top),
         "salary_market": market,
+        "salary_market_direct": direct_market,
+        "salary_market_agency": agency_market,
         # 样本量警示：可解析薪资 <30 时结论仅供参考（第四轮统计口径）
         "sample_warning": (market.get("parsed", 0) > 0
                            and market.get("parsed", 0) < 30),
@@ -625,12 +649,19 @@ def _format_items(items, empty="暂无"):
 
 
 def _salary_market_line(summary):
-    market = summary.get("salary_market") or {}
+    """薪资行情行：**主行用直招口径**，代发岗单列说明（其区间是面议、偏高）。"""
+    direct = summary.get("salary_market_direct") or {}
+    agency = summary.get("salary_market_agency") or {}
+    market = direct if direct.get("parsed") else (summary.get("salary_market") or {})
     if not market.get("parsed"):
         return f"薪资行情: 无法解析（未标注 {market.get('unparsed', 0)} 条）"
-    return (f"薪资行情: {market['parsed']} 条可解析，中位 {market['median_k']}K，"
-            f"均值 {market['mean_k']}K，区间 {market['low_k']}-{market['high_k']}K"
-            f"（未标注 {market.get('unparsed', 0)} 条）")
+    scope = "企业直招岗" if direct.get("parsed") else "全部岗位"
+    line = (f"薪资行情（{scope}）: {market['parsed']} 条可解析，中位 {market['median_k']}K，"
+            f"均值 {market['mean_k']}K，区间 {market['low_k']}-{market['high_k']}K")
+    if agency.get("parsed"):
+        line += (f"；另有 {agency['parsed']} 条猎头代发岗（面议区间、偏高，"
+                 f"中位 {agency['median_k']}K，未计入行情）")
+    return line
 
 
 def _salary_by_experience_line(summary):

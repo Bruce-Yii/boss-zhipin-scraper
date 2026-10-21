@@ -737,5 +737,45 @@ class SalaryAnalysisUpgradeTests(unittest.TestCase):
                 self.assertTrue(path.endswith(".png"))
 
 
+    def test_salary_market_is_split_by_post_type(self):
+        """薪资行情按发布主体类型分层：代发岗的"面议区间"不能污染直招行情。
+
+        2026-10-22 实测（294 条杭州 AI 产品经理）：全量均值 21.8K / P90 40K，
+        而**直招**口径 20.1K / 40K，代发岗均值 40.8K、P90 75K —— 混算会把求职者的
+        薪酬预期带偏约 9%。
+        """
+        jobs = [
+            {"title": "AI产品经理", "salary": "15-25K", "post_type": "direct",
+             "location": "杭州", "tags": "1-3年", "company_name": "A"},
+            {"title": "AI产品经理", "salary": "15-25K", "post_type": "direct",
+             "location": "杭州", "tags": "1-3年", "company_name": "B"},
+            {"title": "AI产品经理", "salary": "60-90K", "post_type": "agency",
+             "location": "杭州", "tags": "1-3年", "company_name": "某猎头"},
+        ]
+        module = load_summary_module()
+        summary = module.build_summary(jobs, jobs, "AI产品经理", "杭州", top=5)
+        direct = summary["salary_market_direct"]
+        agency = summary["salary_market_agency"]
+        all_market = summary["salary_market"]
+        self.assertEqual(direct["parsed"], 2)
+        self.assertEqual(agency["parsed"], 1)
+        self.assertEqual(all_market["parsed"], 3)
+        # 代发岗的虚高区间会抬高混算口径的均值（样本小，中位可能持平）
+        self.assertLess(direct["mean_k"], all_market["mean_k"])
+        line = module._salary_market_line(summary)
+        self.assertIn("企业直招岗", line)
+        self.assertIn("猎头代发岗", line)
+        self.assertIn("未计入行情", line)
+
+    def test_salary_market_falls_back_when_no_direct_jobs(self):
+        """没有直招样本时退回全量口径（不能给空行情）。"""
+        jobs = [{"title": "AI产品经理", "salary": "15-25K", "post_type": "agency",
+                 "location": "杭州", "tags": "1-3年", "company_name": "某猎头"}]
+        module = load_summary_module()
+        summary = module.build_summary(jobs, jobs, "AI产品经理", "杭州", top=5)
+        self.assertEqual(summary["salary_market_direct"]["parsed"], 0)
+        self.assertIn("全部岗位", module._salary_market_line(summary))
+
+
 if __name__ == "__main__":
     unittest.main()
