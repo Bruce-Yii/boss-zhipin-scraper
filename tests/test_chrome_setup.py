@@ -44,6 +44,14 @@ _TEST_TRACE_TMP = tempfile.TemporaryDirectory(prefix="boss-trace-test-")
 atexit.register(_TEST_TRACE_TMP.cleanup)
 os.environ["BOSS_TRACE_PATH"] = os.path.join(_TEST_TRACE_TMP.name, "runner_trace.jsonl")
 
+# 同理：详情页日预算计数（2026-10-21 新增）默认落在仓库外的状态目录里，
+# 单测跑一次就会写进真实 ~/.boss-zhipin-scraper/daily_budget.json——既是污染，
+# 也会让"预算已用满"直接改变被测行为。import 期重定向到临时目录。
+_TEST_BUDGET_TMP = tempfile.TemporaryDirectory(prefix="boss-budget-test-")
+atexit.register(_TEST_BUDGET_TMP.cleanup)
+os.environ["BOSS_DAILY_BUDGET_PATH"] = os.path.join(
+    _TEST_BUDGET_TMP.name, "daily_budget.json")
+
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "boss_cdp_raw.py"
 
@@ -55,6 +63,11 @@ def load_module():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    # 单测统一放行**日预算闸门**：真实台账会把"同号岗位"判成当天已抓（所有用例
+    # 都用同一个 job_id）→ 用例之间互相污染，失败原因与被测行为无关。
+    # 预算/台账自身的行为由 DailyBudgetAndRiskTierTests 显式 mock 覆盖。
+    module._budget_consume = (
+        lambda n=1, limit=None, path=None, job_id=None: (True, 0, limit or 0, ""))
     return module
 
 
@@ -7056,7 +7069,7 @@ class DailyBudgetAndRiskTierTests(unittest.TestCase):
         module = load_module()
         with self._mock_detail_page(module, "Build AI agents " * 20) as (ws, _url):
             with mock.patch.object(module, "_consume_detail_page_budget",
-                                   return_value=(False, 700, 700)):
+                                   return_value=(False, 700, 700, "exhausted")):
                 result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "daily_budget_exhausted")
@@ -7069,13 +7082,36 @@ class DailyBudgetAndRiskTierTests(unittest.TestCase):
         module = load_module()
         ws = mock.Mock()
         with mock.patch.object(module, "_consume_detail_page_budget",
-                               return_value=(False, 700, 700)):
+                               return_value=(False, 700, 700, "exhausted")):
             result = module._scrape_one_detail_via_html(
                 self._detail_job(), ws, "s")
         self.assertFalse(result["ok"])
         self.assertEqual(result["reason"], "daily_budget_exhausted")
         ws.eval_js_async.assert_not_called()
 
+    def test_dom_path_skips_job_already_fetched_today(self):
+        """当天已抓过的岗位：跳过、不发请求、不消耗额度。"""
+        module = load_module()
+        with self._mock_detail_page(module, "Build AI agents " * 20) as (ws, _url):
+            with mock.patch.object(module, "_consume_detail_page_budget",
+                                   return_value=(True, 5, 700, "duplicate")):
+                result = module._scrape_one_detail(self._detail_job(), cdp_port=9222)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "skipped_today")
+        nav_calls = [c for c in ws.send.call_args_list
+                     if c.args and c.args[0] == "Page.navigate"]
+        self.assertEqual(nav_calls, [])
+
+    def test_html_path_skips_job_already_fetched_today(self):
+        module = load_module()
+        ws = mock.Mock()
+        with mock.patch.object(module, "_consume_detail_page_budget",
+                               return_value=(True, 5, 700, "duplicate")):
+            result = module._scrape_one_detail_via_html(
+                self._detail_job(), ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "skipped_today")
+        ws.eval_js_async.assert_not_called()
     def test_html_path_blocked_page_reports_account_risk(self):
         """受限页 → risk_timeout + account_blocked（不是普通解析失败）。"""
         module = load_module()
@@ -7090,7 +7126,7 @@ class DailyBudgetAndRiskTierTests(unittest.TestCase):
         }, ensure_ascii=False)
         ws.eval_js_async.return_value = payload
         with mock.patch.object(module, "_consume_detail_page_budget",
-                               return_value=(True, 1, 700)):
+                               return_value=(True, 1, 700, "")):
             result = module._scrape_one_detail_via_html(
                 self._detail_job(), ws, "s")
         self.assertFalse(result["ok"])
