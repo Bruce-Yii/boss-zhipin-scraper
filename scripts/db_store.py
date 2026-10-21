@@ -19,6 +19,7 @@ re-export，保持 ``scripts.boss_cdp_raw.X`` 导入面不变（同 ratelimit/ex
 
 import json
 import os
+import pathlib
 import sqlite3
 from datetime import UTC, datetime
 
@@ -32,6 +33,13 @@ _sanitize_job = _export_contract._sanitize_job
 # 默认库路径：仓库外（用户状态目录），与 job-result/、.session/ 同源约定
 DEFAULT_DB_PATH = os.path.expanduser("~/.boss-zhipin-scraper/boss.db")
 SCHEMA_VERSION = 1
+
+
+class DbSchemaError(RuntimeError):
+    """数据库 schema 高于当前代码可安全处理的版本。"""
+
+
+_FINISHED_AT_UNSET = object()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -85,10 +93,28 @@ def _payload_json(record):
     return json.dumps(_sanitize_job(record), ensure_ascii=False, sort_keys=True)
 
 
+def _stored_schema_version(conn):
+    """读取已持久化 schema 版本；无表/无值返回 None，非法值 fail-closed。"""
+    table = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = conn.execute(
+        "SELECT value FROM schema_meta WHERE key='schema_version'"
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return int(row[0])
+    except (TypeError, ValueError) as exc:
+        raise DbSchemaError(f"schema_version 非法: {row[0]!r}") from exc
+
+
 def open_store(path=None):
     """打开（必要时创建）SQLite 库并确保 schema，返回连接。
 
-    WAL + ``busy_timeout`` 让并发进程"等待"而非直接报 database is locked。
+    已存在且版本高于当前代码时立即拒绝，不执行 WAL/DDL/版本覆盖等写操作。
     """
     db_path = os.path.expanduser(path or DEFAULT_DB_PATH)
     parent = os.path.dirname(db_path)
@@ -96,15 +122,36 @@ def open_store(path=None):
         os.makedirs(parent, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript(_SCHEMA)
-    conn.execute(
-        "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-        (str(SCHEMA_VERSION),),
-    )
-    conn.commit()
+    try:
+        stored = _stored_schema_version(conn)
+        if stored is not None and stored > SCHEMA_VERSION:
+            raise DbSchemaError(
+                f"数据库 schema v{stored} 高于当前支持版本 v{SCHEMA_VERSION}")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.executescript(_SCHEMA)
+        if stored is None:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+        conn.commit()
+        return conn
+    except (OSError, sqlite3.Error, DbSchemaError):
+        conn.close()
+        raise
+
+
+def open_store_readonly(path):
+    """以 SQLite read-only URI 打开已有库；绝不创建或修改文件。"""
+    db_path = os.path.expanduser(path)
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(db_path)
+    uri = pathlib.Path(db_path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
     return conn
 
 
@@ -213,16 +260,19 @@ def load_details(conn, job_ids=None):
 
 
 def record_run(conn, run_id, *, mode=None, keyword=None, city=None,
-               started_at=None, finished_at=None, job_count=0, detail_count=0,
-               now=None):
-    """记录/更新一次 run 的元信息（同一 run_id 重复调用为幂等更新）。"""
+               started_at=None, finished_at=_FINISHED_AT_UNSET, job_count=0,
+               detail_count=0, now=None):
+    """记录/更新一次 run；显式 ``finished_at=None`` 保持未完成状态。"""
     ts = now or _utcnow()
+    finish = ts if finished_at is _FINISHED_AT_UNSET else finished_at
     conn.execute(
         "INSERT INTO runs (run_id, started_at, finished_at, mode, keyword, city, "
         "job_count, detail_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(run_id) DO UPDATE SET finished_at=excluded.finished_at, "
-        "job_count=excluded.job_count, detail_count=excluded.detail_count",
-        (run_id, started_at or ts, finished_at or ts, mode, keyword, city,
+        "ON CONFLICT(run_id) DO UPDATE SET mode=excluded.mode, "
+        "keyword=excluded.keyword, city=excluded.city, "
+        "finished_at=excluded.finished_at, job_count=excluded.job_count, "
+        "detail_count=excluded.detail_count",
+        (run_id, started_at or ts, finish, mode, keyword, city,
          int(job_count or 0), int(detail_count or 0)),
     )
     conn.commit()
@@ -235,9 +285,18 @@ def stats(conn):
     for row in conn.execute("PRAGMA database_list"):
         if row[1] == "main":
             db_path = row[2]
+    stored_schema = None
+    try:
+        row = conn.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()
+        if row is not None:
+            stored_schema = int(row[0])
+    except (sqlite3.Error, TypeError, ValueError):
+        stored_schema = None
     return {
         "db_path": db_path,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": stored_schema,
         "jobs": conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
         "details": conn.execute("SELECT COUNT(*) FROM details").fetchone()[0],
         "details_with_jd": conn.execute(
@@ -261,9 +320,16 @@ def _main(argv=None):
     if not os.path.exists(args.db):
         print(f"数据库不存在: {args.db}")
         return 1
-    conn = open_store(args.db)
+    try:
+        conn = open_store_readonly(args.db)
+    except (OSError, sqlite3.Error) as exc:
+        print(f"数据库只读打开失败: {exc}")
+        return 1
     try:
         info = stats(conn)
+    except sqlite3.Error as exc:
+        print(f"数据库统计失败: {exc}")
+        return 1
     finally:
         conn.close()
     print(f"库: {info['db_path']}（schema v{info['schema_version']}）")

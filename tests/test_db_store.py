@@ -8,6 +8,7 @@ import io
 import json
 import os
 import pathlib
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -106,6 +107,52 @@ class DbStoreTests(unittest.TestCase):
         self.assertEqual(info["runs"], 1)
         self.assertEqual(str(info["db_path"]).replace("\\", "/"),
                          self.path.replace("\\", "/"))
+
+    def test_open_store_rejects_future_schema_without_rewriting_version(self):
+        future = os.path.join(self.tmp.name, "future.db")
+        conn = sqlite3.connect(future)
+        conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO schema_meta(key, value) VALUES ('schema_version', '999')")
+        conn.commit()
+        conn.close()
+        with self.assertRaises(self.db.DbSchemaError):
+            self.db.open_store(future)
+        check = sqlite3.connect(future)
+        value = check.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()[0]
+        check.close()
+        self.assertEqual(value, "999")
+
+    def test_readonly_store_does_not_create_or_mutate_missing_file(self):
+        missing = os.path.join(self.tmp.name, "readonly-missing.db")
+        with self.assertRaises(FileNotFoundError):
+            self.db.open_store_readonly(missing)
+        self.assertFalse(os.path.exists(missing))
+        readonly = self.db.open_store_readonly(self.path)
+        try:
+            self.assertEqual(readonly.execute("PRAGMA query_only").fetchone()[0], 1)
+        finally:
+            readonly.close()
+
+    def test_stats_reads_persisted_schema_version(self):
+        self.conn.execute(
+            "UPDATE schema_meta SET value='7' WHERE key='schema_version'")
+        self.conn.commit()
+        self.assertEqual(self.db.stats(self.conn)["schema_version"], 7)
+
+    def test_record_run_can_leave_finished_at_open_for_later_finalize(self):
+        self.db.record_run(self.conn, "r-open", mode="single", keyword="AI",
+                           city="上海", finished_at=None)
+        row = self.conn.execute(
+            "SELECT finished_at FROM runs WHERE run_id='r-open'").fetchone()
+        self.assertIsNone(row[0])
+        self.db.record_run(self.conn, "r-open", mode="single", keyword="AI",
+                           city="上海", job_count=2, detail_count=1)
+        row = self.conn.execute(
+            "SELECT finished_at, job_count, detail_count FROM runs WHERE run_id='r-open'"
+        ).fetchone()
+        self.assertIsNotNone(row[0])
+        self.assertEqual((row[1], row[2]), (2, 1))
 
     def test_main_reports_stats_and_handles_missing_db(self):
         self.db.upsert_jobs(self.conn, [{"job_id": "a", "title": "T"}])
