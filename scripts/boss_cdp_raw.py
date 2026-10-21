@@ -3317,9 +3317,9 @@ def merge_jobs(external_path, new_jobs):
 
     old_jobs = old_data.get("jobs", [])
     merged = merge_unique(old_jobs, new_jobs)
-    # 链接凭证取新（2026-10-22）：平台 job_detail URL = securityId + **短时效 token**，
-    # 旧链接隔天会指向别的岗位（实测：昨天的链接今天取回银雁科技/德佑等）。
-    # 同一 job_id 再次出现时**新链接覆盖旧链接**（凭证取新不取旧），其余字段保持旧记录。
+    # 链接取新（2026-10-22）：同一 job_id 再次出现时**新链接覆盖旧链接**，其余字段保持
+    # 旧记录。注：链接本身是稳的（实测隔天用真导航打开仍是同一岗位），这里只是保证
+    # 合并时用最新一次列表拿到的链接。
     refreshed = _refresh_links_in_jobs(merged, new_jobs)
     if refreshed:
         print(f"🔗 链接刷新: {refreshed} 条改用本次的新链接（平台 URL 是短时效凭证）")
@@ -3331,8 +3331,10 @@ def merge_jobs(external_path, new_jobs):
 def _refresh_links_in_jobs(jobs, fresh_jobs):
     """把同 job_id 的**新链接**覆盖到旧记录上，返回更新条数。
 
-    平台 `job_detail` URL = securityId + 短时效 token（实测隔天会指向别的岗位；
-    只用 job_id 拼 URL 会 404）→ 链接是"抓取时刻有效的一次性入口"，耐久主键是 job_id。
+    平台 `job_detail` URL 含 securityId 段（只用 job_id 拼会 404）→ 链接**不能由
+    job_id 重建**，耐久主键是 job_id、链接需要单独刷新。
+    实测：链接字符串跨天稳定，隔天用真导航打开仍是同一岗位；真正会"取到别的岗位"的是
+    fetch(XHR) 取页面时命中平台诱饵（渲染通道不受影响）。
     """
     fresh = {}
     for job in fresh_jobs or []:
@@ -4234,9 +4236,9 @@ def build_detail_record(job, extracted):
         "post_type": classify_post_type(job),
         # title_key: 标题归一化键（分组/匹配用，展示仍用平台原值）
         "title_key": normalize_title(job.get("title", "")),
-        # link_verified_at: 该链接在**抓取时刻**被验证有效。平台 URL = securityId +
-        #   短时效 token（实测隔天会返回别的岗位；只用 job_id 拼 URL 会 404），
-        #   所以链接是"临时入口"而非耐久标识，耐久主键是 job_id。
+        # link_verified_at: 该链接在**抓取时刻**被验证指向这个岗位。平台 URL 含
+        #   securityId 段（只用 job_id 拼会 404）→ 链接不能由 job_id 重建，耐久主键是
+        #   job_id；链接本身跨天稳定（实测隔天真导航打开仍是同一岗位）。
         "link_verified_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -7276,8 +7278,8 @@ def build_parser():
     g_search.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
     g_search.add_argument("--refresh-links", metavar="EXPORT_PATH", default=None,
                           help="按 job_id 用**新拉取的列表链接**刷新导出里的 job_link"
-                               "（平台 URL 是短时效凭证，隔天会指向别的岗位；本模式只发列表"
-                               "请求，不占详情页日额度）")
+                               "（链接含 securityId 段、不能由 job_id 重建；本模式只发列表"
+                               "请求，不占详情页日额度）并报告多少个 job_id 已查不到")
     g_search.add_argument("--max-jobs", type=int, default=None,
                           help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
     g_search.add_argument("--max-concurrent", type=int, default=1,

@@ -175,7 +175,7 @@ python3 scripts/job_summary.py --top 15
 | `--no-detail` | 不抓取详情页 |
 | `--concurrency` | 详情抓取并发度（默认 1=串行）。**并发只决定同时在飞几个，不决定请求速率**——速率由 `--detail-rate` 统一控制。API 通道使用共享 tab 池，请求由 `BurstThrottle(center=2.25)` 全局串行节流（目标约 0.44 req/s）；DOM 通道用自适应限速器，panel 通道保持串行 |
 | `--detail-rate RPS` | 详情页请求速率上限（次/秒，**绝对值、与并发数解耦**；默认 1.0）。平台对详情页访问次数有日累计预算，超速拿不到更多记录、只提高风控档位（09-23 1 条/秒 → 只撞可解的滑块验证码；10-21 2.6 条/秒 → 撞账号限时限制） |
-| `--refresh-links EXPORT` | 按 job_id 用**新拉取的列表链接**刷新导出里的 `job_link`（平台 URL 是短时效凭证，隔天会指向别的岗位；只发列表请求，不占详情页额度），并报告多少个 job_id 已查不到 |
+| `--refresh-links EXPORT` | 按 job_id 用**新拉取的列表链接**刷新导出里的 `job_link`（链接含 securityId 段、不能由 job_id 重建；只发列表请求，不占详情页额度），并报告多少个 job_id 已查不到（岗位可能已下架） |
 | `--daily-detail-budget N` | 详情页访问日预算（请求次数，**跨 run 累计**，默认 700；0=不限）。计数文件在仓库外 `~/.boss-zhipin-scraper/daily_budget.json`，`BOSS_DAILY_BUDGET_PATH` 可覆盖。同一岗位当天第二次抓取**默认跳过且不消耗额度**（台账），日额度因此必然换来互不重复的岗位 |
 | `--detail-channel` | 详情通道：`dom`（默认，整页渲染详情页，document 导航，**唯一有生产证据的形态**——2026-09-23 用它跑出 1005 条/天、只撞可人工解开的滑块验证码）/ `html`（**已封存**：详情页 HTML 直取。2026-10-22 真机实测：平台会间歇性对 fetch 请求返回**别的岗位**的 JD，且该路径用 textContent 抽取会带进 `display:none` 诱饵文本；绝对限速下零吞吐收益）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`·`encrypt`（详情 API 通道，**已封存**：该接口被平台限流并升级为短时账号封禁，见 tangzhiyao/boss-show-time#42）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路）。meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
