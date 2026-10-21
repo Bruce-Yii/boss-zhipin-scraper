@@ -102,6 +102,11 @@ try:
 except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
     import semantics as _semantics
 
+try:
+    from scripts import known_failures as _known_failures
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import known_failures as _known_failures
+
 classify_post_type = _semantics.classify_post_type
 normalize_title = _semantics.normalize_title
 content_fingerprint = _semantics.content_fingerprint
@@ -2021,6 +2026,21 @@ def _park_html_tab(ws, sid, url=HTML_PARK_URL, timeout=20):
     return False
 
 
+def _record_known_bad_page(job_id, message, page_text=""):
+    """把解析失败的岗位沉淀进**坏页台账**（跨 run、跨日）。
+
+    根因：这类页面的解析路径不适用（实测每天固定 3 个岗位 invalid_detail），
+    结果可复现 → 沉淀后当天/次日**直接跳过、不发请求、不消耗额度**。
+    """
+    if not job_id:
+        return
+    try:
+        fingerprint = _semantics.classify_extract_failure(message, page_text)
+        _known_failures.record(job_id, fingerprint, message)
+    except Exception:  # pragma: no cover - 台账失败不得影响抓取
+        pass
+
+
 def _norm_title(text):
     """岗位标题归一化（去空白 + 小写），用于"取回页面是否目标岗位"的一致性比对。"""
     return re.sub(r"\s+", "", str(text or "")).lower()
@@ -2048,6 +2068,14 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
         # 全局限速：HTML 直取同样消耗真实请求配额，**不得绕过限速**
         # （CONTRIBUTING 红线：去掉限速与预算帽的改动不接受）。与渲染版
         # 共用同一把令牌桶，节律口径完全一致。
+        # 已知坏页跳过（2026-10-22）：某些岗位页的解析路径不适用（每天固定
+        # 3 个 invalid_detail），结果可复现 → 不必每天重试、白花额度。
+        # 命中台账 → 直接跳过（**不消耗日额度**）；--retry-job 可强制重试。
+        if job_id and _known_failures.is_known(job_id):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "known_bad_page",
+                    "message": "已知解析失败的页面（已沉淀），跳过以免浪费额度",
+                    "channel": "html"}
         # 日预算：详情页请求前先记一次（超限立即停）
         allowed, used, limit, why = _consume_detail_page_budget(job_id=job_id)
         if why == "duplicate":
@@ -5141,6 +5169,14 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                 _apply_asset_blocking(ws, sid)
 
         detail_url = build_detail_url(job)
+        # 已知坏页跳过（2026-10-22）：某些岗位页的解析路径不适用（每天固定
+        # 3 个 invalid_detail），结果可复现 → 不必每天重试、白花额度。
+        # 命中台账 → 直接跳过（**不消耗日额度**）；--retry-job 可强制重试。
+        if job_id and _known_failures.is_known(job_id):
+            return {"ok": False, "detail": None, "job_id": job_id,
+                    "reason": "known_bad_page",
+                    "message": "已知解析失败的页面（已沉淀），跳过以免浪费额度",
+                    "channel": "dom"}
         # 日预算：详情页请求前先记一次（超限立即停，不浪费一次真实请求）
         allowed, used, limit, why = _consume_detail_page_budget(job_id=job_id)
         if why == "duplicate":
@@ -5230,6 +5266,7 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
                     "channel": "dom"}
         except DetailExtractionError as exc:
             capture_debug_screenshot(ws, sid, "invalid_detail")
+            _record_known_bad_page(job_id, str(exc))
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "invalid_detail", "message": str(exc),
                     "channel": "dom"}
@@ -5801,7 +5838,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
                 print(f"  已进入冷却期（{CDP_COOLDOWN_SECONDS}s），可运行 --stop-chrome 后重新 --setup-chrome 再继续。")
                 break
             continue
-        elif reason == "skipped_today":
+        elif reason in ("skipped_today", "known_bad_page"):
             # 当天已抓过 → 不算失败、不进 pending（额度没被浪费，不需要重试）
             # **继续下一个岗位**（不是停手）
             serial_done += 1
@@ -6168,7 +6205,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 pending.pop(job_id, None)
             return
         reason = result["reason"]
-        if reason in ("invalid_detail", "stopped", "skipped_today"):
+        if reason in ("invalid_detail", "stopped", "skipped_today",
+                      "known_bad_page"):
             # 停止信号/当天已抓过，都不是岗位失败：不应污染 pending 或触发失败降速。
             return
         limiter.record_failure()

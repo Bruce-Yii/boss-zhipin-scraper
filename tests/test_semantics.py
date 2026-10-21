@@ -16,6 +16,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -136,6 +137,98 @@ class SemanticsTests(unittest.TestCase):
         result = self.s.check_invariants([job])
         self.assertFalse(result["field_salary"]["ok"])
         self.assertFalse(result["link_age"]["ok"])
+
+
+class FourFixesTests(unittest.TestCase):
+    """四项根因修法的行为锁定（2026-10-22）。"""
+
+    def setUp(self):
+        self.s = load_module("semantics", ROOT / "scripts" / "semantics.py")
+
+    # ---------- ① 失败指纹归类 ----------
+    def test_classify_extract_failure_fingerprints(self):
+        """抽取失败按**页面特征**归类，而不是笼统的 invalid_detail。"""
+        self.assertEqual(
+            self.s.classify_extract_failure(
+                "job description too short after validation: 99 < 120"), "too_short")
+        self.assertEqual(
+            self.s.classify_extract_failure("职位描述"), "no_section")
+        self.assertEqual(
+            self.s.classify_extract_failure("", "BOSS正在加载中"), "shell_only")
+        self.assertEqual(
+            self.s.classify_extract_failure("", "登录查看完整内容"), "login_wall")
+        self.assertEqual(
+            self.s.classify_extract_failure("", "访问受限 您的账户存在异常行为"),
+            "risk_page")
+        self.assertEqual(self.s.classify_extract_failure("随便什么"), "unknown")
+
+    # ---------- ② 重复组标记 ----------
+    def test_mark_duplicate_groups_flags_same_content(self):
+        """平台允许同一岗位多条发布（job_id 不同）→ 内容指纹标出重复组。"""
+        jd = "岗位职责：负责 AI 产品需求分析与设计。" * 10
+        jobs = [
+            {"job_id": "a1", "jd": jd, "salary": "20-30K", "location": "杭州"},
+            {"job_id": "b2", "jd": jd, "salary": "20-30K", "location": "杭州"},
+            {"job_id": "c3", "jd": "别的岗位内容" * 30, "salary": "10-15K",
+             "location": "上海"},
+        ]
+        self.s.mark_duplicate_groups(jobs)
+        self.assertEqual(jobs[0]["dup_group"], jobs[1]["dup_group"])
+        self.assertEqual(jobs[0]["dup_size"], 2)
+        self.assertTrue(jobs[0]["is_primary"])
+        self.assertFalse(jobs[1]["is_primary"])
+        self.assertEqual(jobs[2]["dup_group"], "")
+        self.assertTrue(jobs[2]["is_primary"])
+
+    # ---------- ③ 标题归一化分组 ----------
+    def test_title_groups_merge_case_variants(self):
+        counts = self.s.title_group_counts([
+            {"title": "AI产品经理"}, {"title": "ai产品经理"},
+            {"title": "AI 产品经理"}, {"title": "AI产品经理"},
+        ])
+        self.assertEqual(counts, {"ai产品经理": 4})
+
+    # ---------- ④ 活跃度三态 ----------
+    def test_active_state_distinguishes_unknown_from_inactive(self):
+        """**"平台没给"不等于"不活跃"**（实测 14 条两边都没有活跃标签）。"""
+        self.assertEqual(self.s.active_state(""), "unknown")
+        self.assertEqual(self.s.active_state("刚刚活跃"), "active")
+        self.assertEqual(self.s.active_state("在线"), "active")
+        self.assertEqual(self.s.active_state("半年前活跃"), "inactive")
+
+
+class KnownBadPageSkipTests(unittest.TestCase):
+    """① 已知坏页：命中台账 → 跳过、**不消耗额度**、不发请求。"""
+
+    def setUp(self):
+        self.module = load_module("boss_cdp_raw", ROOT / "scripts" / "boss_cdp_raw.py")
+
+    def test_known_bad_page_is_skipped_without_request(self):
+        module = self.module
+        ws = mock.Mock()
+        with mock.patch.object(module._known_failures, "is_known", return_value=True):
+            result = module._scrape_one_detail_via_html(
+                {"job_id": "j1", "title": "AI产品经理",
+                 "job_link": "https://www.zhipin.com/job_detail/x.html"}, ws, "s")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "known_bad_page")
+        ws.eval_js_async.assert_not_called()
+
+    def test_invalid_detail_is_recorded_into_ledger(self):
+        """抽取失败 → 沉淀 job_id + 失败指纹（供次日跳过）。"""
+        module = self.module
+        recorded = {}
+
+        def fake_record(job_id, fingerprint, reason):
+            recorded["job_id"] = job_id
+            recorded["fingerprint"] = fingerprint
+            recorded["reason"] = reason
+
+        with mock.patch.object(module._known_failures, "record",
+                               side_effect=fake_record):
+            module._record_known_bad_page("j9", "职位描述")
+        self.assertEqual(recorded["job_id"], "j9")
+        self.assertEqual(recorded["fingerprint"], "no_section")
 
 
 class LinkRefreshTests(unittest.TestCase):

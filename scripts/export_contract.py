@@ -559,6 +559,27 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
                 "records_in_groups": sum(dup_groups.values()),
                 "max_group": max(dup_groups.values()) if dup_groups else 0,
             }
+            # 同源重复**标记**到每条记录（dup_group/dup_size/is_primary）：
+            # 平台允许同一岗位多条发布，job_id 去重抓不到 → 只能内容指纹识别。
+            # 标记而不删除（猎头岗有时是唯一渠道），消费端可自行折叠。
+            try:
+                _semantics.mark_duplicate_groups(kept)
+            except Exception:  # pragma: no cover - 标记失败不影响导出
+                pass
+            # 标题归一化分组：平台原样回传（AI产品经理 67 / ai产品经理 55 /
+            # AI 产品经理 6）→ 归一化键把它们并成一组，聚合时才不会漏。
+            try:
+                data["title_groups"] = _semantics.title_group_counts(kept)
+            except Exception:  # pragma: no cover
+                pass
+            # 活跃度三态：**"平台没给"不等于"不活跃"**（实测 14 条两边都没有活跃
+            # 标签）→ 显式给 active/inactive/unknown，消费端才分得清。
+            for job in kept:
+                try:
+                    job["active_state"] = _semantics.active_state(
+                        job.get("boss_active_status"))
+                except Exception:  # pragma: no cover
+                    pass
             invariants = _semantics.check_invariants(kept, data)
             data["invariants"] = invariants
             failures = _semantics.invariant_failures(invariants)

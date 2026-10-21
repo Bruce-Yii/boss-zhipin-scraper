@@ -52,6 +52,12 @@ atexit.register(_TEST_BUDGET_TMP.cleanup)
 os.environ["BOSS_DAILY_BUDGET_PATH"] = os.path.join(
     _TEST_BUDGET_TMP.name, "daily_budget.json")
 
+# 坏页台账同理：默认落在仓库外的状态目录里，单测不该写那里
+_TEST_KNOWN_BAD_TMP = tempfile.TemporaryDirectory(prefix="boss-known-bad-test-")
+atexit.register(_TEST_KNOWN_BAD_TMP.cleanup)
+os.environ["BOSS_KNOWN_BAD_PATH"] = os.path.join(
+    _TEST_KNOWN_BAD_TMP.name, "known_bad_jobs.json")
+
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "boss_cdp_raw.py"
 
@@ -68,6 +74,10 @@ def load_module():
     # 预算/台账自身的行为由 DailyBudgetAndRiskTierTests 显式 mock 覆盖。
     module._budget_consume = (
         lambda n=1, limit=None, path=None, job_id=None: (True, 0, limit or 0, ""))
+    # 坏页台账同理：默认放行（所有用例用同一个 job_id，会互相污染）；
+    # 坏页台账自身的行为由 test_known_failures 覆盖。
+    module._known_failures.is_known = lambda job_id: False
+    module._known_failures.record = lambda *args, **kwargs: None
     return module
 
 
