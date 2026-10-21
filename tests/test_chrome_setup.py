@@ -32,6 +32,11 @@ _TEST_AUDIT_TMP = tempfile.TemporaryDirectory(prefix="boss-audit-test-")
 atexit.register(_TEST_AUDIT_TMP.cleanup)
 os.environ["BOSS_AUDIT_PATH"] = os.path.join(_TEST_AUDIT_TMP.name, "risk_events.jsonl")
 
+# 状态目录（锁 / cdp.cooldown）同理：此前单测里漏 mock 路径的用例会往真实
+# ~/.boss-zhipin-scraper/cdp.cooldown 写冷却标记，既挡住真实运行，也让隔离
+# 守卫误报"单测改了真实状态"。import 期整体指到临时目录。
+os.environ["BOSS_STATE_DIR"] = _TEST_AUDIT_TMP.name
+
 
 SCRIPT_PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "boss_cdp_raw.py"
 
