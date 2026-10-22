@@ -37,7 +37,7 @@ def _raw(**over):
         "salaryDesc": "20-30K",
         "cityName": "杭州",
         "brandName": "某科技",
-        "jobType": "0",
+        "jobType": 0,
         "proxyJob": 0,
         "proxyType": 0,
     }
@@ -77,10 +77,13 @@ class RawCaptureTests(unittest.TestCase):
         self.assertNotIn("encryptJobId", cleaned["job"])
         self.assertNotIn("securityId", cleaned["job"])
 
-    def test_job_type_is_verbatim(self):
-        """平台 jobType=0（社招）模型原样存 "0" → 声明必须是 verbatim（逐字一致）。"""
+    def test_job_type_zero_is_declared_normalization(self):
+        """平台的 jobType 是**数字** 0（社招）→ 我们存空串：必须声明为规范化。"""
         spec = {s.name: s for s in self.model.FIELD_SPECS}["job_type"]
-        self.assertEqual(spec.provenance, "verbatim")
+        self.assertEqual(spec.provenance, "normalized")
+        self.assertEqual(spec.raw_shape, "zero_as_empty")
+        record = self.model.JobRecord.from_list_payload(_raw()).to_dict()
+        self.assertEqual(record["job_type"], "")
 
     def test_proxy_job_zero_is_declared_normalization(self):
         """平台 proxyJob=0 → 我们存空串：这是**声明过的**规范化（不是逐字抄）。"""
