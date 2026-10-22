@@ -2266,6 +2266,7 @@ def _scrape_one_detail_via_html(job, ws, sid, stop_event=None, verbose=False,
         extracted["page_update_date"] = fields["page_update_date"]
         return {"ok": True, "detail": build_detail_record(job, extracted),
                 "job_id": job_id, "reason": "", "message": "",
+                "raw_text": fields.get("raw_text") or "",
                 "channel": "html"}
     except DetailLoginRequiredError as exc:
         return {"ok": False, "detail": None, "job_id": job_id,
@@ -3223,6 +3224,9 @@ def save_raw_responses(run_id, keyword, city, pages, detail_payloads=None):
 # 保真核对失败标志（跑完若为真 → 退出码非 0，数据不可信不能当成功交付）
 _FIDELITY_FAILED = {"flag": False}
 
+# 本 run 的详情页原文落盘路径（详情侧保真核对的依据）
+LAST_DETAIL_RAW_PATH = None
+
 
 def set_fidelity_failed():
     _FIDELITY_FAILED["flag"] = True
@@ -3231,6 +3235,31 @@ def set_fidelity_failed():
 def fidelity_failed():
     return bool(_FIDELITY_FAILED["flag"])
 
+
+def save_raw_details(raw_details):
+    """把详情页**清洗前原文**落盘（详情侧保真核对的依据）。
+
+    - 只写仓库外的 job-result/raw/ ✓
+    - 落盘前过 _sanitize_raw_payload（不落凭据/HR 身份）✓
+    - 原子写 ✓
+    失败返回 None（不阻断抓取）。
+    """
+    try:
+        raw_dir = os.path.join(os.path.dirname(default_output_path("jobs")), RAW_DIR_NAME)
+        os.makedirs(raw_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payload = {
+            "kind": "detail",
+            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "details": list(raw_details or []),
+        }
+        cleaned = _sanitize_raw_payload(payload)
+        path = os.path.join(raw_dir, f"detail_{stamp}.json")
+        _atomic_write_json(path, cleaned)
+        return path
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"⚠️ 详情原文落盘失败（不影响抓取）：{exc}")
+        return None
 
 def run_fidelity_check(raw_path, jobs):
     """跑完自动做保真核对：平台原文 ↔ 我们的记录。
@@ -3271,6 +3300,47 @@ def run_fidelity_check(raw_path, jobs):
         set_fidelity_failed()
     return summary
 
+
+def run_detail_fidelity_check(detail_raw_path, records):
+    """详情侧保真核对：交付的 JD 必须是页面原文的子序列。
+
+    详情原文落盘在 run 的 raw 目录里（run_detail_raw_path 给出）；
+    对不上 → 与列表侧一样：大声报 + 退出码 1。
+    """
+    if not detail_raw_path or not records:
+        return {}
+    try:
+        from scripts import fidelity as _fidelity
+    except ImportError:
+        try:
+            import fidelity as _fidelity  # type: ignore
+        except ImportError:
+            return {}
+    try:
+        with open(detail_raw_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return {"error": f"详情原文读取失败: {exc}"}
+    ok, report = _fidelity.check_detail_fidelity(payload, records)
+    summary = {
+        "ok": bool(ok),
+        "checked_details": report.get("checked_details", 0),
+        "error_count": report.get("detail_error_count", 0),
+        "findings": (report.get("detail_findings") or [])[:20],
+    }
+    if ok and not report.get("detail_findings"):
+        print(f"✅ 详情保真核对通过：{summary['checked_details']} 条 JD 均为页面原文的子序列")
+    elif ok:
+        print(f"⚠️ 详情保真核对：有 {len(report['detail_findings'])} 条可疑（未达失真）")
+        for item in summary["findings"][:5]:
+            print(f"   · {item['field']}｜{item.get('title', '')}｜{item.get('actual', '')}")
+    else:
+        print(f"❌ 详情保真核对未通过：{summary['error_count']} 条 JD 与页面原文不符")
+        for item in summary["findings"][:10]:
+            print(f"   · {item.get('title', '')}｜{item.get('actual', '')}")
+        print("   → JD 与页面不一致，先查清楚再交付")
+        set_fidelity_failed()
+    return summary
 
 def write_csv(csv_path, jobs):
     """将 jobs 列表写入 CSV 文件（写出前递归脱敏）。"""
@@ -4794,6 +4864,11 @@ def _filter_options(args):
 
 
 def build_detail_record(job, extracted):
+    """列表 job + 详情抽取 → 详情记录。
+
+    ``extracted`` 里的 ``_raw_text``（清洗前的页面原文）是**详情侧保真核对的依据**：
+    它只进 raw 落盘文件，导出前会被脱敏层剥掉（见 export_contract 的内部字段规则）。
+    """
     """详情记录 = **岗位模型记录**（列表侧 + 详情侧合一）。
 
     2026-10-22 修：此前详情记录是**另一套手写 schema**（只 23 个字段，缺 company_name
@@ -5826,6 +5901,8 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             d["jd"] = fields["jd"]
             d["boss_active_status"] = fields["boss_active_status"]
             d["page_update_date"] = fields["page_update_date"]
+            # 清洗前原文：详情侧保真核对的依据（只进 raw 落盘，不进导出）
+            d["_raw_text"] = fields.get("raw_text") or ""
         except DetailLoginRequiredError as exc:
             capture_debug_screenshot(ws, sid, "login_required")
             return {"ok": False, "detail": None, "job_id": job_id,
@@ -5840,6 +5917,7 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
 
         return {"ok": True, "detail": build_detail_record(job, d),
                 "job_id": job_id, "reason": "", "message": "",
+                "raw_text": d.get("_raw_text") or "",
                 "channel": "dom"}
     except _cdp_exception_types() as exc:
         return {"ok": False, "detail": None, "job_id": job_id,
@@ -6092,6 +6170,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
         output_path = default_output_path("details")
 
     print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
+    # 详情页**清洗前原文**（详情侧保真核对的依据）：只进 raw 落盘，不进导出
+    raw_details = []
+    global LAST_DETAIL_RAW_PATH
+    LAST_DETAIL_RAW_PATH = None
     # 断点续抓：先加载已有结果文件，避免"跳过已抓 + 全量覆盖"把旧数据冲掉
     results = []
     if os.path.exists(output_path):
@@ -6365,6 +6447,11 @@ def scrape_details(list_data, max_details=None, output_path=None,
             consecutive_cdp_errors = 0
             detail = result["detail"]
             results.append(detail)
+            # 详情页清洗前原文（详情侧保真核对的依据）
+            raw_text = str(result.get("raw_text") or "")
+            if raw_text:
+                raw_details.append({"job_id": str(detail.get("job_id") or ""),
+                                    "raw_text": raw_text})
             serial_ok += 1
             serial_done += 1
             # 抓取成功：从待重试清单移除
@@ -6484,6 +6571,14 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if fmt == "csv":
         csv_path = output_path.rsplit(".", 1)[0] + ".csv"
         write_detail_csv(csv_path, results)
+
+    # 详情页原文落盘（详情侧保真核对的依据）
+    detail_raw_path = None
+    if raw_details:
+        detail_raw_path = save_raw_details(raw_details)
+        if detail_raw_path:
+            print(f"详情原文已保存（详情侧保真核对）: {detail_raw_path}")
+    LAST_DETAIL_RAW_PATH = detail_raw_path
     return results
 
 
@@ -8699,6 +8794,14 @@ def _run_cli_impl(p, args):
             if args.format == "csv":
                 detail_csv = args.detail_output.rsplit(".", 1)[0] + ".csv"
                 write_detail_csv(detail_csv, details)
+
+        # 详情侧保真核对（自动）：交付的 JD 必须是页面原文的子序列
+        detail_fidelity = run_detail_fidelity_check(LAST_DETAIL_RAW_PATH, details or [])
+        if detail_fidelity and list_data:
+            sources = list_data.setdefault("raw_sources", {})
+            if LAST_DETAIL_RAW_PATH:
+                sources["detail"] = LAST_DETAIL_RAW_PATH
+            list_data["fidelity_detail"] = detail_fidelity
 
         # P4c-2：详情增量入库（置于口径一之前，确保风控中断也保留已抓详情）
         if db_conn is not None and details:
