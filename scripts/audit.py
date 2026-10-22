@@ -96,6 +96,21 @@ def audit_path():
     return os.environ.get(ALT_AUDIT_PATH_ENV) or DEFAULT_AUDIT_PATH
 
 
+def _replace_with_retry(src, dst, attempts=6, base_delay=0.02):
+    """os.replace 带 PermissionError 退避重试（Windows 上目标文件可能被并发占用）。
+
+    独立审计 2026-10-22：同型问题在冷却标记上会让**熔断静默失效**。轮转失败只丢
+    一次滚动（不丢事件），但要退避重试而不是第一次就放弃。
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return True
+        except PermissionError:
+            time.sleep(base_delay * (2 ** attempt))
+    return False
+
+
 def _rotate(path):
     """超过阈值则把当前日志滚动为 ``.1``（覆盖旧 ``.1``）。"""
     try:
@@ -103,7 +118,7 @@ def _rotate(path):
             rotated = path + ".1"
             if os.path.exists(rotated):
                 os.remove(rotated)
-            os.replace(path, rotated)
+            _replace_with_retry(path, rotated)
     except (OSError, ValueError):
         pass
 
