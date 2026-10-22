@@ -577,3 +577,61 @@ class AcceptanceCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MissingCoverageTests(unittest.TestCase):
+    """补齐覆盖矩阵报出的缺口：R01 的 P6/P7、R02 的 P0_empty、R08 的 P4。
+
+    矩阵（``scripts/audit_pipeline.py matrix``）会报"某性质没有反例 = 等于没写"，
+    这里把缺的补上，让矩阵归零。
+    """
+
+    def setUp(self):
+        self.acc = load_module("acceptance", SCRIPTS / "acceptance.py")
+        self.spec = self.acc.load_spec()
+
+    def _check(self, payload):
+        ok, findings = self.acc.check_export(payload, self.spec)
+        return ok, findings
+
+    def test_missing_semantic_label_is_flagged(self):
+        """P7_semantic_labels_present：语义标签缺失 → 必须被指出。"""
+        record = _record()
+        record.pop("active_state", None)
+        ok, findings = self._check(_payload([record]))
+        self.assertTrue(
+            any(f["id"] == "P7_semantic_labels_present" for f in findings),
+            f"缺语义标签必须被报出来：{findings}")
+
+    def test_one_id_two_links_is_flagged(self):
+        """P4_link_belongs_to_record：同一 job_id 挂在多条 job_link 上 → 必须被指出。"""
+        a = _record(job_id="a1", job_link="https://x/a.html")
+        b = _record(job_id="a1", job_link="https://x/b.html")
+        ok, findings = self._check(_payload([a, b]))
+        self.assertTrue(
+            any(f["id"] == "P4_link_belongs_to_record" for f in findings),
+            f"一个 id 挂多条链接必须被报出来：{findings}")
+
+    def test_job_id_not_matching_link_is_flagged(self):
+        """P13：job_id 与 md5(job_link)[:16] 对不上 → 必须被指出（模型真身定义）。"""
+        record = _record(job_id="deadbeefdeadbeef")
+        ok, findings = self._check(_payload([record]))
+        self.assertTrue(
+            any(f["id"] == "P13_identity_freshness_credentials" for f in findings),
+            f"job_id 与链接对不上必须被报出来：{findings}")
+
+    def test_missing_link_verified_at_is_flagged(self):
+        """P6_link_verified：缺链接校验时刻 → 必须被指出。"""
+        record = _record()
+        record.pop("link_verified_at", None)
+        ok, findings = self._check(_payload([record]))
+        self.assertTrue(
+            any(f["id"] == "P6_link_verified" for f in findings),
+            f"缺 link_verified_at 必须被报出来：{findings}")
+
+    def test_empty_product_is_flagged(self):
+        """P0_empty：产物里没有记录 → 必须被指出。"""
+        ok, findings = self._check(_payload([]))
+        self.assertFalse(ok)
+        self.assertTrue(any(f["id"] == "P0_empty" for f in findings),
+                        f"空产物必须被报出来：{findings}")

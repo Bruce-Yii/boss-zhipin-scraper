@@ -619,8 +619,17 @@ def _check_p11(payload, records, spec):
     city_min = float(thresholds.get("city_match_rate_min", 0.95))
     total = len(records)
 
-    keyword = str(meta.get("keyword") or "").strip()
-    roots = [r.strip() for r in re.split(r"[,，、;；/]+", keyword) if r.strip()]
+    # 目标词根：优先 meta.target_roots（机器可用的词根列表），退回 meta.keyword。
+    # 为什么需要单独字段：关键词是**搜索词**（如 "AI产品经理"），而平台对它是模糊召回
+    # → 搜 "AI产品经理" 会回来 "AI出海产品经理"、"AIGC产品运营" 这类**命中目标但标题
+    # 不含完整关键词串**的岗位；用完整串匹配会把它们误判成"不是这次要找的岗"。
+    # 词根列表让"命中"按词根算，而不是按整串。
+    raw_roots = meta.get("target_roots")
+    if isinstance(raw_roots, (list, tuple)):
+        roots = [str(r).strip() for r in raw_roots if str(r).strip()]
+    else:
+        keyword = str(meta.get("keyword") or "").strip()
+        roots = [r.strip() for r in re.split(r"[,，、;；/]+", keyword) if r.strip()]
     if not roots:
         out.append(_finding(
             "P11_delivery_matches_request", "warn",

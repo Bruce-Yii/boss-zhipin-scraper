@@ -67,7 +67,13 @@ def counterexample_ids(repo_root=None):
         return set()
     with open(path, encoding="utf-8") as handle:
         text = handle.read()
-    return set(re.findall(r"#\s*(P\d+[a-zA-Z0-9_]*)\s*[:：]", text))
+    # 反例的两种写法都算：注释标注（# Pxx: 说明）与断言调用
+    # （self._assert_red(findings, "Pxx_...")）——后者是实际形态。
+    ids = set(re.findall(r"#\s*(P\d+[a-zA-Z0-9_]*)\s*[:：]", text))
+    ids.update(re.findall(r"_assert_red\(\s*findings\s*,\s*[\"'](P\d+[a-zA-Z0-9_]*)[\"']", text))
+    ids.update(re.findall(r"findings\[[^\]]*\]\s*==\s*[\"'](P\d+[a-zA-Z0-9_]*)[\"']", text))
+    ids.update(re.findall(r"f\[\"id\"\]\s*==\s*[\"'](P\d+[a-zA-Z0-9_]*)[\"']", text))
+    return ids
 
 
 def coverage_matrix(repo_root=None):

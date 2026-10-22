@@ -7,79 +7,160 @@
       "id": "R01",
       "ask": "这家公司是谁、什么规模、什么行业？值不值得投？",
       "question": "who_is_the_company",
-      "properties": ["P1_required_non_empty", "P7_semantic_labels_present"],
-      "delivery": ["company_name", "company_scale", "company_stage", "company_industry", "company_link"]
+      "properties": [
+        "P1_required_non_empty",
+        "P7_semantic_labels_present",
+        "P6_link_verified"
+      ],
+      "delivery": [
+        "company_name",
+        "company_scale",
+        "company_stage",
+        "company_industry",
+        "company_link"
+      ]
     },
     {
       "id": "R02",
-      "ask": "这个岗具体做什么？",
+      "ask": "这个岗具体做什么？（正文完整、不含页面模块）",
       "question": "what_is_the_role",
-      "properties": ["P1_required_non_empty", "P5_jd_matches_its_title", "P9_jd_not_too_short"],
-      "delivery": ["title", "jd", "title_key", "skill_tags"]
+      "properties": [
+        "P1_required_non_empty",
+        "P5_jd_matches_its_title",
+        "P9_jd_not_too_short",
+        "P10_no_junk_tail",
+        "P0_empty"
+      ],
+      "delivery": [
+        "title",
+        "jd",
+        "title_key",
+        "skill_tags"
+      ]
     },
     {
       "id": "R03",
       "ask": "多少钱？不同口径能比吗？",
       "question": "how_much_pay",
-      "properties": ["P12_semantic_cross_consistency"],
-      "delivery": ["salary", "salary_min", "salary_max", "salary_unit", "months_per_year"]
+      "properties": [
+        "P12_semantic_cross_consistency"
+      ],
+      "delivery": [
+        "salary",
+        "salary_min",
+        "salary_max",
+        "salary_unit",
+        "months_per_year"
+      ]
     },
     {
       "id": "R04",
       "ask": "是不是猎头代发（公司不可核、薪资虚高）？",
       "question": "is_it_agency",
-      "properties": ["P12_semantic_cross_consistency"],
-      "delivery": ["post_type", "proxy_job", "proxy_type", "boss_title"]
+      "properties": [
+        "P12_semantic_cross_consistency"
+      ],
+      "delivery": [
+        "post_type",
+        "proxy_job",
+        "proxy_type",
+        "boss_title"
+      ]
     },
     {
       "id": "R05",
       "ask": "是社招、实习还是校招？",
       "question": "is_it_internship",
-      "properties": ["P12_semantic_cross_consistency"],
-      "delivery": ["recruit_type", "job_type"]
+      "properties": [
+        "P12_semantic_cross_consistency"
+      ],
+      "delivery": [
+        "recruit_type",
+        "job_type"
+      ]
     },
     {
       "id": "R06",
       "ask": "岗位还活着吗？HR 还活跃吗？",
       "question": "is_it_alive",
-      "properties": ["P12_semantic_cross_consistency", "P13_freshness_and_credentials"],
-      "delivery": ["job_valid_status", "boss_active_status", "active_state", "link_verified_at"]
+      "properties": [
+        "P12_semantic_cross_consistency",
+        "P13_identity_freshness_credentials"
+      ],
+      "delivery": [
+        "job_valid_status",
+        "boss_active_status",
+        "active_state",
+        "link_verified_at"
+      ]
     },
     {
       "id": "R07",
       "ask": "跟别的岗是不是同一份内容？",
       "question": "is_it_duplicate",
-      "properties": ["P3_duplicates_are_flagged", "P13_freshness_and_credentials"],
-      "delivery": ["job_id", "dup_group", "dup_size", "is_primary"]
+      "properties": [
+        "P3_duplicates_are_flagged",
+        "P13_identity_freshness_credentials"
+      ],
+      "delivery": [
+        "job_id",
+        "dup_group",
+        "dup_size",
+        "is_primary"
+      ]
     },
     {
       "id": "R08",
       "ask": "链接现在还能打开、还指向这个岗吗？",
       "question": "can_i_open_it",
-      "properties": ["P4_identity_unique", "P13_freshness_and_credentials"],
-      "delivery": ["job_link", "link_verified_at", "job_id"]
+      "properties": [
+        "P4_link_belongs_to_record",
+        "P13_identity_freshness_credentials"
+      ],
+      "delivery": [
+        "job_link",
+        "link_verified_at",
+        "job_id"
+      ]
     },
     {
       "id": "R09",
       "ask": "**这是不是这次要找的岗**（方向对不对、覆盖全不全）？",
       "question": "delivery_matches_request",
-      "properties": ["P11_delivery_matches_request"],
-      "delivery": ["direction", "is_ai_pm", "direction_evidence"],
+      "properties": [
+        "P11_delivery_matches_request"
+      ],
+      "delivery": [
+        "direction",
+        "is_ai_pm",
+        "direction_evidence"
+      ],
       "added": "2026-10-22 独立审计指出：这是第一版验收器最大的洞——没有任何性质问这句话"
     },
     {
       "id": "R10",
       "ask": "**这份数据覆盖了它声称覆盖的范围吗**（别把 55% 覆盖当全量卖给我）？",
       "question": "coverage_honesty",
-      "properties": ["P11_delivery_matches_request"],
-      "delivery": ["coverage", "scanned_count", "dropped_by_reason"],
+      "properties": [
+        "P11_delivery_matches_request"
+      ],
+      "delivery": [
+        "coverage",
+        "scanned_count",
+        "dropped_by_reason"
+      ],
       "added": "2026-10-22 独立审计 S1：合并文件只覆盖扫描到的 55%，文件里零披露"
     },
     {
       "id": "R11",
       "ask": "**有没有平台凭据漏进产物**（红线）？",
       "question": "no_credential_leak",
-      "properties": ["P0_forbidden_fields", "P13_freshness_and_credentials"],
+      "properties": [
+        "P0_forbidden_fields",
+        "P13_identity_freshness_credentials",
+        "P2_no_unregistered_field",
+        "P2_type_stable"
+      ],
       "delivery": []
     }
   ],
