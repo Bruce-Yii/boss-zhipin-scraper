@@ -630,5 +630,20 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
             data.setdefault("warnings", []).append(f"数据完整性自检异常：{exc}")
     if extra_meta:
         data.update(_sanitize_payload(extra_meta))
+    # ── 空导出不覆盖原文件（独立审计 F8）─────────────────────────
+    # 详情全失败（登录失效/风控/坏页台账）时 kept 会是 0 → 旧行为把列表文件里
+    # 已有的 title/薪资/公司数据整个覆盖成空数组，**退出码还是 0** → 下游按
+    # "成功"处理就拿到空表。这里改成：**不写**（保留原文件），并把失败原因
+    # 写进 meta.warnings，让调用方能给出非零退出码。
+    if total_before > 0 and not kept:
+        data["jobs"] = list(jobs)          # 保留原来的列表数据
+        data["job_count"] = len(jobs)
+        data["total"] = len(jobs)
+        data["empty_export_blocked"] = True
+        warns = list(data.get("warnings") or [])
+        warns.append(
+            f"导出为空（详情 {total_before} 条全部未拿到 JD）→ **未覆盖原文件**，"
+            "保留列表侧数据；请检查登录状态/风控/坏页台账")
+        data["warnings"] = warns
     _atomic_write_json(target_path, _sanitize_payload(data))
     return len(kept), len(dropped_ids)
