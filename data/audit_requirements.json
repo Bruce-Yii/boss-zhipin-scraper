@@ -1,0 +1,112 @@
+{
+  "version": "1.0",
+  "updated": "2026-10-22",
+  "why": "**需求的独立来源**。验收项必须能追溯到「使用者要回答什么问题」，而不是「代码里有哪些字段」。\n\n2026-10-22 的根因链（一层一层往上推）：\n1. 症状：连续多轮都能发现新缺陷；\n2. 我漏检 → 因为体检脚本是**当场写的**，检查什么取决于我那一刻想到什么；\n3. 盲区必然存在且会复发 → 因为**没有独立于实现的东西**（规格也是我写的）；\n4. 规格由实现方写 → 因为**没有需求的独立来源**（用户的真实问题没被固化成可执行验收项）；\n5. 需求没固化 → 因为**没有验收流水线**（谁验、验什么、怎么复现、结论怎么留痕）；\n6. **没有流水线 = 源头**。\n\n所以根治不是再加检查脚本，而是把「需求 → 验收项 → 反例 → 独立执行 → 结论留痕」做成流水线：\n- 需求（本文件）→ 验收性质（data/acceptance_spec.json）→ 反例（tests/test_acceptance_counterexamples.py）\n- 独立执行（data/audit_briefs/ 下的固定 brief，由子代理执行）\n- 结论留痕（scripts/audit_pipeline.py self_check → 写进产物 meta）",
+  "requirements": [
+    {
+      "id": "R01",
+      "ask": "这家公司是谁、什么规模、什么行业？值不值得投？",
+      "question": "who_is_the_company",
+      "properties": ["P1_required_non_empty", "P7_semantic_labels_present"],
+      "delivery": ["company_name", "company_scale", "company_stage", "company_industry", "company_link"]
+    },
+    {
+      "id": "R02",
+      "ask": "这个岗具体做什么？",
+      "question": "what_is_the_role",
+      "properties": ["P1_required_non_empty", "P5_jd_matches_its_title", "P9_jd_not_too_short"],
+      "delivery": ["title", "jd", "title_key", "skill_tags"]
+    },
+    {
+      "id": "R03",
+      "ask": "多少钱？不同口径能比吗？",
+      "question": "how_much_pay",
+      "properties": ["P12_semantic_cross_consistency"],
+      "delivery": ["salary", "salary_min", "salary_max", "salary_unit", "months_per_year"]
+    },
+    {
+      "id": "R04",
+      "ask": "是不是猎头代发（公司不可核、薪资虚高）？",
+      "question": "is_it_agency",
+      "properties": ["P12_semantic_cross_consistency"],
+      "delivery": ["post_type", "proxy_job", "proxy_type", "boss_title"]
+    },
+    {
+      "id": "R05",
+      "ask": "是社招、实习还是校招？",
+      "question": "is_it_internship",
+      "properties": ["P12_semantic_cross_consistency"],
+      "delivery": ["recruit_type", "job_type"]
+    },
+    {
+      "id": "R06",
+      "ask": "岗位还活着吗？HR 还活跃吗？",
+      "question": "is_it_alive",
+      "properties": ["P12_semantic_cross_consistency", "P13_freshness_and_credentials"],
+      "delivery": ["job_valid_status", "boss_active_status", "active_state", "link_verified_at"]
+    },
+    {
+      "id": "R07",
+      "ask": "跟别的岗是不是同一份内容？",
+      "question": "is_it_duplicate",
+      "properties": ["P3_duplicates_are_flagged", "P13_freshness_and_credentials"],
+      "delivery": ["job_id", "dup_group", "dup_size", "is_primary"]
+    },
+    {
+      "id": "R08",
+      "ask": "链接现在还能打开、还指向这个岗吗？",
+      "question": "can_i_open_it",
+      "properties": ["P4_identity_unique", "P13_freshness_and_credentials"],
+      "delivery": ["job_link", "link_verified_at", "job_id"]
+    },
+    {
+      "id": "R09",
+      "ask": "**这是不是这次要找的岗**（方向对不对、覆盖全不全）？",
+      "question": "delivery_matches_request",
+      "properties": ["P11_delivery_matches_request"],
+      "delivery": ["direction", "is_ai_pm", "direction_evidence"],
+      "added": "2026-10-22 独立审计指出：这是第一版验收器最大的洞——没有任何性质问这句话"
+    },
+    {
+      "id": "R10",
+      "ask": "**这份数据覆盖了它声称覆盖的范围吗**（别把 55% 覆盖当全量卖给我）？",
+      "question": "coverage_honesty",
+      "properties": ["P11_delivery_matches_request"],
+      "delivery": ["coverage", "scanned_count", "dropped_by_reason"],
+      "added": "2026-10-22 独立审计 S1：合并文件只覆盖扫描到的 55%，文件里零披露"
+    },
+    {
+      "id": "R11",
+      "ask": "**有没有平台凭据漏进产物**（红线）？",
+      "question": "no_credential_leak",
+      "properties": ["P0_forbidden_fields", "P13_freshness_and_credentials"],
+      "delivery": []
+    }
+  ],
+  "audit_kinds": [
+    {
+      "id": "data_usability",
+      "brief": "data/audit_briefs/data_usability.md",
+      "question": "一个真实求职者拿这份数据做决策会不会被误导？",
+      "produced": "2026-10-22：抓出「只覆盖 55% 且零披露」「32.6% 与目标无关」「薪资列日月薪混装」"
+    },
+    {
+      "id": "implementation_correctness",
+      "brief": "data/audit_briefs/implementation_correctness.md",
+      "question": "哪里会出错、丢数据、静默损坏、或让两份文件结论相反？",
+      "produced": "2026-10-22：抓出 6 个 P0（过滤只改内存/--merge 复活/坏页台账永久拉黑/活跃度口径分叉/空导出不报错/预算跨进程无锁）"
+    },
+    {
+      "id": "acceptance_mechanism",
+      "brief": "data/audit_briefs/acceptance_mechanism.md",
+      "question": "这套验收机制本身有没有洞？还缺哪些维度？只能加三条的话加哪三条？",
+      "produced": "2026-10-22：抓出「17 条单缺陷记录全部放行」「P8 恒假」「P5 靠通用词放行」「P2/P3 与实现同源」「最大的洞：没问是不是这次要找的岗」"
+    },
+    {
+      "id": "delivery_verification",
+      "brief": "data/audit_briefs/delivery_verification.md",
+      "question": "这份交付能不能直接用？不能的话最少还差什么？",
+      "produced": "2026-10-22：抓出「自检写的 no_junk_tail: ok 是假的」「10 条 JD 头部截断（蚂蚁那条丢 35% 正文）」「5 条不是日常实习」「220 条 JD 无溯源」"
+    }
+  ]
+}
