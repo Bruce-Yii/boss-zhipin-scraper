@@ -539,6 +539,15 @@ class JobRecord:
             row.setdefault(spec.name, "" if spec.type != "list" else [])
         return row
 
+    def to_public_dict(self) -> dict:
+        """**对外可见**的行：剔除平台内部字段（红线：内部 id/凭据不落盘）。
+
+        列表行在内存里带着 security_id/lid/encrypt_*（详情 API 通道要用），
+        但任何落盘产物（详情输出 / CSV / 导出）都不能带它们。
+        """
+        return {key: value for key, value in self.data.items()
+                if key not in EXPORT_HIDDEN_FIELDS}
+
 
 def _list_active_status(raw) -> str:
     """列表侧活跃度文案：优先 activeTimeDesc，否则 bossOnline → 「在线」。"""
