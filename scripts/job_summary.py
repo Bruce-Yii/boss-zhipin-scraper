@@ -8,6 +8,11 @@ import io
 import json
 import os
 import re
+
+try:
+    from scripts import job_model as _model
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import job_model as _model
 import sys
 from collections import Counter
 
@@ -110,6 +115,21 @@ def experience_tag_for_job(job):
     return ""
 
 
+def degree_tag_for_job(job):
+    """Return the first authoritative degree label for a job.
+
+    优先读 ``education`` 专用字段（旧文件/仅列表的调用方才回退到 tags/job_labels）——
+    同一信息只留一个来源，避免两处口径打架。
+    """
+    if not isinstance(job, dict):
+        return ""
+    for field in ("education", "tags", "job_labels"):
+        for tag in split_tags(job.get(field, "")):
+            if is_degree_tag(tag):
+                return tag
+    return ""
+
+
 def district_from_location(location):
     parts = [part.strip() for part in str(location or "").split("·") if part.strip()]
     if len(parts) >= 2:
@@ -140,17 +160,11 @@ def parse_salary_monthly(salary):
 
     支持 "20-40K" / "20-40K·15薪"（K 后缀月薪）与 "350-500元/天"
     （按 22 个工作日折算月薪千元）。
+
+    **解析口径由岗位模型统一提供**（scripts/job_model.py）——同一份薪资文本在导出、
+    摘要、自检里必须得到同一个数。
     """
-    text = str(salary or "").strip()
-    if not text:
-        return None
-    m = _SALARY_K_RE.search(text)
-    if m:
-        return float(m.group(1)), float(m.group(2))
-    m = _SALARY_DAY_RE.search(text)
-    if m:
-        return round(float(m.group(1)) * 22 / 1000, 1), round(float(m.group(2)) * 22 / 1000, 1)
-    return None
+    return _model.parse_salary_monthly(salary)
 
 
 _SALARY_MONTHS_RE = re.compile(r"(\d+)\s*薪")
@@ -232,30 +246,13 @@ def _recruit_type_counts(jobs):
 
 
 def _recruit_type_of(job):
-    """招聘类型（social/intern/campus）；没有标注时按社招处理。"""
-    if not isinstance(job, dict):
-        return "social"
-    value = str(job.get("recruit_type") or "").strip()
-    if value:
-        return value
-    raw = str(job.get("job_type") or "").strip()
-    if raw == "4":
-        return "intern"
-    if raw == "5":
-        return "campus"
-    return "social"
+    """招聘类型（social/intern/campus）；判定由岗位模型统一提供。"""
+    return _model.classify_recruit_type(job)
 
 
 def _post_type_of(job):
-    """取岗位的发布主体类型（direct/agency/anonymous）；没有标注时按 direct 处理。"""
-    if not isinstance(job, dict):
-        return "direct"
-    value = str(job.get("post_type") or "").strip()
-    if value:
-        return value
-    if str(job.get("proxy_job") or "").strip() or str(job.get("proxy_type") or "").strip():
-        return "agency"
-    return "direct"
+    """发布主体类型（direct/agency/anonymous）；判定由岗位模型统一提供。"""
+    return _model.classify_post_type(job)
 
 
 def experience_bucket(tag):
@@ -593,15 +590,16 @@ def _build_summary_from_retained(
         if experience_tag:
             experience[experience_tag] += 1
 
+        degree_tag = degree_tag_for_job(job)
+        if degree_tag:
+            degrees[degree_tag] += 1
+
         for tag in split_tags(job.get("tags", "")):
-            if is_experience_tag(tag):
+            if is_experience_tag(tag) or is_degree_tag(tag):
                 continue
-            if is_degree_tag(tag):
-                degrees[tag] += 1
-            else:
-                cleaned = clean_skill_tag(tag)
-                if cleaned:
-                    skill_tags[cleaned] += 1
+            cleaned = clean_skill_tag(tag)
+            if cleaned:
+                skill_tags[cleaned] += 1
 
         for tag in split_tags(job.get("skills", "")):
             cleaned = clean_skill_tag(tag)
@@ -638,6 +636,29 @@ def _build_summary_from_retained(
                     jd_terms[normalized] += 1
                     seen_terms.add(key)
 
+    # 行业 / 福利 / 角标：平台给了但此前从没人用（"抄了不用"）→ 进报告才算交付
+    industries = Counter()
+    welfare = Counter()
+    icon_words = Counter()
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        industry = str(job.get("company_industry") or "").strip()
+        if industry:
+            industries[industry] += 1
+        welfare_text = str(job.get("welfare") or "").strip()
+        if welfare_text:
+            for item in welfare_text.split(" | "):
+                item = item.strip()
+                if item:
+                    welfare[item] += 1
+        icon = str(job.get("icon_word") or "").strip()
+        if not icon:
+            flags = str(job.get("icon_flags") or "").strip()
+            icon = flags.split("|")[0].strip() if flags else ""
+        if icon:
+            icon_words[icon] += 1
+
     market = salary_stats(jobs)
     # 分层行情（2026-10-22）：直招 vs 代发分开报，避免代发岗的虚高面议区间带偏行情
     direct_market = salary_stats(jobs, post_types={"direct"})
@@ -669,6 +690,9 @@ def _build_summary_from_retained(
         "degrees": _most_common(degrees, top),
         "districts": _most_common(districts, top),
         "companies": _most_common(companies, top),
+        "industries": _most_common(industries, top),
+        "welfare": _most_common(welfare, top),
+        "icon_words": _most_common(icon_words, top),
         "company_scales": _most_common(company_scales, top),
         "company_stages": _most_common(company_stages, top),
         "skill_tags": _most_common(skill_tags, top),
@@ -766,6 +790,9 @@ def format_summary(summary):
         f"高频公司: {_format_items(summary['companies'])}",
         f"公司规模: {_format_items(summary.get('company_scales'))}",
         f"融资阶段: {_format_items(summary.get('company_stages'))}",
+        f"行业分布: {_format_items(summary.get('industries'))}",
+        f"福利待遇: {_format_items(summary.get('welfare'))}",
+        f"岗位角标: {_format_items(summary.get('icon_words'))}",
         f"技能标签: {_format_items(summary['skill_tags'])}",
         f"JD 高频词: {_format_items(summary['jd_terms'])}",
     ]

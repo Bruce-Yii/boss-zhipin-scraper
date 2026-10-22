@@ -31,6 +31,11 @@
 import re
 import unicodedata
 
+try:
+    from scripts import job_model as _model
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import job_model as _model
+
 # ---------------------------------------------------------------------------
 # 1) 发布主体类型
 # ---------------------------------------------------------------------------
@@ -46,76 +51,18 @@ _ANON_PATTERNS = (
 _FRAGILE_TYPES = ("工作室", "个体", "自由职业", "兼职")
 
 
-def classify_post_type(job):
-    """判定发布主体类型：``direct``（企业直招）/ ``agency``（猎头代发）/ ``anonymous``（匿名）。
-
-    依据（按优先级）：
-    1. 平台自己标的 ``proxy_job`` / ``proxy_type`` 非空 → ``agency``（**以平台标注为准**，
-       不靠猜公司名）
-    2. 公司名匿名（"某…"）→ ``anonymous``（代发但公司被隐去）
-    3. 其余 → ``direct``
-    """
-    if not isinstance(job, dict):
-        return "direct"
-    proxy = str(job.get("proxy_job") or "").strip()
-    proxy_type = str(job.get("proxy_type") or "").strip()
-    if proxy or proxy_type:
-        return "agency"
-    company = str(job.get("company_name") or job.get("company") or "").strip()
-    if company:
-        for pat in _ANON_PATTERNS[:2]:
-            if pat.search(company):
-                return "anonymous"
-        if any(k in company for k in _FRAGILE_TYPES):
-            return "anonymous"
-    return "direct"
-
-
-# 平台 jobType 的取值（2026-10-22 用 294 条真实数据交叉验证，不靠猜）：
-#   jobType=4 → 实习岗：24/24 条是日薪制、24/24 条经验要求为空、17/24 条标题含"实习"
-#   jobType=5 → 校招岗：**11/11 条经验要求 = "在校/应届"**
-#   jobType 空 → 社招岗：259 条全是月薪制、经验要求有值
-# 与 post_type 同一个病：平台标了我们抄了从不用 → 实习/校招岗（实测 35 条、8.5%）
-# 混在社招岗里，薪资口径也不可比。
-RECRUIT_TYPE_BY_JOB_TYPE = {
-    "4": "intern",
-    "5": "campus",
-}
-
-
-def classify_recruit_type(job):
-    """招聘类型：``social``（社招）/ ``intern``（实习）/ ``campus``（校招）。
-
-    以平台 ``jobType`` 为准；无标注按社招处理（实测社招岗的 jobType 一律为空）。
-    """
-    if not isinstance(job, dict):
-        return "social"
-    raw = str(job.get("job_type") or "").strip()
-    if raw:
-        mapped = RECRUIT_TYPE_BY_JOB_TYPE.get(raw)
-        if mapped:
-            return mapped
-    return "social"
-
-
-def is_agency_like(job):
-    """猎头代发或匿名发布（薪资带虚高、公司不可核，求职端需区别对待）。"""
-    return classify_post_type(job) in ("agency", "anonymous")
+# 记录级语义的**唯一定义点在 scripts/job_model.py**（岗位数据模型）。
+# 这里只保留集合级逻辑（指纹、重复分组、供给编排、导出不变量）。
+classify_post_type = _model.classify_post_type
+classify_recruit_type = _model.classify_recruit_type
+is_agency_like = _model.is_agency_like
 
 
 # ---------------------------------------------------------------------------
 # 2) 标题归一化
 # ---------------------------------------------------------------------------
 
-def normalize_title(title):
-    """标题归一化键：全角转半角、去空白、去标点、小写。
-
-    用于**分组/匹配**，不用于展示（展示保留平台原值）。
-    """
-    text = unicodedata.normalize("NFKC", str(title or "")).strip().lower()
-    text = re.sub(r"\s+", "", text)
-    text = re.sub(r"[·・\-—_、,，。;；:：!！?？()（）\[\]【】\"'`]+", "", text)
-    return text
+normalize_title = _model.normalize_title
 
 
 # ---------------------------------------------------------------------------
@@ -303,21 +250,7 @@ def classify_extract_failure(message, page_text=""):
     return "unknown"
 
 
-def active_state(status):
-    """HR 活跃度三态：``active`` / ``inactive`` / ``unknown``。
-
-    **"平台没给"不等于"不活跃"**——2026-10-22 实测有 14 条岗位的列表侧与详情侧都没有
-    活跃标签（招聘方长期未活跃 → 页面不显示），若把空值当成"不活跃"会误杀，
-    反之当成"活跃"会误导。导出里显式给三态，消费端才分得清。
-    """
-    text = str(status or "").strip()
-    if not text:
-        return "unknown"
-    if re.search(r"(?:\d+\s*)?(?:个?月|周|年)\s*前活跃", text):
-        return "inactive"
-    if text == "在线" or text.endswith("活跃"):
-        return "active"
-    return "unknown"
+active_state = _model.active_state
 
 
 def mark_duplicate_groups(jobs):

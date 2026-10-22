@@ -25,7 +25,6 @@ import argparse
 import base64
 import csv
 import glob
-import hashlib
 import inspect
 import json
 import logging
@@ -101,6 +100,11 @@ try:
     from scripts import semantics as _semantics
 except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
     import semantics as _semantics
+
+try:
+    from scripts import job_model as _job_model
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import job_model as _job_model
 
 try:
     from scripts import known_failures as _known_failures
@@ -1234,69 +1238,16 @@ class NetworkJoblistCapture:
 
 
 def map_api_job(raw):
-    """joblist.json 原始条目 → 统一 job dict。
+    """joblist.json 原始条目 → 统一 job dict（**由岗位模型产生**）。
 
     字段与 ``FETCH_API_JS_TEMPLATE`` 一一对应（注入 JS 模板的 Python 等价版），
     保证被动捕获与 XHR 两条通道产出**同形状**的 job，下游契约/security_map 不受影响。
+
+    字段的含义、来源与消费方在 ``scripts/job_model.py`` 里声明（唯一真相来源）。
     """
     if not isinstance(raw, dict):
         return None
-    encrypt_job_id = str(raw.get("encryptJobId") or "")
-    encrypt_brand_id = str(raw.get("encryptBrandId") or "")
-    salary = raw.get("salaryDesc") or ""
-    location = "\u00b7".join([
-        raw.get("cityName") or "",
-        raw.get("areaDistrict") or "",
-        raw.get("businessDistrict") or "",
-    ])
-    tags = " | ".join(
-        t for t in (raw.get("jobExperience") or "", raw.get("jobDegree") or "")
-        if t and t != "不限"
-    )
-
-    def optional(key):
-        value = raw.get(key)
-        return "" if value is None else value
-
-    return {
-        "title": raw.get("jobName") or "",
-        "salary": salary,
-        "salary_source": "api" if salary else "api_empty",
-        "location": location,
-        "tags": tags,
-        "boss_name": raw.get("brandName") or "",
-        "company_name": raw.get("brandName") or "",
-        "boss_title": raw.get("bossTitle") or "",
-        "boss_active_status": map_list_boss_active_status(raw),
-        "anonymous": optional("anonymous"),
-        "job_valid_status": optional("jobValidStatus"),
-        "icon_flags": "|".join(raw.get("iconFlagList") or []),
-        "icon_word": raw.get("iconWord") or "",
-        "proxy_job": raw.get("proxyJob") or "",
-        "proxy_type": raw.get("proxyType") or "",
-        "job_type": raw.get("jobType") or "",
-        "experience": raw.get("jobExperience") or "",
-        "education": raw.get("jobDegree") or "",
-        "company_scale": raw.get("brandScaleName") or "",
-        "company_stage": raw.get("brandStageName") or "",
-        "company_industry": raw.get("brandIndustry") or "",
-        "job_labels": " | ".join(raw.get("jobLabels") or []),
-        "skills": raw.get("skills") or [],
-        "security_id": raw.get("securityId") or "",
-        "lid": raw.get("lid") or "",
-        "encrypt_job_id": encrypt_job_id,
-        "encrypt_boss_id": str(raw.get("encryptBossId") or ""),
-        "encrypt_brand_id": encrypt_brand_id,
-        "job_link": (
-            f"https://www.zhipin.com/job_detail/{encrypt_job_id}.html"
-            if encrypt_job_id else ""
-        ),
-        "company_link": (
-            f"https://www.zhipin.com/gongsi/{encrypt_brand_id}.html"
-            if encrypt_brand_id else ""
-        ),
-        "welfare": " | ".join(raw.get("welfareList") or []),
-    }
+    return _job_model.JobRecord.from_list_payload(raw).to_dict()
 
 
 def map_api_jobs(data):
@@ -4120,7 +4071,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
             new = 0
             for j in jobs:
                 key = j.get('job_link') or j['title']
-                j['job_id'] = hashlib.md5(key.encode()).hexdigest()[:16]
+                j['job_id'] = _job_model.compute_job_id(key)
                 observed_ids.append(j['job_id'])
                 sid_ = j.get('security_id')
                 if sid_:
