@@ -1,0 +1,96 @@
+{
+  "version": "1.0",
+  "updated": "2026-10-22",
+  "why": "验收标准不应该由写代码的同一个人在同一个会话里当场写。那样得到的体检与被体检的东西出自同一个心智模型，天生有相同的盲区——2026-10-22 上午就是这么连续漏掉三类缺陷的。本规格的条目来自**消费者（求职者）要回答的问题**，与实现无关；检查器按性质（property）而不是按字段清单来判定，因此能覆盖写规格时没想到的具体情形。",
+  "questions": [
+    {
+      "id": "who_is_the_company",
+      "ask": "这家公司是谁、什么规模、什么行业？",
+      "requires": ["company_name", "company_industry", "company_scale", "company_stage", "company_link"]
+    },
+    {
+      "id": "what_is_the_role",
+      "ask": "这个岗具体做什么？最近更新过吗？",
+      "requires": ["title", "jd", "title_key", "page_update_date", "skill_tags", "tags"]
+    },
+    {
+      "id": "how_much_pay",
+      "ask": "多少钱？薪资口径是什么？",
+      "requires": ["salary", "salary_source", "post_type", "recruit_type"]
+    },
+    {
+      "id": "is_it_agency",
+      "ask": "是不是猎头代发（公司不可核、薪资面议虚高）？",
+      "requires": ["post_type", "proxy_job", "proxy_type", "boss_title", "company_name"]
+    },
+    {
+      "id": "is_it_internship",
+      "ask": "是社招、实习还是校招？",
+      "requires": ["recruit_type", "job_type", "salary", "experience"]
+    },
+    {
+      "id": "is_it_alive",
+      "ask": "岗位还活着吗？HR 还活跃吗？",
+      "requires": ["job_valid_status", "boss_active_status", "active_state", "link_verified_at"]
+    },
+    {
+      "id": "is_it_duplicate",
+      "ask": "跟别的岗是不是同一份内容？",
+      "requires": ["job_id", "dup_group", "dup_size", "is_primary", "jd", "salary", "location"]
+    },
+    {
+      "id": "can_i_open_it",
+      "ask": "链接现在还能打开、还指向这个岗吗？",
+      "requires": ["job_link", "link_verified_at", "job_id"]
+    }
+  ],
+  "required_always": ["job_id", "title", "company_name", "salary", "location", "job_link", "jd"],
+  "value_rules": {
+    "post_type": ["direct", "agency", "anonymous"],
+    "recruit_type": ["social", "intern", "campus"],
+    "active_state": ["active", "inactive", "unknown"]
+  },
+  "properties": [
+    {
+      "id": "P1_required_non_empty",
+      "desc": "每条记录的必填字段都必须有值（不允许'空得像有值'）"
+    },
+    {
+      "id": "P2_no_unregistered_field",
+      "desc": "记录里出现的每个字段都必须在规格里登记（不允许有'没人知道这是什么'的字段）"
+    },
+    {
+      "id": "P3_duplicates_are_flagged",
+      "desc": "任意两条记录若内容指纹相同（JD 前 180 字 + 薪资 + 城市），必须被标进同一个 dup_group"
+    },
+    {
+      "id": "P4_link_belongs_to_record",
+      "desc": "每条记录的链接必须能归属到它自己的 job_id（链接不能是别的岗的）"
+    },
+    {
+      "id": "P5_jd_matches_its_title",
+      "desc": "每条记录的 JD 至少包含其岗位名的一个 2 字以上词（不允许张冠李戴的 JD）"
+    },
+    {
+      "id": "P6_link_verified",
+      "desc": "每条记录都必须有 link_verified_at（链接是短时效凭证，必须知道它何时被验证）"
+    },
+    {
+      "id": "P7_semantic_labels_present",
+      "desc": "每条记录都必须有 post_type / recruit_type / active_state 三个判定"
+    },
+    {
+      "id": "P8_salary_source_consistent",
+      "desc": "标了 salary_source=api 的记录薪资不能为空"
+    },
+    {
+      "id": "P9_jd_not_too_short",
+      "desc": "JD 长度不得低于 120 字（低于这个长度基本是抽取失败，不是真 JD）"
+    },
+    {
+      "id": "P10_no_junk_tail",
+      "desc": "JD 尾部不得混进页面模块文案（薪资详情/活跃标签/招聘专员等）"
+    }
+  ],
+  "forbidden_fields": ["security_id", "lid", "encrypt_job_id", "encrypt_boss_id", "encrypt_brand_id"]
+}

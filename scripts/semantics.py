@@ -76,19 +76,15 @@ def _normalize_jd(jd):
 
 
 def content_fingerprint(job, head=180):
-    """岗位内容指纹：归一化 JD 开头 + 薪资带 + 城市。
+    """岗位内容指纹（**转发到岗位模型——唯一定义**）。
 
     用途：识别"同一份 JD 被多家猎头/多个发布重复投放"（`job_id` 不同但内容同源）。
     只取 JD 开头（正文前 180 字）——足够区分不同岗位，又不会被尾部差异干扰。
+
+    2026-10-22：指纹定义迁到 models（验收器与打标器必须同源，否则会出现
+    "检查器说重复、打标器说不重复"——实测 4 组真重复因此没被标）。
     """
-    if not isinstance(job, dict):
-        return ""
-    jd = _normalize_jd(job.get("jd"))[:head]
-    if not jd:
-        return ""
-    salary = re.sub(r"\s+", "", str(job.get("salary") or ""))
-    city = normalize_title(job.get("location"))[:12]
-    return f"{jd}|{salary}|{city}"
+    return _model.content_fingerprint(job, head=head)
 
 
 def group_duplicates(jobs):
@@ -226,6 +222,39 @@ _EXTRACT_FAILURE_PATTERNS = (
     ("no_section", ("职位描述",)),          # 有标题但取不到正文块 → 选择器/结构不匹配
     ("too_short", ("too short", "字，", "职位描述")),   # 抽到了但过短
 )
+
+
+def filter_by_relevance(jobs, recruit_types=None, industry_allow=None):
+    """**零成本的相关度过滤**（在列表阶段做，丢掉的不进详情 → 也不耗额度）。
+
+    - ``recruit_types``: 只保留这些招聘类型（social/intern/campus）；
+    - ``industry_allow``: 只保留这些行业（``None``=按模型默认白名单；``[]``=不过滤）。
+
+    返回 ``(kept, dropped_detail)``，dropped_detail 说明每类丢了多少（不静默丢）。
+    """
+    if industry_allow is None:
+        industry_allow = _model.DEFAULT_INDUSTRY_ALLOW
+    allow_set = {str(x).strip() for x in industry_allow if str(x).strip()}
+    type_set = {str(x).strip() for x in (recruit_types or []) if str(x).strip()}
+    kept, dropped = [], {"recruit_type": 0, "industry": 0, "no_industry": 0}
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        if type_set:
+            rtype = _model.classify_recruit_type(job)
+            if rtype not in type_set:
+                dropped["recruit_type"] += 1
+                continue
+        if allow_set:
+            industry = _model.industry_of(job)
+            if not industry:
+                # 行业缺失（平台没给）→ 不静默丢，计入 no_industry 供人判断
+                dropped["no_industry"] += 1
+            elif industry not in allow_set:
+                dropped["industry"] += 1
+                continue
+        kept.append(job)
+    return kept, dropped
 
 
 def classify_extract_failure(message, page_text=""):

@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 
 try:
     from scripts import job_model as _model
@@ -135,6 +136,34 @@ def district_from_location(location):
     if len(parts) >= 2:
         return parts[1]
     return parts[0] if parts else ""
+
+
+def jd_matches_title(job, head=160):
+    """JD 是否与岗位名对得上（粗但有效）。
+
+    平台搜索是模糊召回，会带回别的岗位：实测 466 条里有 2 条 JD 与岗位名完全对不上
+    ——一条是"招募小红书运营合伙人（股权/项目合作）"的**引流帖**、一条是古茗茶饮的
+    **工厂信息化产品经理**（跨行业）。这类 JD 对求职毫无价值。
+    """
+    if not isinstance(job, dict):
+        return True
+    title = str(job.get("title") or "")
+    jd = str(job.get("jd") or "")
+    if not title or not jd:
+        return True
+    text = unicodedata.normalize("NFKC", jd).lower()
+    for chunk in re.split(r"[\s\-—_|/·、,，()（）【】\[\]]+",
+                          unicodedata.normalize("NFKC", title).strip().lower()):
+        chunk = chunk.strip()
+        if len(chunk) < 2:
+            continue
+        if chunk in text:
+            return True
+        if re.search(r"[\u4e00-\u9fff]", chunk) and len(chunk) > 3:
+            for i in range(len(chunk) - 1):
+                if chunk[i:i + 2] in text:
+                    return True
+    return False
 
 
 def clean_skill_tag(tag):
@@ -467,12 +496,24 @@ def filter_summary_inputs(jobs, details=None):
             )
         sales_flags.append(is_sales)
 
+    # JD 与岗位名对不上 → 平台模糊召回带进来的别的岗（实测：招募合伙人引流帖、跨行业
+    # 工厂信息化产品经理）。对求职无价值 → 与销售岗同级剔除。
+    mismatch_flags = []
+    for index, job in enumerate(jobs):
+        mismatch = not jd_matches_title(job)
+        if not mismatch:
+            mismatch = any(
+                not jd_matches_title(detail) for detail in details_by_job[index]
+            )
+        mismatch_flags.append(mismatch)
+
+    dropped_flags = [sales_flags[i] or mismatch_flags[i] for i in range(len(jobs))]
     retained_jobs = [
-        job for index, job in enumerate(jobs) if not sales_flags[index]
+        job for index, job in enumerate(jobs) if not dropped_flags[index]
     ]
     sales_filtered = sum(sales_flags)
     retained_indices = {
-        index for index, is_sales in enumerate(sales_flags) if not is_sales
+        index for index, dropped in enumerate(dropped_flags) if not dropped
     }
     retained_details = [
         detail
@@ -480,6 +521,32 @@ def filter_summary_inputs(jobs, details=None):
         if candidates and candidates.issubset(retained_indices)
     ]
     return retained_jobs, retained_details, sales_filtered
+
+
+def count_jd_title_mismatches(jobs, details=None):
+    """有多少条岗位的 **JD 与岗位名对不上**（平台模糊召回带进来的别的岗）。
+
+    单独成一个函数：``filter_summary_inputs`` 的返回结构是既有契约，不改
+    （2026-10-22 改过一次签名 → 20 个既有用例直接挂 → 说明它是有契约的）。
+    """
+    jobs = jobs or []
+    details = details or []
+    by_job = {}
+    for detail in details:
+        if isinstance(detail, dict):
+            by_job.setdefault(str(detail.get("job_id") or ""), []).append(detail)
+    count = 0
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        if not jd_matches_title(job):
+            count += 1
+            continue
+        for detail in by_job.get(str(job.get("job_id") or ""), []):
+            if not jd_matches_title(detail):
+                count += 1
+                break
+    return count
 
 
 def term_appears_in_jd(term, jd_text):
@@ -698,6 +765,7 @@ def _build_summary_from_retained(
         "skill_tags": _most_common(skill_tags, top),
         "jd_terms": _most_common(jd_terms, top),
         "sales_filtered": sales_filtered,
+        "mismatch_filtered": count_jd_title_mismatches(jobs, details),
     }
 
 
@@ -776,6 +844,9 @@ def format_summary(summary):
     ]
     if summary.get("sales_filtered"):
         lines.insert(1, f"⚠️ 已剔除 {summary['sales_filtered']} 条疑似销售岗（关键词模糊匹配混入）")
+    if summary.get("mismatch_filtered"):
+        lines.insert(1, f"⚠️ 已剔除 {summary['mismatch_filtered']} 条 JD 与岗位名不符的岗位"
+                        "（平台模糊召回带进来的别的岗）")
     if summary.get("sample_warning"):
         lines.insert(1, "⚠️ 样本量警示：可解析薪资不足 30 条，统计结论仅供参考")
     lines += [

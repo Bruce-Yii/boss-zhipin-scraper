@@ -325,6 +325,54 @@ def classify_post_type(job) -> str:
     return "direct"
 
 
+# 默认行业白名单（2026-10-22 从 294 条真实数据里取"目标行业"那一簇）。
+# 平台对"产品经理"这类词是**模糊召回**：搜 AI 产品经理会带回房地产经纪、餐饮、支付、
+# 医药快消、工厂信息化等别的行业的产品经理岗（实测 109 条 JD 首 400 字命中非目标行业
+# 词）。**行业是平台自己给的字段 → 在列表阶段丢弃，零额外请求**（省下的还有详情页额度）。
+# 白名单偏保守：只保留互联网/软件/AI/电商/企业服务这一簇；要全要传 --industry-allow ""。
+DEFAULT_INDUSTRY_ALLOW = (
+    "互联网", "人工智能", "计算机软件", "计算机服务", "电子商务", "企业服务",
+    "广告营销", "社交网络与媒体", "生活服务(O2O)", "O2O", "大数据", "游戏",
+    "通信/网络设备", "智能硬件", "智能硬件/消费电子", "移动互联网", "信息安全",
+    "在线教育", "新零售", "学术/科研", "互联网金融",
+)
+
+# 招聘类型（记录级语义）：social 社招 / intern 实习 / campus 校招
+RECRUIT_TYPES = ("social", "intern", "campus")
+
+
+def _normalize_jd(jd) -> str:
+    text = unicodedata.normalize("NFKC", str(jd or "")).lower()
+    return re.sub(r"\s+", "", text)
+
+
+def content_fingerprint(job, head=180) -> str:
+    """内容指纹（**唯一定义**）：同 JD + 同薪资 + 同城市 → 同一份内容。
+
+    平台允许同一岗位**多条发布**（同公司同岗、不同 job_id）→ job_id 去重抓不到，
+    只能靠内容指纹识别。验收器（scripts/acceptance.py 的 P3）与打标器
+    （semantics.mark_duplicate_groups）**必须用同一个指纹**，否则会出现
+    "检查器说重复、打标器说不重复"（2026-10-22 上午实测踩到过：4 组真重复没被标）。
+
+    实现自原语义层（逐字迁移，行为不变）：归一化 JD 开头 + 薪资带 + 城市。
+    """
+    if not isinstance(job, dict):
+        return ""
+    jd = _normalize_jd(job.get("jd"))[:head]
+    if not jd:
+        return ""
+    salary = re.sub(r"\s+", "", str(job.get("salary") or ""))
+    city = normalize_title(job.get("location"))[:12]
+    return f"{jd}|{salary}|{city}"
+
+
+def industry_of(job) -> str:
+    """公司行业（平台字段）。"""
+    if not isinstance(job, dict):
+        return ""
+    return str(job.get("company_industry") or "").strip()
+
+
 def is_agency_like(job) -> bool:
     """猎头代发或匿名发布（薪资带虚高、公司不可核，求职端需区别对待）。"""
     return classify_post_type(job) in ("agency", "anonymous")

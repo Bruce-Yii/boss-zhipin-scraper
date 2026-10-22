@@ -7298,6 +7298,13 @@ def build_parser():
     g_search.add_argument("--city", default=DEFAULT_CITY_INPUT,
                           help=f"城市 (中文名或代码，默认 {DEFAULT_CITY_INPUT})")
     g_search.add_argument("--pages", type=int, default=3, help=f"抓取页数 (最大 {MAX_PAGES})")
+    g_search.add_argument("--recruit-type", default=None, metavar="TYPES",
+                          help=("只要指定招聘类型（逗号分隔：social 社招 / intern 实习 / "
+                                "campus 校招）。**在列表阶段过滤** → 不抓详情、不耗额度。"
+                                "不传=全要"))
+    g_search.add_argument("--industry-allow", default=None, metavar="LIST",
+                          help=("只要指定行业（逗号分隔）。默认=互联网/AI/软件等目标行业"
+                                "白名单（平台自己的行业字段，零额外请求）；传空串=不过滤"))
     g_search.add_argument("--refresh-links", metavar="EXPORT_PATH", default=None,
                           help="按 job_id 用**新拉取的列表链接**刷新导出里的 job_link"
                                "（链接含 securityId 段、不能由 job_id 重建；本模式只发列表"
@@ -7984,6 +7991,34 @@ def _run_cli_impl(p, args):
 
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
+
+        # ── 相关度过滤（零额外请求，在抓详情之前）────────────────────
+        # 平台对"产品经理"是模糊召回：会带回房地产/餐饮/支付/食品等别的行业的产品经理岗。
+        # 用**平台自己的字段**（公司行业、招聘类型）过滤：丢掉的岗**不抓详情 → 不耗额度**。
+        _recruit_types = ([t.strip() for t in str(args.recruit_type or "").split(",")
+                           if t.strip()] or None)
+        if args.industry_allow is None:
+            _industry_allow = None                      # 用模型默认白名单
+        else:
+            _industry_allow = [t.strip() for t in str(args.industry_allow).split(",")
+                               if t.strip()]
+        if _recruit_types or _industry_allow is not None:
+            _before = len(list_data.get("jobs") or [])
+            _kept, _dropped = _semantics.filter_by_relevance(
+                list_data.get("jobs") or [],
+                recruit_types=_recruit_types, industry_allow=_industry_allow)
+            list_data["jobs"] = _kept
+            list_data["total"] = len(_kept)
+            _drop_total = _before - len(_kept)
+            print(f"🔎 相关度过滤：{_before} → {len(_kept)} 岗（丢弃 {_drop_total}）")
+            if _dropped.get("recruit_type"):
+                print(f"   招聘类型不符：{_dropped['recruit_type']} 条")
+            if _dropped.get("industry"):
+                print(f"   行业不在白名单：{_dropped['industry']} 条")
+            if _dropped.get("no_industry"):
+                print(f"   ⚠️ 行业字段缺失（无法判定）：{_dropped['no_industry']} 条（已保留）")
+            if _drop_total:
+                print("   → 这些岗不抓详情，**不消耗详情页额度**")
         if db_state is not None:
             db_state["list_data"] = list_data
         # sidecar 只在真正开始详情前创建，并由详情调用 finally 删除。
