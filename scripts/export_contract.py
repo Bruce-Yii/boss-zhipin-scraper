@@ -15,6 +15,14 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
         import semantics as _semantics
     except ImportError:  # pragma: no cover - 独立拷贝时语义层不可用则降级
         _semantics = None
+
+try:
+    from scripts import job_model as _job_model
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    try:
+        import job_model as _job_model
+    except ImportError:  # pragma: no cover - 独立拷贝时模型不可用则降级
+        _job_model = None
 import logging
 import os
 import re
@@ -490,23 +498,12 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
         return None
 
-    jd_map = {}
-    activity_map = {}
-    semantic_map = {}
+    # 详情记录按 job_id 归拢；合并**由岗位模型负责**（字段白名单、覆盖规则、
+    # 派生语义重算都在模型里，不再在这里手工搬字段——那正是"抄了/丢了一半"的来源）。
+    detail_by_id = {}
     for d in details or []:
         if isinstance(d, dict) and d.get("job_id") and str(d.get("jd") or "").strip():
-            jid = str(d["job_id"])
-            jd_map[jid] = d["jd"]
-            activity_map[jid] = d.get("boss_active_status")
-            semantic_map[jid] = {
-                key: d.get(key) for key in
-                ("post_type", "title_key", "link_verified_at", "recruit_type",
-                 # 详情侧独有、列表侧没有的字段（2026-10-22 发现被丢弃）：
-                 #   page_update_date = 岗位侧最后编辑日期（判断岗位新鲜度）
-                 #   skill_tags       = 详情页技能标签（比列表侧 skills 更准）
-                 "page_update_date", "skill_tags")
-                if d.get(key)
-            }
+            detail_by_id[str(d["job_id"])] = d
 
     jobs = data["jobs"]
     kept, dropped_ids = [], []
@@ -515,15 +512,19 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         if not isinstance(job, dict):
             continue
         jid = str(job.get("job_id") or "")
-        jd = jd_map.get(jid)
-        if jd:
-            job = {**job, "jd": jd}
-            activity = _more_specific_activity(
-                job.get("boss_active_status"), activity_map.get(jid))
-            if activity:
-                job["boss_active_status"] = activity
-            for key, value in (semantic_map.get(jid) or {}).items():
-                job[key] = value
+        detail = detail_by_id.get(jid)
+        if detail:
+            if _job_model is not None:
+                record = _job_model.JobRecord(job).merge_detail(detail)
+                activity = _more_specific_activity(
+                    job.get("boss_active_status"), detail.get("boss_active_status"))
+                if activity:
+                    record.data["boss_active_status"] = activity
+                record.apply_derived(
+                    link_verified_at=record.data.get("link_verified_at", ""))
+                job = record.to_dict()
+            else:  # pragma: no cover - 模型不可用时的降级路径
+                job = {**job, "jd": detail.get("jd")}
             kept.append(job)
             with_jd += 1
         elif keep_without_jd:
