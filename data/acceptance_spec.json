@@ -6,49 +6,115 @@
     {
       "id": "who_is_the_company",
       "ask": "这家公司是谁、什么规模、什么行业？",
-      "requires": ["company_name", "company_industry", "company_scale", "company_stage", "company_link"]
+      "requires": [
+        "company_name",
+        "company_industry",
+        "company_scale",
+        "company_stage",
+        "company_link"
+      ]
     },
     {
       "id": "what_is_the_role",
       "ask": "这个岗具体做什么？最近更新过吗？",
-      "requires": ["title", "jd", "title_key", "page_update_date", "skill_tags", "tags"]
+      "requires": [
+        "title",
+        "jd",
+        "title_key",
+        "page_update_date",
+        "skill_tags",
+        "tags"
+      ]
     },
     {
       "id": "how_much_pay",
       "ask": "多少钱？薪资口径是什么？",
-      "requires": ["salary", "salary_source", "post_type", "recruit_type"]
+      "requires": [
+        "salary",
+        "salary_source",
+        "post_type",
+        "recruit_type"
+      ]
     },
     {
       "id": "is_it_agency",
       "ask": "是不是猎头代发（公司不可核、薪资面议虚高）？",
-      "requires": ["post_type", "proxy_job", "proxy_type", "boss_title", "company_name"]
+      "requires": [
+        "post_type",
+        "proxy_job",
+        "proxy_type",
+        "boss_title",
+        "company_name"
+      ]
     },
     {
       "id": "is_it_internship",
       "ask": "是社招、实习还是校招？",
-      "requires": ["recruit_type", "job_type", "salary", "experience"]
+      "requires": [
+        "recruit_type",
+        "job_type",
+        "salary",
+        "experience"
+      ]
     },
     {
       "id": "is_it_alive",
       "ask": "岗位还活着吗？HR 还活跃吗？",
-      "requires": ["job_valid_status", "boss_active_status", "active_state", "link_verified_at"]
+      "requires": [
+        "job_valid_status",
+        "boss_active_status",
+        "active_state",
+        "link_verified_at"
+      ]
     },
     {
       "id": "is_it_duplicate",
       "ask": "跟别的岗是不是同一份内容？",
-      "requires": ["job_id", "dup_group", "dup_size", "is_primary", "jd", "salary", "location"]
+      "requires": [
+        "job_id",
+        "dup_group",
+        "dup_size",
+        "is_primary",
+        "jd",
+        "salary",
+        "location"
+      ]
     },
     {
       "id": "can_i_open_it",
       "ask": "链接现在还能打开、还指向这个岗吗？",
-      "requires": ["job_link", "link_verified_at", "job_id"]
+      "requires": [
+        "job_link",
+        "link_verified_at",
+        "job_id"
+      ]
     }
   ],
-  "required_always": ["job_id", "title", "company_name", "salary", "location", "job_link", "jd"],
+  "required_always": [
+    "job_id",
+    "title",
+    "company_name",
+    "salary",
+    "location",
+    "job_link",
+    "jd"
+  ],
   "value_rules": {
-    "post_type": ["direct", "agency", "anonymous"],
-    "recruit_type": ["social", "intern", "campus"],
-    "active_state": ["active", "inactive", "unknown"]
+    "post_type": [
+      "direct",
+      "agency",
+      "anonymous"
+    ],
+    "recruit_type": [
+      "social",
+      "intern",
+      "campus"
+    ],
+    "active_state": [
+      "active",
+      "inactive",
+      "unknown"
+    ]
   },
   "properties": [
     {
@@ -92,5 +158,17 @@
       "desc": "JD 尾部不得混进页面模块文案（薪资详情/活跃标签/招聘专员等）"
     }
   ],
-  "forbidden_fields": ["security_id", "lid", "encrypt_job_id", "encrypt_boss_id", "encrypt_brand_id"]
+  "forbidden_fields": [
+    "security_id",
+    "lid",
+    "encrypt_job_id",
+    "encrypt_boss_id",
+    "encrypt_brand_id"
+  ],
+  "aliases": {
+    "company": "company_name（历史列名，值相同）",
+    "tags_list": "tags（历史列名，值相同）",
+    "link": "job_link（历史列名，值相同）"
+  },
+  "why_aliases_registered": "别名是**显式登记**的历史兼容列（值取模型字段），不是未声明字段——验收器据此区分『没人知道这是什么』与『知道但保留旧名』。"
 }

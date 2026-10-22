@@ -106,6 +106,8 @@ def _registered_fields(spec):
     for question in spec.get("questions") or []:
         fields.update(question.get("requires") or [])
     fields.update(spec.get("required_always") or [])
+    # 显式登记的历史别名（值为模型字段，只是保留旧列名）——不是"没人知道这是什么"
+    fields.update(spec.get("aliases") or {})
     return fields
 
 
