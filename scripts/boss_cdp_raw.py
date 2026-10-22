@@ -2874,13 +2874,21 @@ CSV_COLUMNS = [
     "job_link", "welfare",
 ]
 
-DETAIL_CSV_COLUMNS = [
+# CSV 的列**由岗位模型派生**：新增模型字段自动进 CSV，不再手工维护两份列清单
+# （2026-10-22 踩过：post_type/active_state 等语义字段只进了 JSON，CSV 上等于没有）。
+# 前 11 列是历史列位（保持向后兼容：company 仍是公司名那一列），其余按模型声明顺序追加。
+_DETAIL_CSV_LEADING_COLUMNS = [
     "job_id", "title", "company", "salary", "salary_source", "location",
     "boss_active_status", "tags_list", "job_link", "skill_tags", "jd",
-    # 语义层与新鲜度（2026-10-22）：CSV 是用户实际拿到的表，语义标注必须进表，
-    # 否则 post_type/active_state/dup_group 只在 JSON 里、CSV 上等于没有。
-    "post_type", "active_state", "dup_group", "dup_size", "is_primary",
-    "title_key", "link_verified_at", "page_update_date", "recruit_type",
+]
+# 历史列位与模型字段名的对应（写 CSV 时取值用模型字段名）
+_DETAIL_CSV_VALUE_SOURCE = {
+    "company": "company_name",
+    "tags_list": "tags",
+}
+DETAIL_CSV_COLUMNS = _DETAIL_CSV_LEADING_COLUMNS + [
+    name for name in _job_model.EXPORT_PUBLIC_FIELDS
+    if name not in _DETAIL_CSV_LEADING_COLUMNS
 ]
 
 
@@ -2910,7 +2918,10 @@ def write_detail_csv(csv_path, details):
         for detail in cleaned_details:
             if not isinstance(detail, dict):
                 continue
-            row = {col: detail.get(col, "") for col in DETAIL_CSV_COLUMNS}
+            row = {}
+            for col in DETAIL_CSV_COLUMNS:
+                source = _DETAIL_CSV_VALUE_SOURCE.get(col, col)
+                row[col] = detail.get(source, "")
             if isinstance(row.get("skill_tags"), list):
                 row["skill_tags"] = " | ".join(row["skill_tags"])
             writer.writerow(row)

@@ -212,6 +212,16 @@ FIELD_INDEX = {spec.name: spec for spec in FIELD_SPECS}
 # 导出里允许出现的字段（模型字段 + 平台原始字段的子集）
 EXPORT_FIELDS = tuple(spec.name for spec in FIELD_SPECS)
 
+# **绝不进导出/CSV 的内部字段**（红线：securityId 等平台凭据不落盘）
+EXPORT_HIDDEN_FIELDS = (
+    "security_id", "lid",
+    "encrypt_job_id", "encrypt_boss_id", "encrypt_brand_id",
+)
+
+# 对外可见的字段（导出行与 CSV 列的来源）
+EXPORT_PUBLIC_FIELDS = tuple(
+    name for name in EXPORT_FIELDS if name not in EXPORT_HIDDEN_FIELDS)
+
 
 # ---------------------------------------------------------------------------
 # 2) 记录级语义（唯一判定点）
