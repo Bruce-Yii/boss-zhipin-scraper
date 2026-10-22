@@ -463,6 +463,37 @@ def _more_specific_activity(list_value, detail_value):
     return list_text
 
 
+def attach_acceptance_result(payload, source_path=None):
+    """把**验收结论**写进产物 meta（``meta.acceptance``）——结论跟着产物走。
+
+    独立审计 2026-10-22 指出：新验收器在生产代码里零引用，"没人被告知要跑，
+    结论不进入任何决策"。修法不是提醒，是**让结论成为产物的一部分**：
+    用户拿到文件就能看到它是否通过了验收、哪些性质没过。
+
+    验收器不可用时**不能毁产物**（只记一条说明）→ 验收是附加信息，不是产物的前置条件。
+    """
+    if not isinstance(payload, dict):
+        return payload
+    try:
+        try:
+            from scripts import acceptance as _acc
+        except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+            import acceptance as _acc
+        ok, findings = _acc.check_export(payload)
+    except Exception as exc:  # pragma: no cover - 验收器不可用/异常时不能毁产物
+        payload["acceptance"] = {"ok": None, "error": f"验收器不可用：{exc}"}
+        return payload
+    payload["acceptance"] = {
+        "ok": ok,
+        "source": source_path or "",
+        "error_count": sum(1 for f in findings if f["level"] == "error"),
+        "warn_count": sum(1 for f in findings if f["level"] == "warn"),
+        "findings": [{"id": f["id"], "level": f["level"], "detail": f["detail"]}
+                     for f in findings],
+    }
+    return payload
+
+
 def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
                           extra_meta=None):
     """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
@@ -536,6 +567,9 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
     data["jobs"] = kept
     data["job_count"] = len(kept)
     data["total"] = len(kept)
+    # 验收结论**跟着产物走**（独立审计：新验收器在生产代码里零引用 → 没人跑、
+    # 结论进不了决策）。挂在最终产物出口，不是靠人记得手动跑。
+    attach_acceptance_result(data, source_path=target_path)
     data["jd_coverage"] = {
         "with_jd": with_jd,
         "total_before": total_before,

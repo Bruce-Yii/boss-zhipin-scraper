@@ -163,6 +163,10 @@ python3 scripts/job_summary.py --top 15
 | Parameter | Description |
 |-----------|-------------|
 | `--keyword` | Search keyword (default "AI Agent"); comma-separated multi-keyword supported (scraped in turn and merged by job_id, e.g. `"Java 后端,Java 风控"`) |
+| `--recruit-type` | Keep only these recruitment types (`social` / `intern` / `campus`), comma-separated; filtered **at the list stage** → those jobs are never fetched, so no detail-page budget is spent |
+| `--industry-allow` | Keep only these industries (comma-separated). **No industry filter by default** — measured across 933 records / 90 industries, industry is *not* a relevance signal (every one of 4 restaurant-industry records was a real product-manager job) |
+| `--industry-block` | Drop these industries (comma-separated, e.g. `房地产中介/租赁`). Every dropped job is printed with its reason — nothing is dropped silently |
+| `--only-relevant-title` | Keep only jobs whose title is a product-manager / AI direction (list-stage filter, dropped jobs are never fetched → no budget spent) |
 | `--city` | City (Chinese name or 9-digit code, default Shanghai). **Supports cities nationwide** (300+, incl. tier-3/4/5); city codes auto-sync from BOSS at runtime. See [`data/city_codes.json`](data/city_codes.json), or run `--list-cities`. An unrecognized city name now exits with an error instead of silently producing zero results |
 | `--list-cities [keyword]` | Print the supported city list, optional keyword filter, e.g. `--list-cities 江` |
 | `--pages` | Number of pages (max 10) |
