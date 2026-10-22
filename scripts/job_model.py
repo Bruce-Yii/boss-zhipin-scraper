@@ -205,7 +205,7 @@ FIELD_SPECS: tuple = (
     FieldSpec("proxy_type", SOURCE_LIST, "str", "平台标注：代发类型（1/4）",
               (_M_SEMANTICS, _M_SUMMARY, _M_MAIN), provenance=PROV_NORMALIZED, raw_paths=("proxyType",), raw_shape='zero_as_empty', derive_rule=''),
     FieldSpec("job_type", SOURCE_LIST, "str", "平台标注：招聘类型（4=实习 5=校招）",
-              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN), provenance=PROV_VERBATIM, raw_paths=("jobType",), raw_shape='str', derive_rule=''),
+              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN), provenance=PROV_NORMALIZED, raw_paths=("jobType",), raw_shape='zero_as_empty', derive_rule=''),
     FieldSpec("boss_active_status", SOURCE_LIST, "str", "HR 活跃度文案",
               (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), provenance=PROV_DERIVED, raw_paths=("activeTimeDesc", "bossOnline"), raw_shape='', derive_rule='list_active_status'),
     # ── 详情页 ───────────────────────────────────────────────────────
@@ -291,6 +291,7 @@ DERIVE_RULES = {
     "list_active_status": "_list_active_status(raw)：在线/活跃文案",
     "post_type": "classify_post_type：代发标记/猎头顾问/匿名公司名 → direct|agency|anonymous",
     "recruit_type": "classify_recruit_type：jobType 4=实习 5=校招 空=社招",
+    "job_type_zero": "平台 jobType 是**数字** 0（社招）；我们统一存空串（规范化）",
     "active_state": "active_state(boss_active_status)：active/inactive/unknown",
     "title_key": "normalize_title(title)：大小写与空白归一",
     "dup_group": "content_fingerprint(JD前180字|城市) 稳定哈希分组",

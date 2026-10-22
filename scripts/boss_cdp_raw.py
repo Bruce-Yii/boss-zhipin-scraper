@@ -3220,6 +3220,58 @@ def save_raw_responses(run_id, keyword, city, pages, detail_payloads=None):
         return None
 
 
+# 保真核对失败标志（跑完若为真 → 退出码非 0，数据不可信不能当成功交付）
+_FIDELITY_FAILED = {"flag": False}
+
+
+def set_fidelity_failed():
+    _FIDELITY_FAILED["flag"] = True
+
+
+def fidelity_failed():
+    return bool(_FIDELITY_FAILED["flag"])
+
+
+def run_fidelity_check(raw_path, jobs):
+    """跑完自动做保真核对：平台原文 ↔ 我们的记录。
+
+    返回 ``{"ok": bool, "fidelity_rate": float, "mismatch_count": int,
+    "mismatches": [...], "checked_jobs": int}``；对不上时**打印明细并把退出码置 1**
+    （数据不可信就不能当成功交出去）。
+    """
+    try:
+        from scripts import fidelity as _fidelity  # 延迟导入，避免循环依赖
+    except ImportError:
+        try:
+            import fidelity as _fidelity  # type: ignore
+        except ImportError:
+            return {"ok": True, "skipped": "fidelity 模块不可用"}
+    try:
+        with open(raw_path, encoding="utf-8") as handle:
+            raw_payload = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return {"ok": True, "skipped": f"原文读取失败: {exc}"}
+    ok, report = _fidelity.check_fidelity(raw_payload, {"jobs": jobs})
+    summary = {
+        "ok": bool(ok),
+        "fidelity_rate": round(float(report.get("fidelity_rate") or 0.0), 4),
+        "mismatch_count": len(report.get("mismatches") or []),
+        "checked_jobs": report.get("checked_jobs", 0),
+        "mismatches": (report.get("mismatches") or [])[:20],
+    }
+    if ok:
+        print(f"✅ 保真核对通过：{summary['checked_jobs']} 条记录，"
+              f"保真率 {summary['fidelity_rate']:.1%}（平台显示什么我们就是什么）")
+    else:
+        print(f"❌ 保真核对未通过：{summary['mismatch_count']} 处与平台原文不一致")
+        for item in summary["mismatches"][:10]:
+            print(f"   · {item['field']}｜{item.get('title', '')}｜"
+                  f"平台={item.get('expected', '')!r}｜我们={item.get('actual', '')!r}")
+        print("   → 数据与平台不一致，先查清楚再交付（不要直接拿去投简历）")
+        set_fidelity_failed()
+    return summary
+
+
 def write_csv(csv_path, jobs):
     """将 jobs 列表写入 CSV 文件（写出前递归脱敏）。"""
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
@@ -3316,9 +3368,10 @@ def send_alert(title, text, timeout=10):
             timeout=timeout,
         )
         return resp.status_code == 200
-    except OSError:
-        # requests.RequestException 继承 IOError(=OSError)；网络层失败不阻塞主流程
-        log.warning("告警发送失败", exc_info=True)
+    except OSError as exc:
+        # requests.RequestException 继承 IOError(=OSError)；网络层失败不阻塞主流程。
+        # 端点挂掉时只留一行提示——刷一屏 traceback 会把真正的错误淹掉。
+        log.warning("告警发送失败（已忽略，不影响主流程）: %s", exc)
         return False
 # _INTERNAL_KEYS / _sanitize_job / _missing_required_fields / flush_jobs
 # 已抽出到 scripts/export_contract.py（见顶部导入兼容层；P1 架构重构 2026-09-22）。
@@ -4608,6 +4661,12 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
         if raw_path:
             print(f"原始响应已保存（可溯源/保真核对）: {raw_path}")
 
+        # **保真核对接进链路**：跑完自动核，平台显示什么我们就是什么。
+        # 对不上 → 大声报 + 退出码非 0（不是"打个分就算了"）。
+        fidelity_report = None
+        if raw_path:
+            fidelity_report = run_fidelity_check(raw_path, all_jobs)
+
         flush_jobs(output_path, {
             "keyword": keyword,
             "city": city_name,
@@ -4625,6 +4684,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
             "exhausted": exhausted,
             "list_stage_audit": list_audit,
             "raw_sources": {"list": raw_path} if raw_path else {},
+            "fidelity": fidelity_report or {},
         }, all_jobs)
         print(f"已保存: {output_path}")
 
@@ -8701,6 +8761,11 @@ def _run_cli_impl(p, args):
             db_conn.close()
             if db_state is not None:
                 db_state["closed"] = True
+
+    # 保真核对失败 → 退出码非 0（数据与平台不一致，不能当成功交付）
+    if fidelity_failed():
+        print("\n❌ 本次数据未通过保真核对（与平台原文不一致）——退出码 1")
+        sys.exit(1)
 
     # 抓取正常结束后按需收尾（仅成功路径；异常/登录失败走 sys.exit，不会触发，保留登录态）
     if args.close_chrome:
