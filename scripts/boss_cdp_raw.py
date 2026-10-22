@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.19.0"
+__version__ = "2.20.0"
 
 import argparse
 import base64
@@ -77,6 +77,9 @@ except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
 FORMAT_VERSION = _export_contract.FORMAT_VERSION
 _scrub_secrets = _export_contract._scrub_secrets
 _sanitize_payload = _export_contract._sanitize_payload
+# 原始响应落盘用另一套规则：保留岗位身份（encryptJobId，明文就在导出的 job_link 里），
+# 剥掉真凭据（securityId）与个人信息（encryptBossId）。见 export_contract 说明。
+_sanitize_raw_payload = _export_contract._sanitize_raw_payload
 _sanitize_job = _export_contract._sanitize_job
 _missing_required_fields = _export_contract._missing_required_fields
 merge_unique = _export_contract.merge_unique
@@ -1200,7 +1203,7 @@ FETCH_API_JS_TEMPLATE = """
             title: j.jobName || '',
             salary: j.salaryDesc || '',
             salary_source: j.salaryDesc ? 'api' : 'api_empty',
-            location: (j.cityName || '') + '\\u00b7' + (j.areaDistrict || '') + '\\u00b7' + (j.businessDistrict || ''),
+            location: [j.cityName, j.areaDistrict, j.businessDistrict].filter(function(x){return !!x;}).join('\\u00b7'),
             tags: [j.jobExperience || '', j.jobDegree || ''].filter(function(t){return t && t !== '\\u4e0d\\u9650';}).join(' | '),
             boss_name: j.brandName || '',
             company_name: j.brandName || '',
@@ -1230,7 +1233,9 @@ FETCH_API_JS_TEMPLATE = """
             welfare: (j.welfareList || []).join(' | ')
         };
     });
-    return JSON.stringify(results);
+    // 2026-10-22：把**原始响应**一起带回（保真核对需要原文对照）。
+    // 同一个 fetch 顺带返回，不额外发请求。
+    return JSON.stringify({jobs: results, raw: data});
 })()
 """
 
@@ -3183,6 +3188,38 @@ DETAIL_CSV_COLUMNS = _DETAIL_CSV_LEADING_COLUMNS + [
 ]
 
 
+RAW_DIR_NAME = "raw"
+
+
+def save_raw_responses(run_id, keyword, city, pages, detail_payloads=None):
+    """把平台**原始响应**落盘（可溯源 + 保真核对的依据）。
+
+    - 只写仓库外的 ~/.boss-zhipin-scraper/job-result/raw/（产物目录）✓
+    - 落盘前过 _sanitize_payload（不落 cookie/token/securityId 等凭据）✓
+    - 原子写 ✓
+    返回落盘路径（失败返回 None，不影响抓取主流程）。
+    """
+    try:
+        raw_dir = os.path.join(os.path.dirname(default_output_path("jobs")), RAW_DIR_NAME)
+        os.makedirs(raw_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payload = {
+            "run_id": run_id,
+            "keyword": keyword,
+            "city": city,
+            "captured_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "list_pages": pages or [],
+            "detail_pages": detail_payloads or [],
+        }
+        cleaned = _sanitize_raw_payload(payload)
+        path = os.path.join(raw_dir, f"list_{run_id[:8]}_{stamp}.json")
+        _atomic_write_json(path, cleaned)
+        return path
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"⚠️ 原始响应落盘失败（不影响抓取）：{exc}")
+        return None
+
+
 def write_csv(csv_path, jobs):
     """将 jobs 列表写入 CSV 文件（写出前递归脱敏）。"""
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
@@ -3774,14 +3811,29 @@ def should_use_dom_fallback(jobs, allow_dom_fallback=False):
 
 
 def parse_api_jobs_eval_value(value):
+    """兼容两种返回形状：旧版是 jobs 数组，新版是 {jobs: [...], raw: {...}}。"""
+    jobs, _raw = parse_api_eval_value(value)
+    return jobs
+
+
+def parse_api_eval_value(value):
+    """解析页面内 fetch 的返回值 → (映射后的 jobs, 平台**原始响应**)。
+
+    原始响应用于保真核对（"纸片上什么样，爬出来就应该是什么样"）与溯源；
+    没有它，字段对不对只能靠人读产物。
+    """
     if not value:
-        return []
+        return [], None
     try:
         parsed = json.loads(value) if isinstance(value, str) else value
     except (json.JSONDecodeError, ValueError, TypeError):
-        return []
+        return [], None
+    raw = None
+    if isinstance(parsed, dict):
+        raw = parsed.get("raw")
+        parsed = parsed.get("jobs")
     if not isinstance(parsed, list):
-        return []
+        return [], raw
 
     jobs = []
     for item in parsed:
@@ -3789,7 +3841,7 @@ def parse_api_jobs_eval_value(value):
             continue
         if item.get("title") or item.get("job_link"):
             jobs.append(item)
-    return jobs
+    return jobs, raw
 
 
 def is_zhipin_host(url):
@@ -3944,7 +3996,7 @@ def close_orphan_detail_tabs(cdp_port=DEFAULT_CDP_PORT):
 
 
 def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
-                          workers=3):
+                          workers=3, raw_sink=None):
     """并发抓取多页列表：并发开 `workers` 个停靠 tab，再跨 tab 同发搜索 XHR。
 
     实测（2026-09-22 E5）：3 页同发一次取全（无风控）；配合并发开 tab，
@@ -3994,7 +4046,10 @@ def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
             js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
             try:
                 val = sess[0].eval_js(js, sess[2])
-                jobs = parse_api_jobs_eval_value(val)
+                jobs, raw_page = parse_api_eval_value(val)
+                if raw_page and raw_sink is not None:
+                    with lock:
+                        raw_sink.append({"page": pg, "response": raw_page})
             except _cdp_exception_types():
                 with lock:
                     failed.append(pg)
@@ -4171,6 +4226,8 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
     security_map = {}
     # 平台「求职期望」设置（抓取时读一次，用于解释召回偏差）
     job_expectation = ""
+    # 平台**原始响应**（每页一份）：落盘后可做保真核对与溯源（2026-10-22）
+    raw_pages = []
 
     # 显示筛选条件
     filter_desc = []
@@ -4267,7 +4324,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
     elif pages_parallel > 1 and max_pages > 1 and not allow_dom_fallback:
         prefetched_pages = _fetch_pages_parallel(
             cdp_port, keyword, city_code, max_pages, filters,
-            workers=pages_parallel)
+            workers=pages_parallel, raw_sink=raw_pages)
         if prefetched_pages is None:
             print("  ⚠️ 并行抓页未全部成功，回退串行模式")
         else:
@@ -4349,7 +4406,9 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                 for attempt in range(API_ATTEMPT_LIMIT):
                     api_js = FETCH_API_JS_TEMPLATE.replace("__API_URL__", api_url)
                     val = cdp.eval_js(api_js, sid)
-                    jobs = parse_api_jobs_eval_value(val)
+                    jobs, raw_page = parse_api_eval_value(val)
+                    if raw_page:
+                        raw_pages.append({"page": pg, "response": raw_page})
                     if jobs:
                         break
                     if attempt < API_ATTEMPT_LIMIT - 1:
@@ -4544,6 +4603,11 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
             _filtered = {"jobs": all_jobs}
             apply_run_filters(_filtered, args=filter_options, label="列表层相关度")
             all_jobs = _filtered["jobs"]
+        # 原始响应落盘（可溯源 + 保真核对的依据）；失败不影响抓取主流程
+        raw_path = save_raw_responses(run_id, keyword, city_name, raw_pages)
+        if raw_path:
+            print(f"原始响应已保存（可溯源/保真核对）: {raw_path}")
+
         flush_jobs(output_path, {
             "keyword": keyword,
             "city": city_name,
@@ -4560,6 +4624,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
             "observed_jobs": sorted(set(observed_ids)),
             "exhausted": exhausted,
             "list_stage_audit": list_audit,
+            "raw_sources": {"list": raw_path} if raw_path else {},
         }, all_jobs)
         print(f"已保存: {output_path}")
 

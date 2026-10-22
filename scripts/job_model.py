@@ -48,6 +48,31 @@ SOURCE_LIST = "list_api"          # 平台列表 API 字段
 SOURCE_DETAIL = "detail_page"     # 平台详情页字段
 SOURCE_DERIVED = "derived"        # 我们推导（模型语义层）
 
+# ---------------------------------------------------------------------------
+# 保真溯源类别（2026-10-22「纸片上什么样，爬出来就应该是什么样」）
+# ---------------------------------------------------------------------------
+# 用户验收标准：**boss 上的东西，纸片上是什么样，你爬取出来的就应该是什么样**。
+# 要能核对这句话，前提是**每个字段都说得清它的值是怎么来的**。三类：
+#
+# - ``verbatim``（平台原样抄来）：值与平台原文**逐字相同**（含类型）。
+#   核对方式：把原文的值与产物里的值直接比 → 逐字一致 / 不一致。
+# - ``normalized``（平台原样但做了规范化）：值仍是平台的那段内容，只是**按声明过的
+#   规则改写**（全半角、空白、标题归一、拼接符、日期格式…）。
+#   核对方式：两边**按同一条声明规则**规范化后比 → 规范化后一致 / 不一致。
+#   规则必须写下来（``raw_shape``），否则「规范化」就成了藏差异的地方。
+# - ``derived``（由平台字段推导，规则可查）：值是我们按规则**算**出来的
+#   （post_type / recruit_type / salary_min…）。
+#   核对方式：**不与原文比**（原文根本没有这个字段），而是核对
+#   ①推导输入在原文里存在 ②推导规则有声明 ③产物里给出依据。
+#
+# 三类之外没有第四类：任何字段都必须落进其中一类，否则「说不清来路」＝缺陷。
+
+PROV_VERBATIM = "verbatim"        # 平台原样抄来
+PROV_NORMALIZED = "normalized"    # 平台原样但做了规范化（规则已声明）
+PROV_DERIVED = "derived"          # 由平台字段推导（规则可查）
+
+PROVENANCE_VALUES = (PROV_VERBATIM, PROV_NORMALIZED, PROV_DERIVED)
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -62,10 +87,31 @@ class FieldSpec:
     exempt_reason: str = ""        # 允许"无消费方"时必须写明理由
     delivery_only: bool = False    # 仅交付给用户（导出里可见），不参与任何判断
     notes: str = ""
+    # ── 保真溯源声明（新增；见上面的 PROV_* 说明）────────────────────
+    provenance: str = ""           # verbatim / normalized / derived
+    raw_paths: tuple = ()          # 平台原文里的字段路径（list 侧=键名；detail 侧=点路径）
+    raw_shape: str = ""            # 从原文取值的形状（见 RAW_SHAPES）
+    raw_join: str = ""             # 多值拼接时的分隔符
+    raw_filter: str = ""           # 拼接前的过滤规则（如去掉"不限"）
+    derive_rule: str = ""          # derived 字段的规则 id（见 DERIVE_RULES）
+    provenance_note: str = ""      # 说不清/核对不了时的原因（写下来，不留空白）
 
     @property
     def is_platform_field(self) -> bool:
         return self.source in (SOURCE_LIST, SOURCE_DETAIL)
+
+    @property
+    def scope(self) -> str:
+        """溯源核对的作用域：``list`` / ``detail`` / ``""``（不与原文比）。"""
+        if self.source == SOURCE_LIST:
+            return "list"
+        if self.source == SOURCE_DETAIL:
+            return "detail"
+        return ""
+
+    @property
+    def is_derived(self) -> bool:
+        return self.provenance == PROV_DERIVED
 
 
 # 消费方模块名（与仓库里的模块一一对应，CI 会核对）
@@ -79,161 +125,181 @@ FIELD_SPECS: tuple = (
     # ── 标识 ──────────────────────────────────────────────────────────
     FieldSpec("job_id", SOURCE_LIST, "str", "岗位唯一标识（耐久主键）",
               (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True,
-              notes="详情链接不能由它重建（URL 含 securityId 段），只能用它做主键"),
+              notes="详情链接不能由它重建（URL 含 securityId 段），只能用它做主键", provenance=PROV_DERIVED, raw_paths=("encryptJobId",), raw_shape='', derive_rule='job_id'),
     FieldSpec("encrypt_job_id", SOURCE_LIST, "str", "URL 里的岗位 token 段",
-              (_M_MAIN,), notes="拼 job_detail URL 用；不落导出（internal key）"),
+              (_M_MAIN,), notes="拼 job_detail URL 用；不落导出（internal key）", provenance=PROV_VERBATIM, raw_paths=("encryptJobId",), raw_shape='str', derive_rule=''),
     FieldSpec("security_id", SOURCE_LIST, "str", "平台内部凭据（securityId）",
-              (), exempt_reason="平台凭据，红线要求绝不进导出/日志"),
+              (), exempt_reason="平台凭据，红线要求绝不进导出/日志", provenance=PROV_VERBATIM, raw_paths=("securityId",), raw_shape='str', derive_rule=''),
     FieldSpec("lid", SOURCE_LIST, "str", "平台内部列表 id", (),
-              exempt_reason="平台内部 id，无用户价值"),
+              exempt_reason="平台内部 id，无用户价值", provenance=PROV_VERBATIM, raw_paths=("lid",), raw_shape='str', derive_rule=''),
     FieldSpec("encrypt_boss_id", SOURCE_LIST, "str", "平台内部 HR id", (),
-              exempt_reason="平台内部 id，无用户价值"),
+              exempt_reason="平台内部 id，无用户价值", provenance=PROV_VERBATIM, raw_paths=("encryptBossId",), raw_shape='str', derive_rule=''),
     FieldSpec("encrypt_brand_id", SOURCE_LIST, "str", "平台内部公司 id", (),
-              exempt_reason="平台内部 id，无用户价值"),
+              exempt_reason="平台内部 id，无用户价值", provenance=PROV_VERBATIM, raw_paths=("encryptBrandId",), raw_shape='str', derive_rule=''),
     FieldSpec("job_link", SOURCE_LIST, "str", "岗位详情页 URL（抓取时刻有效）",
               (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True,
-              notes="含 securityId 段，不能由 job_id 重建；实测跨天稳定"),
+              notes="含 securityId 段，不能由 job_id 重建；实测跨天稳定", provenance=PROV_DERIVED, raw_paths=("encryptJobId",), raw_shape='', derive_rule='job_link'),
     FieldSpec("company_link", SOURCE_LIST, "str", "公司主页 URL",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_DERIVED, raw_paths=("encryptBrandId",), raw_shape='', derive_rule='company_link'),
     FieldSpec("link_verified_at", SOURCE_DERIVED, "str",
               "该链接在抓取时刻被验证指向这个岗位",
-              (_M_EXPORT, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SEMANTICS), provenance=PROV_DERIVED, raw_paths=(), raw_shape='', derive_rule='link_verified_at'),
     # ── 岗位本体 ─────────────────────────────────────────────────────
     FieldSpec("title", SOURCE_LIST, "str", "岗位名（平台原样回传）",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True, provenance=PROV_VERBATIM, raw_paths=("jobName",), raw_shape='str', derive_rule=''),
     FieldSpec("title_key", SOURCE_DERIVED, "str", "标题归一化键（分组/匹配用）",
-              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY)),
+              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY), provenance=PROV_DERIVED, raw_paths=("jobName",), raw_shape='', derive_rule='title_key'),
     FieldSpec("salary", SOURCE_LIST, "str", "薪资描述原文",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True, provenance=PROV_VERBATIM, raw_paths=("salaryDesc",), raw_shape='str', derive_rule=''),
     FieldSpec("salary_source", SOURCE_LIST, "str", "薪资来源（api=列表 API）",
               (), delivery_only=True,
-              notes="报表用：说明薪资来自列表 API（而非页面）"),
+              notes="报表用：说明薪资来自列表 API（而非页面）", provenance=PROV_DERIVED, raw_paths=("salaryDesc",), raw_shape='', derive_rule='salary_source'),
     FieldSpec("location", SOURCE_LIST, "str", "城市·区域·商圈",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True, provenance=PROV_NORMALIZED, raw_paths=("cityName", "areaDistrict", "businessDistrict"), raw_shape='join:·', derive_rule=''),
     FieldSpec("tags", SOURCE_LIST, "str", "经验|学历（列表侧拼接）",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_NORMALIZED, raw_paths=("jobExperience", "jobDegree"), raw_shape='join: | |filter:不限', derive_rule=''),
     FieldSpec("experience", SOURCE_LIST, "str", "经验要求",
               (), delivery_only=True,
-              notes="报表用：读专用字段，不再从 tags 串里解析（消除重复来源）"),
+              notes="报表用：读专用字段，不再从 tags 串里解析（消除重复来源）", provenance=PROV_VERBATIM, raw_paths=("jobExperience",), raw_shape='str', derive_rule=''),
     FieldSpec("education", SOURCE_LIST, "str", "学历要求",
               (), delivery_only=True,
-              notes="报表用：读专用字段，不再从 tags 串里解析（消除重复来源）"),
+              notes="报表用：读专用字段，不再从 tags 串里解析（消除重复来源）", provenance=PROV_VERBATIM, raw_paths=("jobDegree",), raw_shape='str', derive_rule=''),
     FieldSpec("skills", SOURCE_LIST, "list", "列表侧技能标签",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_VERBATIM, raw_paths=("skills",), raw_shape='list', derive_rule=''),
     FieldSpec("skill_tags", SOURCE_DETAIL, "list", "详情页技能标签（比列表侧准）",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_VERBATIM, raw_paths=("skill_tags",), raw_shape='list', derive_rule=''),
     FieldSpec("job_labels", SOURCE_LIST, "str", "平台岗位标签",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_NORMALIZED, raw_paths=("jobLabels",), raw_shape='join: | ', derive_rule=''),
     FieldSpec("welfare", SOURCE_LIST, "str", "福利待遇",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_NORMALIZED, raw_paths=("welfareList",), raw_shape='join: | ', derive_rule=''),
     FieldSpec("icon_flags", SOURCE_LIST, "str", "平台角标（急/新等）",
               (), delivery_only=True,
-              notes="报表用：平台角标统计"),
+              notes="报表用：平台角标统计", provenance=PROV_NORMALIZED, raw_paths=("iconFlagList",), raw_shape='join:|', derive_rule=''),
     FieldSpec("icon_word", SOURCE_LIST, "str", "平台角标文字",
               (), delivery_only=True,
-              notes="报表用：平台角标统计"),
+              notes="报表用：平台角标统计", provenance=PROV_VERBATIM, raw_paths=("iconWord",), raw_shape='str', derive_rule=''),
     FieldSpec("job_valid_status", SOURCE_LIST, "str", "岗位有效性（1=有效）",
               (), delivery_only=True,
-              notes="报表用：已下架/无效岗计数"),
+              notes="报表用：已下架/无效岗计数", provenance=PROV_VERBATIM, raw_paths=("jobValidStatus",), raw_shape='str', derive_rule=''),
     # ── 公司与招聘方 ─────────────────────────────────────────────────
     FieldSpec("company_name", SOURCE_LIST, "str", "公司名（列表侧）",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True, provenance=PROV_VERBATIM, raw_paths=("brandName",), raw_shape='str', derive_rule=''),
     FieldSpec("boss_name", SOURCE_LIST, "str", "招聘方名称",
               (), delivery_only=True,
-              notes="交付给用户：招聘方名称（平台只给品牌名，无个人身份信息）"),
+              notes="交付给用户：招聘方名称（平台只给品牌名，无个人身份信息）", provenance=PROV_VERBATIM, raw_paths=("brandName",), raw_shape='str', derive_rule=''),
     FieldSpec("boss_title", SOURCE_LIST, "str", "招聘方职位（猎头顾问=代发佐证）",
               (_M_MODEL, _M_SEMANTICS, _M_SUMMARY),
-              notes="平台自证的第三个信号：22 条『猎头顾问』⊂ 25 条代发岗"),
+              notes="平台自证的第三个信号：22 条『猎头顾问』⊂ 25 条代发岗", provenance=PROV_VERBATIM, raw_paths=("bossTitle",), raw_shape='str', derive_rule=''),
     FieldSpec("company_scale", SOURCE_LIST, "str", "公司规模",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_VERBATIM, raw_paths=("brandScaleName",), raw_shape='str', derive_rule=''),
     FieldSpec("company_stage", SOURCE_LIST, "str", "融资阶段",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_VERBATIM, raw_paths=("brandStageName",), raw_shape='str', derive_rule=''),
     FieldSpec("company_industry", SOURCE_LIST, "str", "公司行业",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS), provenance=PROV_VERBATIM, raw_paths=("brandIndustry",), raw_shape='str', derive_rule=''),
     FieldSpec("anonymous", SOURCE_LIST, "str", "平台匿名标记（位掩码）",
               (), delivery_only=True,
-              notes="平台位掩码（实测 0/1/12/20/101），含义未验证 → 暂不参与判断"),
+              notes="平台位掩码（实测 0/1/12/20/101），含义未验证 → 暂不参与判断", provenance=PROV_VERBATIM, raw_paths=("anonymous",), raw_shape='str', derive_rule=''),
     # ── 平台标注（语义化的关键输入）──────────────────────────────────
     FieldSpec("proxy_job", SOURCE_LIST, "str", "平台标注：是否猎头代发",
-              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN)),
+              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN), provenance=PROV_NORMALIZED, raw_paths=("proxyJob",), raw_shape='zero_as_empty', derive_rule=''),
     FieldSpec("proxy_type", SOURCE_LIST, "str", "平台标注：代发类型（1/4）",
-              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN)),
+              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN), provenance=PROV_NORMALIZED, raw_paths=("proxyType",), raw_shape='zero_as_empty', derive_rule=''),
     FieldSpec("job_type", SOURCE_LIST, "str", "平台标注：招聘类型（4=实习 5=校招）",
-              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN)),
+              (_M_SEMANTICS, _M_SUMMARY, _M_MAIN), provenance=PROV_VERBATIM, raw_paths=("jobType",), raw_shape='str', derive_rule=''),
     FieldSpec("boss_active_status", SOURCE_LIST, "str", "HR 活跃度文案",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN)),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), provenance=PROV_DERIVED, raw_paths=("activeTimeDesc", "bossOnline"), raw_shape='', derive_rule='list_active_status'),
     # ── 详情页 ───────────────────────────────────────────────────────
     FieldSpec("jd", SOURCE_DETAIL, "str", "职位描述正文",
-              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SUMMARY, _M_SEMANTICS, _M_MAIN), required=True, provenance=PROV_NORMALIZED, raw_paths=("job-detail-text",), raw_shape='detail_jd', derive_rule=''),
     FieldSpec("page_update_date", SOURCE_DETAIL, "str", "岗位侧最后编辑日期",
               (), delivery_only=True,
-              notes="交付给用户：岗位侧最后编辑日期（判断岗位新鲜度）"),
+              notes="交付给用户：岗位侧最后编辑日期（判断岗位新鲜度）", provenance=PROV_VERBATIM, raw_paths=("page_update_date",), raw_shape='str', derive_rule=''),
     FieldSpec("tags_list", SOURCE_DETAIL, "str", "详情页经验|学历",
               (), delivery_only=True,
-              notes="交付给用户：详情页经验|学历"),
+              notes="交付给用户：详情页经验|学历", provenance=PROV_VERBATIM, raw_paths=("tags_list",), raw_shape='str', derive_rule=''),
     FieldSpec("job_status_desc", SOURCE_DETAIL, "str", "岗位状态描述",
               (), delivery_only=True,
-              notes="交付给用户：岗位状态描述"),
+              notes="交付给用户：岗位状态描述", provenance=PROV_VERBATIM, raw_paths=("job_status_desc",), raw_shape='str', derive_rule=''),
     FieldSpec("brand_introduce", SOURCE_DETAIL, "str", "公司介绍",
               (), delivery_only=True,
-              notes="交付给用户：公司介绍"),
+              notes="交付给用户：公司介绍", provenance=PROV_VERBATIM, raw_paths=("brand_introduce",), raw_shape='str', derive_rule=''),
     FieldSpec("brand_scale_name", SOURCE_DETAIL, "str", "详情页公司规模",
               (), delivery_only=True,
-              notes="交付给用户：详情页公司规模"),
+              notes="交付给用户：详情页公司规模", provenance=PROV_VERBATIM, raw_paths=("brand_scale_name",), raw_shape='str', derive_rule=''),
     FieldSpec("brand_stage_name", SOURCE_DETAIL, "str", "详情页融资阶段",
               (), delivery_only=True,
-              notes="交付给用户：详情页融资阶段"),
+              notes="交付给用户：详情页融资阶段", provenance=PROV_VERBATIM, raw_paths=("brand_stage_name",), raw_shape='str', derive_rule=''),
     FieldSpec("brand_industry_name", SOURCE_DETAIL, "str", "详情页行业",
               (), delivery_only=True,
-              notes="交付给用户：详情页行业"),
+              notes="交付给用户：详情页行业", provenance=PROV_VERBATIM, raw_paths=("brand_industry_name",), raw_shape='str', derive_rule=''),
     FieldSpec("brand_active_time", SOURCE_DETAIL, "str", "详情页公司活跃时间",
               (), delivery_only=True,
-              notes="交付给用户：详情页公司活跃时间"),
+              notes="交付给用户：详情页公司活跃时间", provenance=PROV_VERBATIM, raw_paths=("brand_active_time",), raw_shape='str', derive_rule=''),
     # ── 派生语义 ─────────────────────────────────────────────────────
     FieldSpec("post_type", SOURCE_DERIVED, "str",
               "发布主体类型（direct 企业直招 / agency 猎头代发 / anonymous 匿名）",
-              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY, _M_MAIN), required=True, provenance=PROV_DERIVED, raw_paths=("proxyJob", "proxyType", "bossTitle"), raw_shape='', derive_rule='post_type'),
     FieldSpec("recruit_type", SOURCE_DERIVED, "str",
               "招聘类型（social 社招 / intern 实习 / campus 校招）",
-              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY, _M_MAIN), required=True),
+              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY, _M_MAIN), required=True, provenance=PROV_DERIVED, raw_paths=("jobType",), raw_shape='', derive_rule='recruit_type'),
     FieldSpec("active_state", SOURCE_DERIVED, "str",
               "活跃度三态（active / inactive / unknown）",
-              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY)),
+              (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY), provenance=PROV_DERIVED, raw_paths=("activeTimeDesc", "bossOnline"), raw_shape='', derive_rule='active_state'),
     FieldSpec("dup_group", SOURCE_DERIVED, "str", "同源重复组 id（空=不重复）",
-              (_M_EXPORT, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SEMANTICS), provenance=PROV_DERIVED, raw_paths=("jobName", "cityName"), raw_shape='', derive_rule='dup_group'),
     FieldSpec("dup_size", SOURCE_DERIVED, "int", "同源重复组内条数",
-              (_M_EXPORT, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SEMANTICS), provenance=PROV_DERIVED, raw_paths=("jobName", "cityName"), raw_shape='', derive_rule='dup_size'),
     FieldSpec("is_primary", SOURCE_DERIVED, "bool", "是否重复组内首条",
-              (_M_EXPORT, _M_SEMANTICS)),
+              (_M_EXPORT, _M_SEMANTICS), provenance=PROV_DERIVED, raw_paths=("jobName", "cityName"), raw_shape='', derive_rule='is_primary'),
     # ── 独立验收 2026-10-22 要求补的字段 ──────────────────────────
     FieldSpec("is_ai_pm", SOURCE_DERIVED, "bool",
               "是否 AI 方向的产品岗（审计实测 32.6% 的检索结果与 AI 无关）",
-              (_M_EXPORT, _M_SUMMARY), required=True),
+              (_M_EXPORT, _M_SUMMARY), required=True, provenance=PROV_DERIVED, raw_paths=("jobName",), raw_shape='', derive_rule='direction'),
     FieldSpec("direction", SOURCE_DERIVED, "str",
               "方向标签（ai_pm / pm_only / ai_other / other）",
-              (_M_EXPORT, _M_SUMMARY), required=True),
+              (_M_EXPORT, _M_SUMMARY), required=True, provenance=PROV_DERIVED, raw_paths=("jobName",), raw_shape='', derive_rule='direction'),
     FieldSpec("direction_evidence", SOURCE_DERIVED, "list",
               "方向判定命中的信号词（可复核，不给黑箱结论）",
               (), delivery_only=True,
-              notes="交付给用户核对判定依据：不让用户只能接受一个黑箱结论"),
+              notes="交付给用户核对判定依据：不让用户只能接受一个黑箱结论", provenance=PROV_DERIVED, raw_paths=("jobName",), raw_shape='', derive_rule='direction'),
     FieldSpec("salary_min", SOURCE_DERIVED, "str",
               "薪资下界（元/月 或 元/天，可排序）",
               (), delivery_only=True, required=True,
               notes="交付给用户排序用：同一列混装月薪与日薪会让 Excel 文本排序完全错位"
-                    "（审计实测 150-200K·16薪 排到第 396 位）"),
+                    "（审计实测 150-200K·16薪 排到第 396 位）", provenance=PROV_DERIVED, raw_paths=("salaryDesc",), raw_shape='', derive_rule='salary_parts'),
     FieldSpec("salary_max", SOURCE_DERIVED, "str",
               "薪资上界（元/月 或 元/天，可排序）",
               (), delivery_only=True, required=True,
-              notes="交付给用户排序用（与 salary_min 同源）"),
+              notes="交付给用户排序用（与 salary_min 同源）", provenance=PROV_DERIVED, raw_paths=("salaryDesc",), raw_shape='', derive_rule='salary_parts'),
     FieldSpec("salary_unit", SOURCE_DERIVED, "str",
               "薪资单位（month 月 / day 日 / year 年 / 空=面议）",
               (), delivery_only=True, required=True,
-              notes="交付给用户排序用：日薪与月薪不是同一量纲，必须分开"),
+              notes="交付给用户排序用：日薪与月薪不是同一量纲，必须分开", provenance=PROV_DERIVED, raw_paths=("salaryDesc",), raw_shape='', derive_rule='salary_parts'),
     FieldSpec("months_per_year", SOURCE_DERIVED, "str",
               "薪月数（如 16薪；空=按 12 个月）",
               (), delivery_only=True,
-              notes="交付给用户算年包用（16薪 ≠ 16 个月月薪）"),
+              notes="交付给用户算年包用（16薪 ≠ 16 个月月薪）", provenance=PROV_DERIVED, raw_paths=("salaryDesc",), raw_shape='', derive_rule='salary_parts'),
 )
+
+# ── 派生规则注册表（derived 字段的 derive_rule 必须在这里登记）────────
+# 「规则可查」不能是空话：每个规则 id 都要能指到一条可执行的推导说明。
+DERIVE_RULES = {
+    "job_id": "compute_job_id(job_link or title) = md5(...)[:16]",
+    "job_link": "https://www.zhipin.com/job_detail/{encryptJobId}.html",
+    "company_link": "https://www.zhipin.com/gongsi/{encryptBrandId}.html",
+    "salary_source": "api if salary else api_empty",
+    "list_active_status": "_list_active_status(raw)：在线/活跃文案",
+    "post_type": "classify_post_type：代发标记/猎头顾问/匿名公司名 → direct|agency|anonymous",
+    "recruit_type": "classify_recruit_type：jobType 4=实习 5=校招 空=社招",
+    "active_state": "active_state(boss_active_status)：active/inactive/unknown",
+    "title_key": "normalize_title(title)：大小写与空白归一",
+    "dup_group": "content_fingerprint(JD前180字|城市) 稳定哈希分组",
+    "dup_size": "同源重复组内条数",
+    "is_primary": "同源重复组内首条",
+    "direction": "classify_direction：标题+JD+技能 → ai_pm|pm_only|ai_other|other",
+    "salary_parts": "parse_salary_parts：拆 min/max/unit/months",
+    "link_verified_at": "抓取时刻（链接在该时刻被验证指向本岗位）",
+}
 
 FIELD_INDEX = {spec.name: spec for spec in FIELD_SPECS}
 
@@ -571,11 +637,13 @@ class JobRecord:
         encrypt_job_id = str(raw.get("encryptJobId") or "")
         encrypt_brand_id = str(raw.get("encryptBrandId") or "")
         salary = raw.get("salaryDesc") or ""
-        location = "·".join([
+        # 2026-10-22 保真核对：平台只给 cityName 时，原实现会拼出 "杭州··"
+        # （两个空段 → 两个多余分隔符）。只拼**有值**的段。
+        location = "·".join([part for part in (
             raw.get("cityName") or "",
             raw.get("areaDistrict") or "",
             raw.get("businessDistrict") or "",
-        ])
+        ) if part])
         tags = " | ".join(
             t for t in (raw.get("jobExperience") or "", raw.get("jobDegree") or "")
             if t and t != "不限"

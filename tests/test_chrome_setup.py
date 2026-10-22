@@ -2359,10 +2359,12 @@ class ChromeSetupTests(unittest.TestCase):
         module = load_module()
         sess = [mock.Mock(), "t", "s", 0]
         sess[0].eval_js.return_value = "{}"
+        # 2026-10-22：列表取值改成 parse_api_eval_value（同时带回平台**原始响应**
+        # 用于保真核对/溯源），旧形状（纯数组）仍然支持。
         with mock.patch.object(module, "_open_api_tab", return_value=sess), \
                 mock.patch.object(module, "_close_api_tab"), \
-                mock.patch.object(module, "parse_api_jobs_eval_value",
-                                  side_effect=lambda v: [{"job_id": "x"}]):
+                mock.patch.object(module, "parse_api_eval_value",
+                                  side_effect=lambda v: ([{"job_id": "x"}], None)):
             out = module._fetch_pages_parallel(9222, "k", "101", 3, {})
         self.assertIsNotNone(out)
         self.assertEqual([len(b) for b in out], [1, 1, 1])
@@ -7277,3 +7279,32 @@ class DailyBudgetAndRiskTierTests(unittest.TestCase):
         self.assertEqual(args.daily_detail_budget, 700)
         self.assertEqual(module.DAILY_DETAIL_BUDGET, 700)
 
+
+
+    def test_parse_api_eval_value_supports_both_shapes(self):
+        """列表取值：旧形状（数组）与新形状（{jobs, raw}）都要支持。"""
+        module = load_module()
+        jobs, raw = module.parse_api_eval_value('[{"title": "x"}]')
+        self.assertEqual(jobs, [{"title": "x"}])
+        self.assertIsNone(raw)
+        jobs, raw = module.parse_api_eval_value(
+            '{"jobs": [{"title": "x"}], "raw": {"zpData": {"jobList": []}}}')
+        self.assertEqual(jobs, [{"title": "x"}])
+        self.assertIsNotNone(raw)
+        self.assertIn("zpData", raw)
+
+    def test_fetch_pages_parallel_collects_raw_into_sink(self):
+        """并行抓页时，平台原始响应要进 raw_sink（保真核对的原料）。"""
+        module = load_module()
+        sess = [mock.Mock(), "t", "s", 0]
+        sess[0].eval_js.return_value = "{}"
+        sink = []
+        with mock.patch.object(module, "_open_api_tab", return_value=sess), \
+                mock.patch.object(module, "_close_api_tab"), \
+                mock.patch.object(module, "parse_api_eval_value",
+                                  side_effect=lambda v: ([{"job_id": "x"}],
+                                                        {"zpData": {"jobList": []}})):
+            out = module._fetch_pages_parallel(9222, "k", "101", 3, {}, raw_sink=sink)
+        self.assertIsNotNone(out)
+        self.assertEqual(len(sink), 3)
+        self.assertIn("zpData", sink[0]["response"])
