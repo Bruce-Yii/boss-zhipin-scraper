@@ -236,6 +236,14 @@ FIELD_SPECS: tuple = (
               (), delivery_only=True,
               notes="交付给用户：详情页公司活跃时间", provenance=PROV_VERBATIM, raw_paths=("brand_active_time",), raw_shape='str', derive_rule=''),
     # ── 派生语义 ─────────────────────────────────────────────────────
+    FieldSpec("risk_flags", SOURCE_DERIVED, "list",
+              "风险标记（用户视角：这岗该不该投）",
+              (_M_MODEL, _M_MAIN), required=False,
+              provenance=PROV_DERIVED,
+              raw_paths=("brandName", "cityName", "areaDistrict", "businessDistrict",
+                         "jobName", "jobLabels"),
+              raw_shape='', derive_rule='risk_flags',
+              notes="代发占位名/无区县/异地base/陈旧帖/薪资离群/兼职创业营"),
     FieldSpec("post_type", SOURCE_DERIVED, "str",
               "发布主体类型（direct 企业直招 / agency 猎头代发 / anonymous 匿名）",
               (_M_EXPORT, _M_SEMANTICS, _M_SUMMARY, _M_MAIN), required=True, provenance=PROV_DERIVED, raw_paths=("proxyJob", "proxyType", "bossTitle"), raw_shape='', derive_rule='post_type'),
@@ -299,7 +307,8 @@ DERIVE_RULES = {
     "is_primary": "同源重复组内首条",
     "direction": "classify_direction：标题+JD+技能 → ai_pm|pm_only|ai_other|other",
     "salary_parts": "parse_salary_parts：拆 min/max/unit/months",
-    "link_verified_at": "抓取时刻（链接在该时刻被验证指向本岗位）",
+    "link_verified_at": "抓取时刻（链接在该时刻被验证指向本岗位）",
+    "risk_flags": "risk_flags(job)：占位公司名/无区县/异地base/陈旧帖/薪资离群/兼职类",
 }
 
 FIELD_INDEX = {spec.name: spec for spec in FIELD_SPECS}
@@ -487,8 +496,106 @@ PM_DIRECTION_TERMS = (
     "产品经理", "产品负责人", "产品总监", "产品运营", "产品规划", "产品线",
     "产品专家", "产品企划", "产品设计", "产品专员", "产品助理", "产品策划",
     "产品需求", "PM",
+    # 实习岗的产品称谓（2026-10-22 修）：此前漏了"产品实习"，导致 244 条
+    # 实习池里 7 条「ai产品实习生」被判成 ai_other（非 AI 方向），
+    # 直接少给用户 7 个**确实是 AI 产品岗**的实习。称谓是同一个岗位的实习版。
+    "产品实习",
 )
 
+
+
+
+# ============================================================================
+# 风险标记（2026-10-22）：用户视角的「这岗该不该投」
+# ============================================================================
+# 之前的风险信号散落在报告里人工看（代发占位名、无区县、异地 base、陈旧帖、
+# 薪资离群、兼职/创业营），没有进产物 → 每次都要人肉再查一遍。
+# 现在算成**一个字段**（risk_flags），交付表里直接一列。
+#
+# 每条标记都只依据**平台给的字段**，不猜：
+#   - agency_placeholder：公司名是「某大型互联网公司」这类平台占位文案 → 公司不可核
+#   - no_district：地点只有城市没有区（杭州·余杭区·仓前 这种才算有）
+#   - other_base：地点写的是杭州但公司名里挂着外地城市名
+#   - stale：平台给的页面更新时间早于阈值
+#   - salary_outlier：同批同方向里显著偏离中位数
+#   - part_time：标题或 JD 明说不是正经岗位
+# 占位公司名不另抄词表：模型里 classify_post_type 已按平台的匿名写法
+# （"某…"/"知名…"/"大型…"/工作室…）判为 anonymous → 直接复用那个判定。
+# （此前另抄一份 → "某某科技有限公司"这类漏判，且两份表必然漂移。）
+RISK_PART_TIME_TERMS = ("兼职", "创业营", "带货", "招生", "代理", "日结",
+                       "私活", "外包")
+RISK_STALE_DAYS = 30
+
+# 异地 base 提示用的城市名（命中才算标记，不是穷举）
+_OTHER_CITY_HINTS = ("北京", "上海", "深圳", "广州", "成都", "武汉", "西安",
+                    "南京", "苏州", "合肥", "长沙", "青岛", "厦门", "天津",
+                    "重庆", "郑州", "济南", "福州", "东莞", "宁波", "无锡")
+
+
+def risk_flags(job, *, peer_salary_median=None, stale_days=RISK_STALE_DAYS):
+    """算这个岗位的**风险标记**（列表；空列表 = 没有明显风险）。
+
+    判据全部来自平台字段或我们已派生的字段，不做主观判断：
+    - ``agency_placeholder``：公司名是平台占位文案（猎头代发常见）→ 公司无法核实
+    - ``no_district``：地点只有城市、没有区/街道
+    - ``other_base``：地点是杭州，但公司名里挂着外地城市 → 可能是异地 base
+    - ``stale``：平台给的页面更新时间超过阈值 → 岗位可能已失效
+    - ``salary_outlier``：同批同方向里显著偏离中位数
+    - ``part_time``：标题/JD 明说是兼职/创业营/带货类
+    """
+    if not isinstance(job, dict):
+        return []
+    flags = []
+    company = str(job.get("company_name") or "").strip()
+    title = str(job.get("title") or "").strip()
+    jd = str(job.get("jd") or "").strip()
+    location = str(job.get("location") or "").strip()
+
+    if company and classify_post_type(job) == "anonymous":
+        flags.append("agency_placeholder")
+
+    parts = [p for p in location.split("·") if p]
+    if parts and len(parts) == 1:
+        flags.append("no_district")
+
+    if parts:
+        city = parts[0]
+        for other in _OTHER_CITY_HINTS:
+            if other in company and other != city:
+                flags.append("other_base")
+                break
+
+    updated = str(job.get("page_update_date") or "").strip()
+    if updated:
+        days = _days_since(updated)
+        if days is not None and days > stale_days:
+            flags.append("stale")
+
+    if peer_salary_median:
+        high = job.get("salary_max")
+        try:
+            high_f = float(high) if high else 0.0
+        except (TypeError, ValueError):
+            high_f = 0.0
+        if high_f and peer_salary_median:
+            if high_f > peer_salary_median * 3 or high_f < peer_salary_median * 0.25:
+                flags.append("salary_outlier")
+
+    blob = (title + " " + jd[:400]).lower()
+    if any(term.lower() in blob for term in RISK_PART_TIME_TERMS):
+        flags.append("part_time")
+
+    return flags
+
+
+def _days_since(date_text):
+    """距今天数；无法解析返回 None（平台没给就不算陈旧）。"""
+    import datetime as _dt
+    try:
+        parsed = _dt.date.fromisoformat(str(date_text)[:10])
+    except (ValueError, TypeError):
+        return None
+    return (_dt.date.today() - parsed).days
 
 def parse_salary_parts(salary):
     """把薪资串拆成**可排序的结构化列**。
@@ -740,6 +847,8 @@ class JobRecord:
         self.data.setdefault("dup_group", "")
         self.data.setdefault("dup_size", 1)
         self.data.setdefault("is_primary", True)
+        # 风险标记（用户视角：这岗该不该投）——此前散在报告里人工看，没进产物
+        self.data["risk_flags"] = risk_flags(self.data)
         return self
 
     @property
