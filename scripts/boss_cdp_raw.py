@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.20.0"
+__version__ = "2.21.0"
 
 import argparse
 import base64
@@ -3354,6 +3354,11 @@ def write_csv(csv_path, jobs):
                 continue
             # 确保每列都有值
             row = {col: job.get(col, "") for col in CSV_COLUMNS}
+            # 列表型字段统一转成 " | " 分隔的文本（CSV 里写成 Python 列表的
+            # repr 会变成 "['a', 'b']"，用户在 Excel 里没法筛）
+            for col, value in row.items():
+                if isinstance(value, list):
+                    row[col] = " | ".join(str(v) for v in value)
             writer.writerow(row)
     print(f"CSV 已保存: {csv_path}")
 
@@ -3374,6 +3379,11 @@ def write_detail_csv(csv_path, details):
                 row[col] = detail.get(source, "")
             if isinstance(row.get("skill_tags"), list):
                 row["skill_tags"] = " | ".join(row["skill_tags"])
+            # 列表型字段统一转成 " | " 分隔的文本（CSV 里写成 Python 列表
+            # 的 repr 会变成 "['a', 'b']"，用户在 Excel 里没法筛）
+            for col, value in row.items():
+                if isinstance(value, list):
+                    row[col] = " | ".join(str(v) for v in value)
             writer.writerow(row)
     print(f"详情 CSV 已保存: {csv_path}")
 
