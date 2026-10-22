@@ -183,6 +183,50 @@ def _sanitize_job(job):
     return _sanitize_payload(job)
 
 
+# 原始响应落盘用：与导出**不同**的一套规则（2026-10-22）。
+#
+# 为什么不同：导出产物是给用户看的，BOSS 内部标识不进产物；而**原始响应**是
+# 保真核对的依据——没有岗位身份（encryptJobId）就没法把原文和记录对上，
+# 原文落下来也等于没落。
+#
+# encryptJobId 不是凭据：它就是公开 URL 里的那一段
+# （https://www.zhipin.com/job_detail/{encryptJobId}.html），
+# **已经明文出现在导出的 job_link 里**，留着它不增加任何暴露面。
+#
+# 仍然必须剥掉的（真凭据 / 个人信息）：
+#   securityId（详情接口凭据）、encryptBossId（HR 身份）、lid、
+#   cookie / token / zp_stoken 等一切凭据。
+_RAW_KEEP_KEYS = frozenset({"encrypt_job_id", "encrypt_brand_id"})
+_RAW_DROP_KEYS = frozenset({
+    "securityid", "security_id", "encryptbossid", "encrypt_boss_id", "lid",
+})
+
+
+def _sanitize_raw_payload(value, *, key=None):
+    """原始响应落盘前的清理：保留岗位身份，剥掉凭据与个人信息。"""
+    if isinstance(value, dict):
+        cleaned = {}
+        for raw_key, raw_value in value.items():
+            normalized = _normalized_key(raw_key)
+            if normalized in _RAW_DROP_KEYS:
+                continue
+            if normalized.startswith("encrypt") and normalized not in _RAW_KEEP_KEYS:
+                continue
+            if _is_sensitive_key(raw_key):
+                continue
+            cleaned[raw_key] = _sanitize_raw_payload(raw_value, key=raw_key)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_raw_payload(item, key=key) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_raw_payload(item, key=key) for item in value)
+    if isinstance(value, str):
+        if _is_url_key(key) or _looks_like_url(value):
+            return _sanitize_url(value)
+        return _scrub_secrets(value)
+    return value
+
+
 def _normalized_job_id(value):
     """返回可哈希的 job_id；容器/空值视为非法并进入 quarantine。"""
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
