@@ -860,6 +860,90 @@ def page_background_default():
     return not FOREGROUND_CAPTURE
 
 
+OPEN_TARGETS_LOG = os.path.join(STATE_DIR, "open_targets.jsonl")
+
+
+def record_opened_target(target_id):
+    """登记"本工具打开的标签页"（崩溃安全：append-only 日志）。
+
+    用途：进程被**强杀**时（执行器超时 / 手动 kill）``finally`` 不会执行 → 标签页
+    泄漏（用户 2026-10-22 反馈：昨晚限流后窗口没关）。下一次运行启动时按这份日志
+    把仍然开着的那些关掉（只关本工具开的，不动用户自己的标签页）。
+    """
+    if not target_id:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(OPEN_TARGETS_LOG, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"target_id": str(target_id),
+                                     "ts": time.time()}) + "\n")
+    except OSError:
+        log.debug("登记标签页失败", exc_info=True)
+
+
+def reap_orphan_targets(cdp_port=DEFAULT_CDP_PORT):
+    """关掉上一次运行遗留的标签页；返回关掉的数量。
+
+    只关**本工具登记过**且**现在还开着**的 target → 不碰用户自己的标签页。
+    """
+    if not os.path.exists(OPEN_TARGETS_LOG):
+        return 0
+    recorded = []
+    try:
+        with open(OPEN_TARGETS_LOG, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    recorded.append(json.loads(line)["target_id"])
+                except (ValueError, KeyError):
+                    continue
+    except OSError:
+        return 0
+    if not recorded:
+        _truncate_open_targets_log()
+        return 0
+
+    closed = 0
+    try:
+        cdp = CDPSession(cdp_port)
+    except Exception:
+        log.debug("孤儿标签页清理：CDP 不可达", exc_info=True)
+        return 0
+    try:
+        targets = cdp.send("Target.getTargets").get("result", {}).get(
+            "targetInfos", [])
+        open_ids = {str(t.get("targetId")) for t in targets}
+        for target_id in dict.fromkeys(recorded):
+            if target_id not in open_ids:
+                continue
+            try:
+                cdp.send("Target.closeTarget", {"targetId": target_id})
+                closed += 1
+            except Exception:
+                log.debug("关闭孤儿标签页失败 %s", target_id, exc_info=True)
+    except Exception:
+        log.debug("孤儿标签页清理失败", exc_info=True)
+    finally:
+        try:
+            cdp.close()
+        except Exception:
+            pass
+    _truncate_open_targets_log()
+    if closed:
+        print(f"🧹 清理上一次运行遗留的标签页：{closed} 个")
+    return closed
+
+
+def _truncate_open_targets_log():
+    try:
+        with open(OPEN_TARGETS_LOG, "w", encoding="utf-8"):
+            pass
+    except OSError:
+        pass
+
+
 def create_page_session(cdp, background=True):
     """Create and attach an about:blank target without stealing focus by default.
 
@@ -873,6 +957,7 @@ def create_page_session(cdp, background=True):
         {"url": "about:blank", "background": background},
     )
     target_id = target["result"]["targetId"]
+    record_opened_target(target_id)
     attached = cdp.send(
         "Target.attachToTarget",
         {"targetId": target_id, "flatten": True},
@@ -1305,6 +1390,32 @@ EXTRACT_LIST_JS = """
 # 详情页提取与校验
 # ============================================================
 DETAIL_LOGIN_MARKER = "登录查看完整内容"
+# 读取平台「求职期望」设置（用户在 BOSS 直聘网页端设的期望）。
+# 用户 2026-10-22 实测：期望设成"房地产中介"后，搜"AI产品经理"也会召回大量
+# 房地产相关岗位 → 平台把期望当默认召回信号。抓取侧必须**读出来并报**，
+# 否则用户只会看到"莫名其妙混进来的岗位"，不知道原因在账号设置上。
+JOB_EXPECTATION_JS = """
+(function(){
+  try {
+    var pick = function(el){
+      if(!el) return '';
+      var t = (el.innerText || el.textContent || '').trim();
+      return t;
+    };
+    var sels = ['.header-Expectation', '.expectation', '.job-expectation',
+                '[class*="Expectation"]', '[class*="expectation"]'];
+    for (var i=0;i<sels.length;i++){
+      var el = document.querySelector(sels[i]);
+      var t = pick(el);
+      if (t) { return t.replace(/^求职期望[：:\\s]*/,'').slice(0,40); }
+    }
+    var body = document.body ? (document.body.innerText || '') : '';
+    var m = body.match(/求职期望[：:\\s]*([^\\n]{1,24})/);
+    return m ? m[1].trim() : '';
+  } catch (e) { return ''; }
+})()
+"""
+
 DETAIL_DESCRIPTION_MARKER = "职位描述"
 DETAIL_COMPETITIVENESS_MARKER = "竞争力分析"
 DETAIL_SAFETY_MARKER = "BOSS 安全提示"
@@ -3854,6 +3965,8 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
     # 详情 API 通道凭据：{job_id: securityId}——同进程内存传递（详情阶段用），
     # 不落导出文件（红线：security_id 属内部标识）。导出时 _sanitize 剔除，此处仅内存。
     security_map = {}
+    # 平台「求职期望」设置（抓取时读一次，用于解释召回偏差）
+    job_expectation = ""
 
     # 显示筛选条件
     filter_desc = []
@@ -4000,6 +4113,15 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                                 "total": len(all_jobs), "jobs": all_jobs, "security_map": security_map, "city_code": city_code}
                 human_scroll(cdp, sid)
                 human_mouse_jitter(cdp, sid)
+                # 读平台「求职期望」（它会污染召回；读出来才能向用户解释
+                # "为什么搜 AI 产品经理会混进房地产岗位"）
+                try:
+                    job_expectation = str(
+                        cdp.eval_js(JOB_EXPECTATION_JS, sid) or "").strip()
+                except _cdp_exception_types():
+                    job_expectation = ""
+                if job_expectation:
+                    print(f"   平台求职期望：{job_expectation}")
 
             # 优先用 API 获取明文数据；失败时刷新页面重试（凭证自愈），
             # 让浏览器重新完成挑战/刷新 stoken，最多 API_ATTEMPT_LIMIT 次。
@@ -4184,6 +4306,32 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
     print(f"\n{'='*60}")
     print(f"完成: {len(all_jobs)} 条")
 
+    # ── 列表层体检（在抓详情之前做：问题要在便宜的一层暴露）──────────
+    list_audit = None
+    if all_jobs:
+        try:
+            list_audit = _semantics.list_stage_audit(
+                all_jobs, keywords=split_keywords(keyword),
+                job_expectation=job_expectation)
+            _dirs = list_audit.get("direction_counts") or {}
+            _rate = list_audit.get("keyword_hit_rate")
+            print("🔬 列表层体检：")
+            print(f"   方向分布：{_dirs}")
+            if _rate is not None:
+                print(f"   标题与关键词命中率：{_rate:.0%}"
+                      f"（{list_audit.get('keyword_hits')}/{len(all_jobs)}）")
+            print(f"   招聘类型：{list_audit.get('recruit_type_counts')}")
+            print("   行业 Top5：" + "；".join(
+                f"{k}×{v}" for k, v in (list_audit.get("industry_top") or [])[:5]))
+            if list_audit.get("job_expectation"):
+                print(f"   平台求职期望：{list_audit['job_expectation']}")
+            for _warn in list_audit.get("warnings") or []:
+                print(f"   ⚠️ {_warn}")
+            for _sample in (list_audit.get("off_direction_samples") or [])[:5]:
+                print(f"      · 非目标方向样例：{_sample}")
+        except Exception as exc:
+            print(f"   （列表层体检异常：{exc}）")
+
     if all_jobs:
         # 最终写入（含时间戳更新 + run 级血缘字段 + B 增量观察集合）
         flush_jobs(output_path, {
@@ -4201,6 +4349,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
             "mode": "incremental",
             "observed_jobs": sorted(set(observed_ids)),
             "exhausted": exhausted,
+            "list_stage_audit": list_audit,
         }, all_jobs)
         print(f"已保存: {output_path}")
 
@@ -7303,8 +7452,14 @@ def build_parser():
                                 "campus 校招）。**在列表阶段过滤** → 不抓详情、不耗额度。"
                                 "不传=全要"))
     g_search.add_argument("--industry-allow", default=None, metavar="LIST",
-                          help=("只要指定行业（逗号分隔）。默认=互联网/AI/软件等目标行业"
-                                "白名单（平台自己的行业字段，零额外请求）；传空串=不过滤"))
+                          help=("只要指定行业（逗号分隔）。**默认不过滤**——实测行业与岗位"
+                                "相关性无关（餐饮 4 条全是产品经理岗）；要限制时自己列"))
+    g_search.add_argument("--industry-block", default=None, metavar="LIST",
+                          help=("排除指定行业（逗号分隔，如 房地产中介/租赁）。丢掉的岗位"
+                                "会逐条列出来，不静默丢"))
+    g_search.add_argument("--only-relevant-title", action="store_true",
+                          help=("只保留标题是产品经理/AI 方向的岗位（列表阶段过滤，丢掉的岗"
+                                "不抓详情 → 不耗额度）"))
     g_search.add_argument("--refresh-links", metavar="EXPORT_PATH", default=None,
                           help="按 job_id 用**新拉取的列表链接**刷新导出里的 job_link"
                                "（链接含 securityId 段、不能由 job_id 重建；本模式只发列表"
@@ -7638,6 +7793,13 @@ def run_cli():
             print("EXPORT_FAIL reason=cooldown_active")
             print("   请等待冷却结束，或先人工处理浏览器验证后重试。")
             sys.exit(1)
+        # 清理上一次运行遗留的标签页：进程被**强杀**时 finally 不会执行 → 标签页
+        # 泄漏（用户 2026-10-22 反馈"限流后窗口没关"）。只关本工具登记过的 target，
+        # 不动用户自己的标签页。
+        try:
+            reap_orphan_targets()
+        except Exception:
+            log.debug("孤儿标签页清理异常", exc_info=True)
         return _run_cli_with_db_cleanup(p, args)
     finally:
         release_scrape_lock()
@@ -7993,30 +8155,44 @@ def _run_cli_impl(p, args):
         args.keyword = list_data.get("keyword") or args.keyword
 
         # ── 相关度过滤（零额外请求，在抓详情之前）────────────────────
-        # 平台对"产品经理"是模糊召回：会带回房地产/餐饮/支付/食品等别的行业的产品经理岗。
-        # 用**平台自己的字段**（公司行业、招聘类型）过滤：丢掉的岗**不抓详情 → 不耗额度**。
+        # 平台对"产品经理"是**模糊召回**：会带回别的行业的产品经理岗。
+        # 2026-10-22 实测 933 条 / 90 个行业后结论：**行业 ≠ 相关性**（餐饮 4 条 100% 是产品
+        # 经理岗；房地产中介里也有正经 SaaS 产品岗）→ **默认按行业不过滤**，行业过滤只能是
+        # 用户显式指定的黑名单；相关性判定用**标题**（产品经理/AI 方向）。
+        # 丢掉的岗**不抓详情 → 不耗额度**；丢的是哪些逐条打出来（不静默丢）。
         _recruit_types = ([t.strip() for t in str(args.recruit_type or "").split(",")
                            if t.strip()] or None)
-        if args.industry_allow is None:
-            _industry_allow = None                      # 用模型默认白名单
-        else:
-            _industry_allow = [t.strip() for t in str(args.industry_allow).split(",")
-                               if t.strip()]
-        if _recruit_types or _industry_allow is not None:
+        _industry_allow = ([t.strip() for t in str(args.industry_allow or "").split(",")
+                            if t.strip()] or None)
+        _industry_block = ([t.strip() for t in str(args.industry_block or "").split(",")
+                            if t.strip()] or None)
+        if (_recruit_types or _industry_allow or _industry_block
+                or getattr(args, "only_relevant_title", False)):
             _before = len(list_data.get("jobs") or [])
             _kept, _dropped = _semantics.filter_by_relevance(
                 list_data.get("jobs") or [],
-                recruit_types=_recruit_types, industry_allow=_industry_allow)
+                recruit_types=_recruit_types, industry_allow=_industry_allow,
+                industry_block=_industry_block,
+                only_relevant_title=bool(getattr(args, "only_relevant_title", False)))
             list_data["jobs"] = _kept
             list_data["total"] = len(_kept)
             _drop_total = _before - len(_kept)
             print(f"🔎 相关度过滤：{_before} → {len(_kept)} 岗（丢弃 {_drop_total}）")
             if _dropped.get("recruit_type"):
                 print(f"   招聘类型不符：{_dropped['recruit_type']} 条")
-            if _dropped.get("industry"):
-                print(f"   行业不在白名单：{_dropped['industry']} 条")
+            if _dropped.get("industry_block"):
+                print(f"   行业在排除名单：{_dropped['industry_block']} 条")
+            if _dropped.get("industry_allow"):
+                print(f"   行业不在白名单：{_dropped['industry_allow']} 条")
+            if _dropped.get("title_relevance"):
+                print(f"   标题不是产品/AI 方向：{_dropped['title_relevance']} 条")
             if _dropped.get("no_industry"):
                 print(f"   ⚠️ 行业字段缺失（无法判定）：{_dropped['no_industry']} 条（已保留）")
+            for _item in (_dropped.get("items") or [])[:20]:
+                print(f"     · 丢弃：{_item.get('title')[:22]}｜{_item.get('company')[:16]}"
+                      f"｜{_item.get('reason')}")
+            if len(_dropped.get("items") or []) > 20:
+                print(f"     … 另有 {len(_dropped['items']) - 20} 条同类丢弃")
             if _drop_total:
                 print("   → 这些岗不抓详情，**不消耗详情页额度**")
         if db_state is not None:

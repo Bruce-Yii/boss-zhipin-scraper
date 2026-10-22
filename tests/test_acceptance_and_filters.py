@@ -136,33 +136,68 @@ class RelevanceFilterTests(unittest.TestCase):
         self.assertEqual([j["job_id"] for j in kept], ["1"])
         self.assertEqual(dropped["recruit_type"], 1)
 
-    def test_industry_filter_drops_other_industries(self):
+    def test_industry_is_not_filtered_by_default(self):
+        """**默认按行业不过滤**（实测：餐饮 4 条 100% 是产品经理岗，行业 ≠ 相关性）。"""
+        jobs = [
+            {"job_id": "1", "job_type": "", "company_industry": "互联网"},
+            {"job_id": "2", "job_type": "", "company_industry": "餐饮"},
+            {"job_id": "3", "job_type": "", "company_industry": "房地产中介/租赁"},
+        ]
+        kept, dropped = self.semantics.filter_by_relevance(jobs)
+        self.assertEqual(len(kept), 3)
+        self.assertEqual(dropped["industry_block"], 0)
+        self.assertEqual(dropped["industry_allow"], 0)
+
+    def test_industry_blocklist_drops_and_lists_what_was_dropped(self):
+        """显式黑名单才丢，且**丢的是哪些要能核对**（不静默丢）。"""
+        jobs = [
+            {"job_id": "1", "title": "产品经理", "job_type": "",
+             "company_industry": "互联网", "company_name": "A"},
+            {"job_id": "2", "title": "产品经理", "job_type": "",
+             "company_industry": "房地产中介/租赁", "company_name": "B"},
+        ]
+        kept, dropped = self.semantics.filter_by_relevance(
+            jobs, industry_block=["房地产中介/租赁"])
+        self.assertEqual([j["job_id"] for j in kept], ["1"])
+        self.assertEqual(dropped["industry_block"], 1)
+        self.assertEqual(len(dropped["items"]), 1)
+        self.assertIn("房地产", dropped["items"][0]["reason"])
+        self.assertEqual(dropped["items"][0]["title"], "产品经理")
+
+    def test_industry_allowlist_drops_others_when_explicitly_given(self):
         jobs = [
             {"job_id": "1", "job_type": "", "company_industry": "互联网"},
             {"job_id": "2", "job_type": "", "company_industry": "餐饮"},
         ]
         kept, dropped = self.semantics.filter_by_relevance(
-            jobs, recruit_types=None, industry_allow=None)
+            jobs, industry_allow=["互联网"])
         self.assertEqual([j["job_id"] for j in kept], ["1"])
-        self.assertEqual(dropped["industry"], 1)
+        self.assertEqual(dropped["industry_allow"], 1)
 
     def test_missing_industry_is_kept_and_counted(self):
         """行业缺失（平台没给）不静默丢，单独计数供人判断。"""
         jobs = [{"job_id": "3", "job_type": "", "company_industry": ""}]
         kept, dropped = self.semantics.filter_by_relevance(
-            jobs, recruit_types=None, industry_allow=None)
+            jobs, industry_allow=["互联网"])
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped["no_industry"], 1)
 
-    def test_empty_allowlist_disables_filter(self):
-        jobs = [{"job_id": "2", "job_type": "", "company_industry": "餐饮"}]
-        kept, _ = self.semantics.filter_by_relevance(
-            jobs, recruit_types=None, industry_allow=[])
-        self.assertEqual(len(kept), 1)
-
-    def test_default_industry_allowlist_is_non_empty(self):
-        self.assertTrue(self.model.DEFAULT_INDUSTRY_ALLOW)
-        self.assertIn("互联网", self.model.DEFAULT_INDUSTRY_ALLOW)
+    def test_title_relevance_filter(self):
+        """相关性判定看**标题**（产品经理/AI 方向），不看行业。"""
+        jobs = [
+            {"job_id": "1", "title": "AI产品经理", "job_type": "",
+             "company_industry": "互联网"},
+            {"job_id": "2", "title": "实习生", "job_type": "4",
+             "company_industry": "互联网"},
+            {"job_id": "3", "title": "AI招聘&猎头方向实习生", "job_type": "4",
+             "company_industry": "互联网"},
+        ]
+        kept, dropped = self.semantics.filter_by_relevance(
+            jobs, only_relevant_title=True)
+        self.assertEqual([j["job_id"] for j in kept], ["1"])
+        self.assertEqual(dropped["title_relevance"], 2)
+        self.assertTrue(self.model.is_relevant_title({"title": "AI产品经理"}))
+        self.assertFalse(self.model.is_relevant_title({"title": "实习生"}))
 
 
 class JdTitleMatchTests(unittest.TestCase):

@@ -160,7 +160,11 @@ def check_export(payload, spec=None, sample_title_check=True):
     # P3 内容相同必须被标重复
     groups = {}
     for record in records:
-        groups.setdefault(_fingerprint(record), []).append(record)
+        fingerprint = _fingerprint(record)
+        if not fingerprint:
+            continue          # 没有 JD 的记录没有内容指纹（列表产物）——
+            # 空指纹会把所有无 JD 记录归成一组 → 假阳性（独立审计 F5）
+        groups.setdefault(fingerprint, []).append(record)
     unflagged = 0
     for members in groups.values():
         if len(members) < 2:
