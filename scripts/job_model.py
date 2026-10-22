@@ -205,6 +205,28 @@ FIELD_SPECS: tuple = (
               (_M_EXPORT, _M_SEMANTICS)),
     FieldSpec("is_primary", SOURCE_DERIVED, "bool", "是否重复组内首条",
               (_M_EXPORT, _M_SEMANTICS)),
+    # ── 独立验收 2026-10-22 要求补的字段 ──────────────────────────
+    FieldSpec("is_ai_pm", SOURCE_DERIVED, "bool",
+              "是否 AI 方向的产品岗（审计实测 32.6% 的检索结果与 AI 无关）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("direction", SOURCE_DERIVED, "str",
+              "方向标签（ai_pm / pm_only / ai_other / other）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("direction_evidence", SOURCE_DERIVED, "list",
+              "方向判定命中的信号词（可复核，不给黑箱结论）",
+              (_M_EXPORT,)),
+    FieldSpec("salary_min", SOURCE_DERIVED, "str",
+              "薪资下界（元/月 或 元/天，可排序）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("salary_max", SOURCE_DERIVED, "str",
+              "薪资上界（元/月 或 元/天，可排序）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("salary_unit", SOURCE_DERIVED, "str",
+              "薪资单位（month 月 / day 日 / year 年 / 空=面议）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("months_per_year", SOURCE_DERIVED, "str",
+              "薪月数（如 16薪；空=按 12 个月）",
+              (_M_EXPORT,)),
 )
 
 FIELD_INDEX = {spec.name: spec for spec in FIELD_SPECS}
