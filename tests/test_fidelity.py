@@ -165,5 +165,49 @@ class FidelityTests(unittest.TestCase):
             self.assertEqual(self.fid.main([raw_path, prod_path]), 0)
 
 
+
+
+class DetailFidelityTests(unittest.TestCase):
+    """详情侧保真：交付的 JD 必须是页面原文的子序列（不多字、不少一大半）。
+
+    清洗本来就该只去掉招聘者卡片/技能标签/页面模块；砍掉大半或凭空多字，
+    都是保真缺陷——而且这两种都不依赖我的主观判断。
+    """
+
+    def setUp(self):
+        self.fid = load_module("fidelity", SCRIPTS / "fidelity.py")
+
+    def _payload(self, raw_text, jd):
+        return (
+            {"details": [{"job_id": "a1", "raw_text": raw_text}]},
+            [{"job_id": "a1", "title": "AI产品经理", "jd": jd}],
+        )
+
+    def test_jd_as_substring_passes(self):
+        raw = "岗位职责：\n1. 负责 AI 产品设计\n2. 推动需求落地\n任职要求：\n1. 3 年以上经验"
+        jd = "岗位职责：\n1. 负责 AI 产品设计\n2. 推动需求落地"
+        ok, report = self.fid.check_detail_fidelity(*self._payload(raw, jd))
+        self.assertTrue(ok, f"应当通过：{report['detail_findings']}")
+
+    def test_invented_content_is_caught(self):
+        raw = "岗位职责：\n1. 负责 AI 产品设计"
+        jd = "岗位职责：\n1. 负责 AI 产品设计\n2. 我们额外编了一段不存在的职责"
+        ok, report = self.fid.check_detail_fidelity(*self._payload(raw, jd))
+        self.assertFalse(ok, "凭空多字必须被抓出来")
+        self.assertEqual(report["detail_error_count"], 1)
+
+    def test_mostly_truncated_jd_is_flagged(self):
+        raw = "岗位职责：\n" + ("负责 AI 产品设计与需求分析。" * 20)
+        jd = "岗位职责："
+        ok, report = self.fid.check_detail_fidelity(*self._payload(raw, jd))
+        self.assertTrue(ok, "只是可疑，不算失真")
+        self.assertTrue(report["detail_findings"], "砍掉大半必须被标出来")
+        self.assertEqual(report["detail_findings"][0]["level"], "warn")
+
+    def test_missing_raw_is_not_counted_as_pass(self):
+        ok, report = self.fid.check_detail_fidelity(
+            {"details": []}, [{"job_id": "a1", "jd": "x"}])
+        self.assertEqual(report["checked_details"], 0)
+
 if __name__ == "__main__":
     unittest.main()

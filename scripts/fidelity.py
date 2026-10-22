@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -175,6 +176,66 @@ def _compare(spec, raw, record):
     return MISMATCH, _as_text(expected), _as_text(actual), ""
 
 
+def _norm_text(value):
+    """比对用的归一化：去掉所有空白（JD 的换行/缩进不该算差异）。"""
+    return re.sub(r"\s+", "", str(value or ""))
+
+
+def check_detail_fidelity(raw_payload, records):
+    """详情侧保真核对：交付的 JD 必须是页面原文的**子序列**。
+
+    两条判据（都不依赖我的主观判断）：
+    1. **没有凭空多字**：交付的 JD（去空白）必须是原文（去空白）的子串；
+       否则说明我们改了内容或拼接了别的东西 → 保真缺陷。
+    2. **没有悄悄丢一大半**：清洗后长度 / 原文长度 < 阈值 → 可疑（告警级）。
+       清洗本来就该只去掉招聘者卡片/技能标签/页面模块，砍掉大半说明切错了。
+    """
+    details = {}
+    if isinstance(raw_payload, dict):
+        for entry in raw_payload.get("details") or []:
+            if isinstance(entry, dict) and entry.get("job_id"):
+                details[str(entry["job_id"])] = entry.get("raw_text") or ""
+    findings = []
+    checked = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        job_id = str(record.get("job_id") or "")
+        raw_text = details.get(job_id)
+        if not raw_text:
+            continue
+        jd = str(record.get("jd") or "")
+        if not jd:
+            continue
+        checked += 1
+        norm_raw = _norm_text(raw_text)
+        norm_jd = _norm_text(jd)
+        if norm_jd and norm_jd not in norm_raw:
+            findings.append({
+                "job_id": job_id,
+                "field": "jd",
+                "title": str(record.get("title") or "")[:24],
+                "expected": f"原文 {len(norm_raw)} 字（去空白）",
+                "actual": f"交付 {len(norm_jd)} 字，且**不是原文子串**",
+                "level": "error",
+            })
+            continue
+        if norm_raw and len(norm_jd) / len(norm_raw) < 0.6:
+            findings.append({
+                "job_id": job_id,
+                "field": "jd",
+                "title": str(record.get("title") or "")[:24],
+                "expected": f"原文 {len(norm_raw)} 字（去空白）",
+                "actual": f"交付只剩 {len(norm_jd)} 字（{len(norm_jd)/len(norm_raw):.0%}）",
+                "level": "warn",
+            })
+    errors = [f for f in findings if f.get("level") == "error"]
+    return (not errors), {
+        "checked_details": checked,
+        "detail_findings": findings,
+        "detail_error_count": len(errors),
+    }
+
 def check_fidelity(raw_payload, product_payload, limit=None, job_model=None):
     """核对一份产物与平台原文。
 
@@ -297,6 +358,20 @@ def main(argv=None):
         product_payload = json.load(handle)
     ok, report = check_fidelity(raw_payload, product_payload, limit=limit)
     print(format_report(report))
+    # 详情侧（可选）：第二个 raw 是详情页原文
+    detail_raw = argv[2] if len(argv) > 2 and not argv[2].startswith("--") else None
+    if detail_raw:
+        with open(detail_raw, encoding="utf-8") as handle:
+            detail_payload = json.load(handle)
+        detail_ok, detail_report = check_detail_fidelity(
+            detail_payload, _records(product_payload))
+        print(f"  详情侧核对：{detail_report['checked_details']} 条 JD，"
+              f"不一致 {detail_report['detail_error_count']} 条")
+        for item in detail_report["detail_findings"][:10]:
+            mark = "❌" if item.get("level") == "error" else "⚠️"
+            print(f"    {mark} {item['field']}｜{item.get('title', '')}｜"
+                  f"{item.get('expected', '')}｜{item.get('actual', '')}")
+        ok = ok and detail_ok
     print("结论：", "保真 ✓" if ok else "存在保真缺陷 ✗")
     return 0 if ok else 1
 
