@@ -413,6 +413,8 @@ LOGIN_PROBE_TARGETS = (
 LOGIN_PROBE_PAGE_SIZE = 10
 LOGIN_PROBE_MAX_INTERVAL = 15
 LOGIN_PROBE_MAX_TRANSIENT_ERRORS = 2
+# 请求级受限（未知非零 code）退避后重试一次探测的等待秒数（不加速，只降速）
+LOGIN_PROBE_BACKOFF_SECONDS = 6
 # 被动捕获（--list-mode passive，上游 #55）等待页面自身首个 joblist 响应的上限：
 # 导航 + SPA 发请求通常 <8s，留足余量
 PROBE_CAPTURE_TIMEOUT = 25
@@ -2564,10 +2566,12 @@ def classify_login_probe_response(data, http_status=200):
     message = str(data.get("message") or data.get("msg") or "")
 
     if code in LOGIN_RESTRICTED_CODES:
+        # 账号级风控码（BOSS 明确的风控码）→ 立即判定，不再试其它探测目标
         return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
     if code != 0:
-        # 未知非零 code 一律按受限处理（降速语义）——新风控形态不被误判为
-        # 不可恢复的 RESPONSE_ERROR（避免"误拦已登录用户"与静默放弃并存）
+        # 未知非零 code = **请求级**受限（某个 query/城市被拒、瞬时抖动…），
+        # 不是账号级风控。按"降速语义"处理：退避后重试一次同一个目标，都失败才判受限
+        # ——不因一次瞬时返回把整次抓取判死（2026-10-22 08:25 实测因此白跑两次列表拉取）。
         return LoginProbeResult(LoginProbeStatus.RESTRICTED, code=code, message=message)
 
     zp_data = data.get("zpData")
@@ -2738,15 +2742,36 @@ def _probe_login_state_uncached(cdp_port=DEFAULT_CDP_PORT):
         time.sleep(4)
 
         last_result = None
+        restricted_result = None
         for query, city_code in LOGIN_PROBE_TARGETS:
             result = probe_login_state(cdp, sid, query=query, city_code=city_code)
             if result.status in (
                 LoginProbeStatus.AVAILABLE,
                 LoginProbeStatus.UNAUTHENTICATED,
-                LoginProbeStatus.RESTRICTED,
             ):
                 return result
+            if result.status is LoginProbeStatus.RESTRICTED:
+                if result.code in LOGIN_RESTRICTED_CODES:
+                    # 账号级风控码 → 立即判定，不再试其它目标
+                    return result
+                # 请求级受限（未知非零 code）：退避后**重试一次同一个目标**。
+                # 这是把代码里写明的"降速语义"真正落地——不是加压，而是别让一次
+                # 瞬时返回把整次抓取判死。
+                time.sleep(LOGIN_PROBE_BACKOFF_SECONDS)
+                retry = probe_login_state(cdp, sid, query=query, city_code=city_code)
+                if retry.status in (
+                    LoginProbeStatus.AVAILABLE,
+                    LoginProbeStatus.UNAUTHENTICATED,
+                ):
+                    return retry
+                if retry.status is LoginProbeStatus.RESTRICTED:
+                    restricted_result = retry
+                else:
+                    last_result = retry
+                continue
             last_result = result
+        if restricted_result is not None:
+            return restricted_result
         return last_result if last_result is not None else LoginProbeResult(
             LoginProbeStatus.RESPONSE_ERROR,
             message="全部探测均无结果",
@@ -7871,8 +7896,12 @@ def _run_cli_impl(p, args):
         if login_result.status is LoginProbeStatus.RESTRICTED:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
             print("   请先在浏览器中完成验证或稍后再试，不要重复运行登录探测。")
+            # 审计必须带上 code/message —— 否则事后只知道"受限"，不知道是哪个码、
+            # 账号级还是请求级（2026-10-22 实测：两次列表拉取因此白跑，事后无法定位）
             send_alert("登录失效",
-                       f"EXPORT_FAIL reason=login_failed status=RESTRICTED city={args.city} keyword={args.keyword}")
+                       f"EXPORT_FAIL reason=login_failed status=RESTRICTED "
+                       f"code={login_result.code} message={login_result.message} "
+                       f"city={args.city} keyword={args.keyword}")
             sys.exit(1)
         if login_result.status is LoginProbeStatus.RESPONSE_ERROR:
             print(f"❌ {describe_login_probe_result(login_result)}，已停止抓取。")
