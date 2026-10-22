@@ -3435,6 +3435,26 @@ def _batch_cooldown_if_needed(done_count):
     return restarted
 
 
+def _atomic_replace_with_retry(src, dst, attempts=8, base_delay=0.02):
+    """原子替换，带 PermissionError 退避重试（Windows 上目标文件可能被占用）。
+
+    独立审计 2026-10-22：os.replace 的 PermissionError 被 `except OSError: pass`
+    吞掉 → 冷却标记静默丢失 = **熔断冷却失效**；导出原子写也有同型风险。
+    退避重试后仍失败则抛出（让上层决定怎么办），不再静默。
+    """
+    last = None
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return True
+        except PermissionError as exc:
+            last = exc
+            time.sleep(base_delay * (2 ** attempt))
+        except FileNotFoundError:
+            raise
+    raise last if last else OSError(f"替换失败：{src} → {dst}")
+
+
 def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
     """熔断时记录冷却截止时间戳（原子写）。
 
@@ -3453,9 +3473,12 @@ def mark_cdp_cooldown(seconds=CDP_COOLDOWN_SECONDS):
             f.write(str(now + seconds + CDP_RECOVERY_SECONDS) + "\n")
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, _cdp_cooldown_path())
-    except OSError:
-        pass
+        _atomic_replace_with_retry(tmp, _cdp_cooldown_path())
+    except OSError as exc:
+        # 冷却标记写不进去 = 熔断冷却失效（本该停手，结果照跑）→ 必须让调用方知道
+        record_audit_event("cooldown_write_failed", error=str(exc))
+        print(f"⚠️ 熔断冷却标记写入失败（{exc}）——冷却可能不生效，请手动等待后再试")
+        raise
 
 
 def check_cdp_recovery():
@@ -4671,7 +4694,7 @@ def build_detail_record(job, extracted):
 
     record = _job_model.JobRecord.from_detail_payload(
         payload, detail_payload,
-        link_verified_at=datetime.now().isoformat(timespec="seconds"))
+        link_verified_at=datetime.now().astimezone().isoformat(timespec="seconds"))
     row = record.to_public_dict()
     # 历史别名（保持详情输出的向后兼容；规范名仍是 model 的 company_name/tags/job_link）
     row["company"] = row.get("company_name", "")
