@@ -1,7 +1,8 @@
 {
-  "version": "1.0",
+  "version": "2.0",
   "updated": "2026-10-22",
-  "why": "验收标准不应该由写代码的同一个人在同一个会话里当场写。那样得到的体检与被体检的东西出自同一个心智模型，天生有相同的盲区——2026-10-22 上午就是这么连续漏掉三类缺陷的。本规格的条目来自**消费者（求职者）要回答的问题**，与实现无关；检查器按性质（property）而不是按字段清单来判定，因此能覆盖写规格时没想到的具体情形。",
+  "why": "验收标准不应该由写代码的同一个人在同一个会话里当场写。那样得到的体检与被体检的东西出自同一个心智模型，天生有相同的盲区——2026-10-22 上午就是这么连续漏掉三类缺陷的，独立审计构造的 17 条单缺陷记录把原版验收器全部放行。本规格的条目来自**消费者（求职者）要回答的问题**，与实现无关；检查器按性质（property）而不是按字段清单来判定，因此能覆盖写规格时没想到的具体情形。",
+  "version_note": "2.0 相对 1.0 的改动：删掉恒假的 P8；P9/P10 改为委托 scripts/semantics.py 的 check_invariants（单一实现，不再在验收器里抄第二份正则）；P5 收紧（通用词不算命中）并降级为信号；P4 改为真正的身份判定；P2 的登记字段表从实现搬进规格（验收器不再与实现同源）；新增 P11/P12/P13 三条性质；每条性质补 `counterexample`（什么样的记录应该让它变红）。",
   "questions": [
     {
       "id": "who_is_the_company",
@@ -88,6 +89,16 @@
         "link_verified_at",
         "job_id"
       ]
+    },
+    {
+      "id": "is_it_the_job_i_wanted",
+      "ask": "这批东西是不是这次要找的岗？（关键词对得上吗？在要的城市吗？条数对得上吗？）",
+      "requires": [
+        "title",
+        "location",
+        "salary",
+        "company_name"
+      ]
     }
   ],
   "required_always": [
@@ -96,8 +107,17 @@
     "company_name",
     "salary",
     "location",
-    "job_link",
+    "job_link"
+  ],
+  "required_detail_only": [
     "jd"
+  ],
+  "required_note": "jd 只在**详情档**必填：列表产物（本来就没有 JD）拿它当必填就是假阳性——产物形态由 meta/字段存在性自动判定，判定结果写进结论。",
+  "presence_fields": [
+    "post_type",
+    "recruit_type",
+    "active_state",
+    "title_key"
   ],
   "value_rules": {
     "post_type": [
@@ -116,46 +136,186 @@
       "unknown"
     ]
   },
+  "field_registry": [
+    "job_id",
+    "job_link",
+    "company_link",
+    "link_verified_at",
+    "title",
+    "title_key",
+    "salary",
+    "salary_source",
+    "salary_min",
+    "salary_max",
+    "salary_unit",
+    "months_per_year",
+    "location",
+    "tags",
+    "experience",
+    "education",
+    "skills",
+    "skill_tags",
+    "job_labels",
+    "welfare",
+    "icon_flags",
+    "icon_word",
+    "job_valid_status",
+    "company_name",
+    "company_scale",
+    "company_stage",
+    "company_industry",
+    "boss_name",
+    "boss_title",
+    "boss_active_status",
+    "anonymous",
+    "proxy_job",
+    "proxy_type",
+    "job_type",
+    "jd",
+    "page_update_date",
+    "tags_list",
+    "job_status_desc",
+    "brand_introduce",
+    "brand_scale_name",
+    "brand_stage_name",
+    "brand_industry_name",
+    "brand_active_time",
+    "post_type",
+    "recruit_type",
+    "active_state",
+    "dup_group",
+    "dup_size",
+    "is_primary",
+    "is_ai_pm",
+    "direction",
+    "direction_evidence",
+    "company",
+    "link"
+  ],
+  "field_registry_note": "登记字段表是**消费者契约**：登记在这里的字段才允许出现在产物里。它故意**不从实现（job_model.FIELD_INDEX）读取**——2026-10-22 独立审计结论：验收器与被验收物同源时，结构上不可能发现实现自身的错误（模型多一个没人问的字段，验收器照样放行）。平台内部字段（security_id/lid/encrypt_*）**不在**表里，且单列为 forbidden_fields（红线）。",
+  "field_types": {
+    "jd": "str",
+    "title": "str",
+    "title_key": "str",
+    "salary": "str",
+    "location": "str",
+    "company_name": "str",
+    "job_link": "str",
+    "link_verified_at": "str",
+    "skills": "list[str]",
+    "skill_tags": "list[str]",
+    "direction_evidence": "list[str]"
+  },
+  "field_types_note": "只登记**类型漂移会直接坑到消费者**的字段：列表型字段（skill_tags/skills）漂移成字符串，消费端按数组读就会炸；文本型字段漂移成数组/对象同理。数值型字段（dup_size/is_primary/salary_min）刻意不登记——它们在不同链路上可能是数字也可能是数字串，强判会误伤。",
+  "thresholds": {
+    "keyword_hit_rate_min": 0.6,
+    "city_match_rate_min": 0.95,
+    "link_max_age_hours": 24,
+    "jd_min_length": 120
+  },
+  "thresholds_note": "jd_min_length 只作记录：JD 长度的**判定实现**在 scripts/semantics.py 的 check_invariants（单一实现，验收器不再持有第二份正则）。",
+  "junk_tail_extra_markers": [],
+  "junk_tail_note": "垃圾尾标记表已并入 scripts/semantics.py 的 check_invariants（单一来源）——此前验收规格与实现侧各存一份且已漂移。",
   "properties": [
     {
+      "id": "P0_empty",
+      "level": "error",
+      "desc": "产物里至少要有一条记录（空产物＝没交付任何东西）。",
+      "counterexample": "{\"jobs\": []} → 变红。"
+    },
+    {
+      "id": "P0_forbidden_fields",
+      "level": "error",
+      "desc": "平台内部字段与凭据（security_id/lid/encrypt_*）不得出现在任何对外产物里（红线）。",
+      "counterexample": "记录里出现 \"security_id\": \"xxx\" → 变红。"
+    },
+    {
       "id": "P1_required_non_empty",
-      "desc": "每条记录的必填字段都必须有值（不允许'空得像有值'）"
+      "level": "error",
+      "desc": "每条记录的必填字段都必须有值；公司信息不得整块为空（消费者问「这家公司是谁」必须能得到答案）。",
+      "counterexample": "company_name/company_industry/company_scale/company_stage/company_link 全空 → 变红；salary 为空 → 变红。"
     },
     {
       "id": "P2_no_unregistered_field",
-      "desc": "记录里出现的每个字段都必须在规格里登记（不允许有'没人知道这是什么'的字段）"
+      "level": "warn",
+      "desc": "记录里出现的每个字段都必须在规格的 field_registry 里登记（不允许有「没人知道这是什么」的字段）；登记表来自规格，不来自实现。",
+      "counterexample": "记录里出现规格未登记的 mystery 字段 → 变黄（信号：实现加了字段但消费者契约没登记）。"
+    },
+    {
+      "id": "P2_type_stable",
+      "level": "error",
+      "desc": "字段取值类型必须与规格声明一致（列表型字段不能漂移成字符串，文本型字段不能漂移成数组）。",
+      "counterexample": "\"skill_tags\": \"B端产品\"（规格要求 list[str]）→ 变红。"
     },
     {
       "id": "P3_duplicates_are_flagged",
-      "desc": "任意两条记录若内容指纹相同（JD 前 180 字 + 薪资 + 城市），必须被标进同一个 dup_group"
+      "level": "error",
+      "desc": "内容相同（归一化 JD 前 180 字 ＋ 归一化城市前 12 字）的记录必须落在同一个 dup_group；指纹在本文件独立实现（与打标器同定义、异实现），没有 JD 的记录跳过。",
+      "counterexample": "两条同 JD 同城的记录（哪怕薪资带被微调过），其中一条 dup_group 为空 → 变红。"
     },
     {
       "id": "P4_link_belongs_to_record",
-      "desc": "每条记录的链接必须能归属到它自己的 job_id（链接不能是别的岗的）"
+      "level": "error",
+      "desc": "身份判定：job_link 与 job_id 必须一一对应——一条链接只能属于一个 job_id，一个 job_id 也只能挂一条链接。",
+      "counterexample": "两条不同 job_id 共用同一个 job_link → 变红；同一个 job_id 出现在两个不同 job_link 上 → 变红。"
     },
     {
       "id": "P5_jd_matches_its_title",
-      "desc": "每条记录的 JD 至少包含其岗位名的一个 2 字以上词（不允许张冠李戴的 JD）"
+      "level": "warn",
+      "desc": "（信号，不是判不合格）JD 里必须出现岗位名中至少一个有区分度的词；通用词（产品/经理/专员/工程师…）不算命中依据。",
+      "counterexample": "岗位名「AI产品经理」，JD 是「看清楚再投简历…招募小红书运营合伙人（股权合作）」→ 变黄。"
     },
     {
       "id": "P6_link_verified",
-      "desc": "每条记录都必须有 link_verified_at（链接是短时效凭证，必须知道它何时被验证）"
+      "level": "warn",
+      "desc": "每条记录都要标注 link_verified_at（链接是短时效凭证，必须知道它何时被验证）。",
+      "counterexample": "记录缺 link_verified_at → 变黄。"
     },
     {
       "id": "P7_semantic_labels_present",
-      "desc": "每条记录都必须有 post_type / recruit_type / active_state 三个判定"
-    },
-    {
-      "id": "P8_salary_source_consistent",
-      "desc": "标了 salary_source=api 的记录薪资不能为空"
+      "level": "warn/error",
+      "desc": "post_type/recruit_type/active_state/title_key 四个判定必须齐全（缺＝信号），取值必须合法（不合法＝判不合格）。",
+      "counterexample": "recruit_type 取值 \"society\" → 变红；整批记录都缺 post_type → 变黄。"
     },
     {
       "id": "P9_jd_not_too_short",
-      "desc": "JD 长度不得低于 120 字（低于这个长度基本是抽取失败，不是真 JD）"
+      "level": "error",
+      "desc": "JD 长度必须达到语义层约定的下限（当前 120 字）；判定由 scripts/semantics.py 的 check_invariants.jd_length **唯一负责**，没有 JD 的记录跳过。",
+      "counterexample": "jd=\"太短\"（2 字）→ 变红。"
     },
     {
       "id": "P10_no_junk_tail",
-      "desc": "JD 尾部不得混进页面模块文案（薪资详情/活跃标签/招聘专员等）"
+      "level": "error",
+      "desc": "JD 尾部不得混进页面模块文案（薪资详情/刚刚活跃/招聘专员等）；判定由 semantics.check_invariants.no_junk_tail 唯一负责，规格只补充同族标记。",
+      "counterexample": "JD 末尾出现「薪资详情」「刚刚活跃」→ 变红。"
+    },
+    {
+      "id": "P11_delivery_matches_request",
+      "level": "error/warn",
+      "desc": "交付物必须与请求一致：标题对关键词的命中率 ≥60%、记录城市与请求城市一致率 ≥95%、meta.job_count 与实际条数相符；关键词不可机器解析时明说「无法核对是不是这次要找的岗」。",
+      "counterexample": "meta.keyword=\"AI产品经理\"，但 5 条记录里只有 1 条标题命中 → 变红；meta.city=\"上海\" 但 9/10 条 location 在杭州 → 变红；meta.job_count=30 而实际只有 28 条 → 变红；meta.keyword 缺失 → 变黄并写明无法核对。"
+    },
+    {
+      "id": "P12_semantic_cross_consistency",
+      "level": "error",
+      "desc": "派生语义必须与平台原始字段自洽：post_type↔proxy_job/proxy_type/boss_title、recruit_type↔job_type（实习必须 job_type=4）、active_state↔boss_active_status（标了 active 就不能 job_valid_status 非 1）、title_key↔title、salary 必须可解析或明确面议、job_type 只能是 ''/4/5、社招不得用日薪口径。",
+      "counterexample": "post_type=direct 却带 proxy_job=1 → 变红；recruit_type=social 却 job_type=4 → 变红；job_valid_status=0 却 active_state=active → 变红；title_key 与 title 对不上 → 变红；salary=\"面议\" 却有 salary_min/salary_max → 变红；job_type=7 → 变红。"
+    },
+    {
+      "id": "P13_identity_freshness_credentials",
+      "level": "error/warn",
+      "desc": "身份 + 时效 + 凭据 + 重复组：job_id 唯一且必须由自己的 job_link 推出（模型真身定义 job_id=md5(job_link)[:16]）；link_verified_at 必须可 fromisoformat 且不超 24 小时（无时区只 warn）；递归扫所有字符串值，URL 的 query/fragment 参数名命中 security*/token/auth/cookie/password/lid/encrypt* 即判不合格（复用消费端 contract_check 的实现）；dup_group 双向一致（内容相同必同组、同组必内容相同）＋dup_size 等于组内条数＋每组恰好 1 条 is_primary。",
+      "counterexample": "两条记录同一个 job_id → 变红；job_id 与 md5(job_link)[:16] 对不上 → 变红；link_verified_at=\"昨天那个时间\" → 变红；link_verified_at 是 48 小时前 → 变红；URL 带 ?securityId=xxx → 变红；dup_size=3 但组内只有 2 条 → 变红；一组里两条都 is_primary=true → 变红。"
+    }
+  ],
+  "removed_properties": [
+    {
+      "id": "P8_salary_source_consistent",
+      "reason": "恒假，删掉。模型把 salary_source 写死成 `api if salary else api_empty`，所以「标了 api 但薪资为空」在模型产物里永远不成立——写了也不会红，等于没有性质。替代物：P12 里的薪资口径规则（薪资必须可解析或明确面议、面议不得带结构化薪资列、salary_source 与薪资是否为空一致），这三条在真实缺陷上会红。"
+    },
+    {
+      "id": "P9/P10 的本地副本",
+      "reason": "验收器自己写了一份 JD 长度/垃圾尾正则，与 scripts/semantics.py 的 check_invariants 两份副本各自漂移。现在改为单一实现：验收器只委托 semantics.check_invariants，规格只补同族标记词。"
     }
   ],
   "forbidden_fields": [

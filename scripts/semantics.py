@@ -28,6 +28,7 @@
 本模块是**纯逻辑、无 CDP 依赖、无网络**，按项目模块约定单独成文件。
 """
 
+import hashlib
 import re
 import unicodedata
 from collections import Counter
@@ -182,7 +183,11 @@ def check_invariants(jobs, meta=None):
     short = sum(1 for n in lens if n < 120)
     add("jd_length", short == 0, f"{short} 条 < 120 字（中位 {sorted(lens)[total // 2]}）")
 
-    junk = re.compile(r"薪资详情|社保类型|提成方式|刚刚活跃|今日活跃|本周活跃|·招聘专员")
+    # 垃圾尾标记表 = **唯一来源**（2026-10-22：验收器与实现侧各抄一份，已发生漂移 →
+    # 实现侧改为问这里；验收规格里的 junk_tail_extra_markers 也并进来）
+    junk = re.compile(
+        r"薪资详情|社保类型|提成方式|刚刚活跃|今日活跃|本周活跃|·招聘专员"
+        r"|奖金补贴|3日内活跃|2周内活跃|本月活跃|·招聘主管|·HRBP")
     dirty = sum(1 for j in jobs if junk.search(str(j.get("jd") or "")))
     add("no_junk_tail", dirty == 0, f"{dirty} 条 JD 尾部混进页面模块")
 
@@ -375,12 +380,31 @@ def classify_extract_failure(message, page_text=""):
 active_state = _model.active_state
 
 
+def stable_group_id(fingerprint):
+    """重复组的**稳定** id（同一份内容永远得到同一个组号）。
+
+    为什么不能用内置 ``hash()``（2026-10-22 审计）：``hash(str)`` 的结果依赖
+    ``PYTHONHASHSEED``（每个进程随机）→ 同一份数据三个进程跑出
+    ``dup-10961898`` / ``dup-96218808`` / ``dup-52751366``。后果：跨天/跨 run
+    合并时组号对不上，同一份输入两次跑出的文件**字节不同**（不可复现）。
+
+    改用 sha256 摘要前 8 位十六进制：跨进程、跨机器、跨 Python 版本都稳定
+    （sha256 而非 md5：md5 已被 ruff B324 视为不安全哈希，且这里要的是稳定性
+    而不是密码学强度，但没必要用被标记的算法）。
+    """
+    text = str(fingerprint or "").encode("utf-8")
+    return hashlib.sha256(text).hexdigest()[:8]
+
+
 def mark_duplicate_groups(jobs):
     """就地给每条记录打重复组标记：``dup_group`` / ``dup_size`` / ``is_primary``。
 
     根因：平台允许同一岗位**多条发布**（同公司同岗、不同 job_id），job_id 去重抓不到，
     只能靠内容指纹识别。标记出来（而不是删掉——猎头岗有时是唯一渠道），让消费端
     能一眼看出重复。
+
+    组号用**稳定哈希**（见 ``stable_group_id``）→ 同一份内容跨进程/跨 run 永远
+    得到同一个组号（可复现、可跨天合并）。
     """
     fingerprint_by_id, sizes = group_duplicates(jobs)
     groups = {}
@@ -404,7 +428,7 @@ def mark_duplicate_groups(jobs):
                 job["dup_size"] = 1
                 job["is_primary"] = True
             continue
-        group_id = f"dup-{abs(hash(fp)) % 10 ** 8:08d}"
+        group_id = f"dup-{stable_group_id(fp)}"
         for index, job in enumerate(members):
             job["dup_group"] = group_id
             job["dup_size"] = len(members)
