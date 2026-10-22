@@ -30,6 +30,7 @@
 
 import re
 import unicodedata
+from collections import Counter
 
 try:
     from scripts import job_model as _model
@@ -224,37 +225,129 @@ _EXTRACT_FAILURE_PATTERNS = (
 )
 
 
-def filter_by_relevance(jobs, recruit_types=None, industry_allow=None):
+def filter_by_relevance(jobs, recruit_types=None, industry_allow=None,
+                         industry_block=None, only_relevant_title=False):
     """**零成本的相关度过滤**（在列表阶段做，丢掉的不进详情 → 也不耗额度）。
 
     - ``recruit_types``: 只保留这些招聘类型（social/intern/campus）；
-    - ``industry_allow``: 只保留这些行业（``None``=按模型默认白名单；``[]``=不过滤）。
+    - ``industry_allow``: 只保留这些行业（**默认不过滤**；给了才生效）；
+    - ``industry_block``: 丢掉这些行业（用户显式指定的"明显无关行业"）；
+    - ``only_relevant_title``: 只保留标题是产品经理/AI 方向的岗位。
 
-    返回 ``(kept, dropped_detail)``，dropped_detail 说明每类丢了多少（不静默丢）。
+    返回 ``(kept, dropped_detail)``：dropped_detail 含每类丢了多少 + **丢掉的清单**
+    （不静默丢——用户要能核对丢的是什么、为什么丢）。
     """
-    if industry_allow is None:
-        industry_allow = _model.DEFAULT_INDUSTRY_ALLOW
-    allow_set = {str(x).strip() for x in industry_allow if str(x).strip()}
+    allow_set = {str(x).strip() for x in (industry_allow or []) if str(x).strip()}
+    block_set = {str(x).strip() for x in (industry_block or []) if str(x).strip()}
     type_set = {str(x).strip() for x in (recruit_types or []) if str(x).strip()}
-    kept, dropped = [], {"recruit_type": 0, "industry": 0, "no_industry": 0}
+    kept = []
+    dropped = {"recruit_type": 0, "industry_block": 0, "industry_allow": 0,
+               "title_relevance": 0, "no_industry": 0, "items": []}
     for job in jobs or []:
         if not isinstance(job, dict):
             continue
+        reason = ""
         if type_set:
             rtype = _model.classify_recruit_type(job)
             if rtype not in type_set:
+                reason = f"招聘类型={rtype}（不在要的类型里）"
                 dropped["recruit_type"] += 1
-                continue
-        if allow_set:
+        if not reason and block_set:
+            industry = _model.industry_of(job)
+            if industry and industry in block_set:
+                reason = f"行业={industry}（在排除名单里）"
+                dropped["industry_block"] += 1
+        if not reason and allow_set:
             industry = _model.industry_of(job)
             if not industry:
-                # 行业缺失（平台没给）→ 不静默丢，计入 no_industry 供人判断
                 dropped["no_industry"] += 1
             elif industry not in allow_set:
-                dropped["industry"] += 1
-                continue
+                reason = f"行业={industry}（不在要的行业里）"
+                dropped["industry_allow"] += 1
+        if not reason and only_relevant_title and not _model.is_relevant_title(job):
+            reason = f"标题={str(job.get('title') or '')[:16]}（不是产品/AI 方向）"
+            dropped["title_relevance"] += 1
+        if reason:
+            dropped["items"].append({
+                "title": str(job.get("title") or ""),
+                "company": str(job.get("company_name") or ""),
+                "industry": _model.industry_of(job),
+                "reason": reason,
+            })
+            continue
         kept.append(job)
     return kept, dropped
+
+
+def list_stage_audit(jobs, keywords=None, job_expectation=""):
+    """**列表层体检**（在抓详情之前做——问题要在便宜的一层暴露）。
+
+    用户 2026-10-22 的原话："当时在列表的时候，你就应该反映到这些问题，
+    而不是现在才发现"。列表层 10 个请求 vs 详情层 700 个请求，且关键词失配、
+    方向跑偏、平台"求职期望"污染在这一层全都看得见。
+
+    返回一个 dict：方向分布 / 关键词命中率 / 行业分布 / 招聘类型分布 /
+    期望设置 / 风险提示列表。
+    """
+    jobs = jobs or []
+    total = len(jobs)
+    if not total:
+        return {"total": 0, "direction_counts": {}, "keyword_hit_rate": None,
+                "industry_top": [], "recruit_type_counts": {}, "job_expectation": "",
+                "warnings": []}
+
+    directions = Counter()
+    industries = Counter()
+    recruit_types = Counter()
+    off_samples = []
+    for job in jobs:
+        is_ai_pm, label, _evidence = _model.classify_direction(job)
+        directions[label] += 1
+        industry = _model.industry_of(job) or "(平台未提供)"
+        industries[industry] += 1
+        rtype = _model.classify_recruit_type(job)
+        recruit_types[rtype] += 1
+        if label not in ("ai_pm",) and len(off_samples) < 8:
+            off_samples.append(f"{str(job.get('title') or '')[:16]}"
+                               f"｜{str(job.get('company_name') or '')[:12]}")
+
+    keywords = [k for k in (keywords or []) if str(k).strip()]
+    hit_rate = None
+    hits = 0
+    if keywords:
+        for job in jobs:
+            title = str(job.get("title") or "").lower()
+            if any(str(k).strip().lower() in title for k in keywords):
+                hits += 1
+        hit_rate = hits / total
+
+    warnings = []
+    if hit_rate is not None and hit_rate < 0.6:
+        warnings.append(
+            f"标题与关键词命中率仅 {hit_rate:.0%}（{hits}/{total}）——"
+            f"这批岗位大多不是关键词要找的方向（平台模糊召回 + 求职期望影响）")
+    non_ai_pm = total - directions.get("ai_pm", 0)
+    if total and non_ai_pm / total > 0.4:
+        warnings.append(
+            f"只有 {directions.get('ai_pm', 0)}/{total} 条是 AI 方向产品岗，"
+            f"其余 {non_ai_pm} 条是别的方向（产品/非产品）——"
+            f"若目标是 AI 产品经理，应在抓详情前按方向过滤")
+    if job_expectation and any(word in str(job_expectation)
+                                for word in ("房地产", "中介", "置业", "房产")):
+        warnings.append(
+            f"平台「求职期望」当前是「{job_expectation}」——平台会据此混入该行业岗位，"
+            f"建议清空或改成目标行业后再抓（设置在 BOSS 直聘 网页端）")
+    return {
+        "total": total,
+        "direction_counts": dict(directions),
+        "keyword_hit_rate": hit_rate,
+        "keyword_hits": hits,
+        "industry_top": industries.most_common(10),
+        "recruit_type_counts": dict(recruit_types),
+        "job_expectation": str(job_expectation or ""),
+        "off_direction_samples": off_samples,
+        "warnings": warnings,
+    }
 
 
 def classify_extract_failure(message, page_text=""):

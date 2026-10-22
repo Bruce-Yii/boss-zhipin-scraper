@@ -205,6 +205,34 @@ FIELD_SPECS: tuple = (
               (_M_EXPORT, _M_SEMANTICS)),
     FieldSpec("is_primary", SOURCE_DERIVED, "bool", "是否重复组内首条",
               (_M_EXPORT, _M_SEMANTICS)),
+    # ── 独立验收 2026-10-22 要求补的字段 ──────────────────────────
+    FieldSpec("is_ai_pm", SOURCE_DERIVED, "bool",
+              "是否 AI 方向的产品岗（审计实测 32.6% 的检索结果与 AI 无关）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("direction", SOURCE_DERIVED, "str",
+              "方向标签（ai_pm / pm_only / ai_other / other）",
+              (_M_EXPORT, _M_SUMMARY), required=True),
+    FieldSpec("direction_evidence", SOURCE_DERIVED, "list",
+              "方向判定命中的信号词（可复核，不给黑箱结论）",
+              (), delivery_only=True,
+              notes="交付给用户核对判定依据：不让用户只能接受一个黑箱结论"),
+    FieldSpec("salary_min", SOURCE_DERIVED, "str",
+              "薪资下界（元/月 或 元/天，可排序）",
+              (), delivery_only=True, required=True,
+              notes="交付给用户排序用：同一列混装月薪与日薪会让 Excel 文本排序完全错位"
+                    "（审计实测 150-200K·16薪 排到第 396 位）"),
+    FieldSpec("salary_max", SOURCE_DERIVED, "str",
+              "薪资上界（元/月 或 元/天，可排序）",
+              (), delivery_only=True, required=True,
+              notes="交付给用户排序用（与 salary_min 同源）"),
+    FieldSpec("salary_unit", SOURCE_DERIVED, "str",
+              "薪资单位（month 月 / day 日 / year 年 / 空=面议）",
+              (), delivery_only=True, required=True,
+              notes="交付给用户排序用：日薪与月薪不是同一量纲，必须分开"),
+    FieldSpec("months_per_year", SOURCE_DERIVED, "str",
+              "薪月数（如 16薪；空=按 12 个月）",
+              (), delivery_only=True,
+              notes="交付给用户算年包用（16薪 ≠ 16 个月月薪）"),
 )
 
 FIELD_INDEX = {spec.name: spec for spec in FIELD_SPECS}
@@ -325,16 +353,19 @@ def classify_post_type(job) -> str:
     return "direct"
 
 
-# 默认行业白名单（2026-10-22 从 294 条真实数据里取"目标行业"那一簇）。
-# 平台对"产品经理"这类词是**模糊召回**：搜 AI 产品经理会带回房地产经纪、餐饮、支付、
-# 医药快消、工厂信息化等别的行业的产品经理岗（实测 109 条 JD 首 400 字命中非目标行业
-# 词）。**行业是平台自己给的字段 → 在列表阶段丢弃，零额外请求**（省下的还有详情页额度）。
-# 白名单偏保守：只保留互联网/软件/AI/电商/企业服务这一簇；要全要传 --industry-allow ""。
-DEFAULT_INDUSTRY_ALLOW = (
-    "互联网", "人工智能", "计算机软件", "计算机服务", "电子商务", "企业服务",
-    "广告营销", "社交网络与媒体", "生活服务(O2O)", "O2O", "大数据", "游戏",
-    "通信/网络设备", "智能硬件", "智能硬件/消费电子", "移动互联网", "信息安全",
-    "在线教育", "新零售", "学术/科研", "互联网金融",
+# **默认不过滤行业**（2026-10-22 实测 933 条 / 90 个行业后推翻的旧做法）：
+# 旧的"技术行业白名单"会**丢掉真岗位**——餐饮 4 条 100% 是产品经理岗（餐饮产品经理、
+# 炸物品类规划、烘焙市场产品经理、AI 餐饮全链路）；房地产中介/租赁里的"产品经理｜贝壳
+# 青鸟筑家"是正经 SaaS 房源管理产品岗；培训/辅导、进出口贸易、基金也全是 AI/产品岗。
+# → **行业 ≠ 相关性**。行业过滤只能是**用户显式指定的黑名单**（--industry-block），
+# 且必须把丢掉的清单打出来（不静默丢）。
+DEFAULT_INDUSTRY_ALLOW = ()   # 空 = 不过滤
+
+# 标题相关性：命中即视为"目标方向"（产品经理 / AI 方向）
+RELEVANCE_TITLE_TERMS = (
+    "产品经理", "产品负责人", "产品总监", "产品运营", "产品规划", "产品线",
+    "产品专家", "产品企划", "产品助理", "产品专员", "产品设计", "产品经理实习",
+    "PM", "AI", "AIGC", "人工智能", "大模型", "算法", "智能", "数智", "Agent",
 )
 
 # 招聘类型（记录级语义）：social 社招 / intern 实习 / campus 校招
@@ -361,9 +392,128 @@ def content_fingerprint(job, head=180) -> str:
     jd = _normalize_jd(job.get("jd"))[:head]
     if not jd:
         return ""
-    salary = re.sub(r"\s+", "", str(job.get("salary") or ""))
     city = normalize_title(job.get("location"))[:12]
-    return f"{jd}|{salary}|{city}"
+    # 刻意**不含薪资**：同一条岗被重复投放时薪资带常被微调（实测 "11-20K" vs "12-20K"
+    # 导致同公司同岗漏标重复），薪资是发布口径不是内容。
+    return f"{jd}|{city}"
+
+
+def is_relevant_title(job) -> bool:
+    """标题是否是**目标方向**（产品经理方向 + AI 信号）。
+
+    刻意**不看行业**（实测证明行业与相关性无关）；也不用"标题里出现 AI 就算"——
+    独立审计实测"AI招聘&猎头方向实习生"这类是招聘岗不是产品岗（AI 只是修饰词）。
+    判定复用 :func:`classify_direction`（产品词 + AI 信号同时命中才算）。
+    """
+    _is_ai_pm, label, _evidence = classify_direction(job)
+    return label == "ai_pm"
+
+
+# 方向判定的 AI 信号（独立审计 2026-10-22：合并文件 152/466 条在
+# 标题+JD+技能全链路找不到任何 AI 痕迹——却是"AI产品经理"检索的结果）
+AI_DIRECTION_TERMS = (
+    "AI", "AIGC", "人工智能", "大模型", "LLM", "大语言模型", "生成式", "GPT",
+    "智能体", "Agent", "算法", "机器学习", "深度学习", "多模态", "NLP",
+    "计算机视觉", "CV", "知识图谱", "RAG", "向量", "推理模型",
+)
+PM_DIRECTION_TERMS = (
+    "产品经理", "产品负责人", "产品总监", "产品运营", "产品规划", "产品线",
+    "产品专家", "产品企划", "产品设计", "产品专员", "产品助理", "产品策划",
+    "产品需求", "PM",
+)
+
+
+def parse_salary_parts(salary):
+    """把薪资串拆成**可排序的结构化列**。
+
+    独立审计 2026-10-22 实测：同一列里混着月薪 ``15-25K``、月薪带薪月数
+    ``150-200K·16薪`` 和日薪 ``150-200元/天`` → Excel 文本降序把真正的
+    ``150-200K·16薪`` 排到第 396 位，日薪排第 1、2 位。求职者最常见的
+    "按薪资排序挑最值得投"因此完全失效。
+
+    返回 ``(min, max, unit, months_per_year)``：
+    - unit: ``"month"`` / ``"day"`` / ``"year"`` / ``""``（面议/无法解析）
+    - min/max: 数值（元/月 或 元/天；月薪按千元×1000 换算成元）
+    - months_per_year: 薪月数（如 16薪 → 16；无则 12）
+    """
+    text = str(salary or "").strip()
+    if not text or text in {"面议", "negotiable", "不限"}:
+        return "", "", "", ""
+    months = ""
+    if "·" in text:
+        head, _, tail = text.partition("·")
+        tail = tail.strip()
+        if tail.endswith("薪"):
+            tail = tail[:-1]
+        if tail.isdigit():
+            months = tail
+        text = head.strip()
+    unit = ""
+    if "元/天" in text or "/天" in text:
+        unit = "day"
+        text = text.replace("元/天", "").replace("/天", "")
+    elif "元/小时" in text:
+        unit = "hour"
+        text = text.replace("元/小时", "")
+    elif "元/时" in text:
+        unit = "hour"
+        text = text.replace("元/时", "")
+    elif "元/年" in text:
+        unit = "year"
+        text = text.replace("元/年", "")
+    elif "K" in text.upper():
+        unit = "month"
+        text = text.upper().replace("K", "")
+    elif "元/月" in text:
+        unit = "month"
+        text = text.replace("元/月", "")
+    elif "元" in text:
+        unit = "month"
+        text = text.replace("元", "")
+    nums = [n for n in re.findall(r"\d+(?:\.\d+)?", text)]
+    if not nums:
+        return "", "", unit, months
+    low = float(nums[0])
+    high = float(nums[-1])
+    if unit == "month" and low <= 999:      # 15-25K → 15000-25000
+        low, high = low * 1000, high * 1000
+    return (str(int(low)) if float(low).is_integer() else str(low),
+            str(int(high)) if float(high).is_integer() else str(high),
+            unit, months)
+
+
+def classify_direction(job):
+    """岗位方向判定：**是不是 AI 方向的产品岗**。
+
+    独立审计 2026-10-22 实测：搜"AI产品经理"回来的 466 条里 152 条（32.6%）
+    在标题+JD+技能全链路找不到任何 AI 痕迹（餐饮产品经理、炊具产品经理、
+    储能产品经理、天文产品经理…）→ 求职者按薪资排序时先看到的就是这批。
+
+    返回 ``(is_ai_pm, label, evidence)``：
+    - label: ``"ai_pm"``（AI 方向产品岗）/ ``"pm_only"``（产品岗但无 AI 信号）/
+      ``"other"``（标题既不是产品岗也不是 AI 岗）
+    - evidence: 命中的信号词（让判定可复核，不给黑箱结论）
+    """
+    if not isinstance(job, dict):
+        return False, "other", []
+    title = str(job.get("title") or "")
+    jd = str(job.get("jd") or "")
+    skills = job.get("skill_tags") or job.get("skills") or []
+    if isinstance(skills, str):
+        skills = [skills]
+    skill_text = " ".join(str(s) for s in skills)
+    blob = f"{title}\n{jd}\n{skill_text}"
+
+    ai_hits = [t for t in AI_DIRECTION_TERMS if t.lower() in blob.lower()]
+    pm_hits = [t for t in PM_DIRECTION_TERMS if t.lower() in title.lower()]
+    title_ai = [t for t in AI_DIRECTION_TERMS if t.lower() in title.lower()]
+    if pm_hits and (ai_hits or title_ai):
+        return True, "ai_pm", sorted(set(ai_hits + pm_hits))[:6]
+    if pm_hits:
+        return False, "pm_only", pm_hits[:4]
+    if ai_hits:
+        return False, "ai_other", sorted(set(ai_hits))[:4]
+    return False, "other", []
 
 
 def industry_of(job) -> str:
@@ -506,6 +656,16 @@ class JobRecord:
         self.data["recruit_type"] = classify_recruit_type(self.data)
         self.data["active_state"] = active_state(self.data.get("boss_active_status"))
         self.data["title_key"] = normalize_title(self.data.get("title"))
+        # 方向判定（是不是 AI 方向的产品岗）+ 薪资拆列（可排序，见 parse_salary_parts）
+        is_ai_pm, direction, evidence = classify_direction(self.data)
+        self.data["is_ai_pm"] = is_ai_pm
+        self.data["direction"] = direction
+        self.data["direction_evidence"] = evidence
+        low, high, unit, months = parse_salary_parts(self.data.get("salary"))
+        self.data["salary_min"] = low
+        self.data["salary_max"] = high
+        self.data["salary_unit"] = unit
+        self.data["months_per_year"] = months
         if link_verified_at:
             self.data["link_verified_at"] = link_verified_at
         self.data.setdefault("dup_group", "")

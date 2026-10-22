@@ -279,6 +279,20 @@ def _recruit_type_of(job):
     return _model.classify_recruit_type(job)
 
 
+def _direction_counts(jobs):
+    counts = Counter()
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        counts[_direction_of(job) or "other"] += 1
+    return dict(counts)
+
+
+def _direction_of(job):
+    """方向标签（转发到岗位模型）：ai_pm / pm_only / ai_other / other。"""
+    return str(job.get("direction") or "") or _model.classify_direction(job)[1]
+
+
 def _post_type_of(job):
     """发布主体类型（direct/agency/anonymous）；判定由岗位模型统一提供。"""
     return _model.classify_post_type(job)
@@ -748,6 +762,12 @@ def _build_summary_from_retained(
         "salary_market_social_direct": social_direct_market,
         "recruit_type_counts": _recruit_type_counts(jobs),
         "non_social_count": non_social_count,
+        # 方向分布（2026-10-22）：平台对"产品经理"是模糊召回，搜 AI 产品经理会带回
+        # 纯行业产品岗（实测 32.6%）→ 摘要必须说清其中多少是真目标方向。
+        "direction_counts": _direction_counts(jobs),
+        "ai_pm_count": sum(1 for j in jobs
+                           if str(j.get("is_ai_pm") or "") == "True"
+                           or _direction_of(j) == "ai_pm"),
         # 样本量警示：可解析薪资 <30 时结论仅供参考（第四轮统计口径）
         "sample_warning": (market.get("parsed", 0) > 0
                            and market.get("parsed", 0) < 30),
