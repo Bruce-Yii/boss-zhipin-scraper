@@ -4221,49 +4221,38 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
 # 抓取详情
 # ============================================================
 def build_detail_record(job, extracted):
-    link = job.get("job_link", "")
+    """详情记录 = **岗位模型记录**（列表侧 + 详情侧合一）。
+
+    2026-10-22 修：此前详情记录是**另一套手写 schema**（只 23 个字段，缺 company_name
+    等 16 个列表侧字段），导致
+    - `--detail-output` 的记录不满足导出契约（契约要求 company_name，详情只有 company）；
+    - CSV 是从详情记录写的 → 46 列里 **32 列整列全空**（用户拿到的表三分之二是空的）；
+    - 详情输出与导出两套字段集（双轨）。
+
+    现在由模型统一产生：列表侧 + 详情侧 + 派生语义 + 内部字段剔除（红线），
+    详情输出与导出**同一套 schema**。
+    """
     boss_active_status = resolve_boss_active_status(
         list_status=job.get("boss_active_status", ""),
         detail_status=extracted.get("boss_active_status", ""),
     )
-    return {
-        "job_id": job.get("job_id", ""),
-        "title": job.get("title", ""),
-        "company": job.get("boss_name", ""),
-        "salary": job.get("salary", ""),
-        "salary_source": job.get("salary_source", ""),
-        "location": job.get("location", ""),
-        "boss_active_status": boss_active_status,
-        "tags_list": job.get("tags", ""),
-        "job_link": link,
-        "link": link,
-        "skill_tags": extracted.get("tags", []),
-        "jd": extracted.get("jd", ""),
-        "page_update_date": extracted.get("page_update_date", ""),
-        # 详情 API 通道新增可选字段（2026-08-14；用户拍板精简范围；DOM 路径缺省空，兼容）
-        "job_status_desc": extracted.get("job_status_desc", ""),
-        "brand_introduce": extracted.get("brand_introduce", ""),
-        "brand_stage_name": extracted.get("brand_stage_name", ""),
-        "brand_scale_name": extracted.get("brand_scale_name", ""),
-        "brand_industry_name": extracted.get("brand_industry_name", ""),
-        "brand_active_time": extracted.get("brand_active_time", ""),
-        # ── 语义层标注（2026-10-22）──
-        # post_type: 发布主体类型（direct 企业直招 / agency 猎头代发 / anonymous 匿名）。
-        #   平台在列表侧已用 proxy_job/proxy_type 标注，此前我们从不语义化使用 →
-        #   猎头代发岗（公司名匿名、薪资带虚高：实测 25 条代理岗 11 条上限 ≥50K，
-        #   企业直招岗 0 条）混在结果里，求职端无法分辨。
-        "post_type": classify_post_type(job),
-        # title_key: 标题归一化键（分组/匹配用，展示仍用平台原值）
-        "title_key": normalize_title(job.get("title", "")),
-        # recruit_type: 招聘类型（social 社招 / intern 实习 / campus 校招）。
-        #   平台的 jobType 实证：4=实习（日薪制）、5=校招（经验=在校/应届）、
-        #   空=社招。实测 35 条实习/校招岗混在社招里（8.5%），薪资口径不可比。
-        "recruit_type": _semantics.classify_recruit_type(job),
-        # link_verified_at: 该链接在**抓取时刻**被验证指向这个岗位。平台 URL 含
-        #   securityId 段（只用 job_id 拼会 404）→ 链接不能由 job_id 重建，耐久主键是
-        #   job_id；链接本身跨天稳定（实测隔天真导航打开仍是同一岗位）。
-        "link_verified_at": datetime.now().isoformat(timespec="seconds"),
-    }
+    payload = dict(job)
+    payload["boss_active_status"] = boss_active_status
+    # 详情 API 通道的可选字段（2026-08-14；DOM 路径缺省空，兼容）
+    detail_payload = dict(extracted or {})
+    for key in ("job_status_desc", "brand_introduce", "brand_stage_name",
+                "brand_scale_name", "brand_industry_name", "brand_active_time"):
+        detail_payload.setdefault(key, "")
+
+    record = _job_model.JobRecord.from_detail_payload(
+        payload, detail_payload,
+        link_verified_at=datetime.now().isoformat(timespec="seconds"))
+    row = record.to_public_dict()
+    # 历史别名（保持详情输出的向后兼容；规范名仍是 model 的 company_name/tags/job_link）
+    row["company"] = row.get("company_name", "")
+    row["tags_list"] = row.get("tags", "")
+    row["link"] = row.get("job_link", "")
+    return row
 
 
 def eval_detail_with_retry(ws, sid, detail_url, retries=1):
