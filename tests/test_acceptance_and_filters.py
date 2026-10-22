@@ -9,11 +9,8 @@
 """
 
 import importlib.util
-import json
-import os
 import pathlib
 import sys
-import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
