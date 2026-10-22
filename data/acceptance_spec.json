@@ -180,6 +180,7 @@
     "brand_stage_name",
     "brand_industry_name",
     "brand_active_time",
+    "risk_flags",
     "post_type",
     "recruit_type",
     "active_state",
@@ -204,7 +205,8 @@
     "link_verified_at": "str",
     "skills": "list[str]",
     "skill_tags": "list[str]",
-    "direction_evidence": "list[str]"
+    "direction_evidence": "list[str]",
+    "risk_flags": "list[str]"
   },
   "field_types_note": "只登记**类型漂移会直接坑到消费者**的字段：列表型字段（skill_tags/skills）漂移成字符串，消费端按数组读就会炸；文本型字段漂移成数组/对象同理。数值型字段（dup_size/is_primary/salary_min）刻意不登记——它们在不同链路上可能是数字也可能是数字串，强判会误伤。",
   "thresholds": {
