@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.18.5"
+__version__ = "2.19.0"
 
 import argparse
 import base64
@@ -1905,6 +1905,40 @@ _JD_NOISE_TOKENS = frozenset((
     "收藏", "立即沟通", "投诉", "下载APP", "下载 APP",
 ))
 
+# 页面模块行（薪资详情 / 社保类型 / 活跃标签 / 招聘职位 …）的判定口径
+# **只有一处**：scripts/semantics.py 的 check_invariants（验收器
+# scripts/acceptance.py 已改为委托它）。本模块**不再抄第二份标记表**——
+# 2026-10-22 独立审计实测两份副本已经漂移（验收器多认 6 个标记，实现侧一个不认）。
+_JD_PAGE_MODULE_MAX_CHARS = 24
+
+
+def _semantic_junk_hit(text):
+    """语义层认为这段文字是「页面模块垃圾」吗（问唯一实现，不自己判）。"""
+    snippet = str(text or "")
+    if not snippet:
+        return False
+    invariants = _semantics.check_invariants([{"jd": snippet}])
+    info = invariants.get("no_junk_tail") or {}
+    return not info.get("ok", True)
+
+
+def _is_jd_page_module_line(line):
+    """这一行是详情页的**页面模块**（而不是招聘方写的正文）吗？
+
+    两个条件缺一不可：
+    1. 语义层（唯一实现）判定它含页面模块标记；
+    2. 标记落在**行首**且整行很短——正文里顺口提到「提成方式」这种句子
+       不能被当成页面模块删掉（子串命中 ≠ 页面模块）。
+    """
+    text = str(line or "").strip()
+    if not text or len(text) > _JD_PAGE_MODULE_MAX_CHARS:
+        return False
+    if not _semantic_junk_hit(text):
+        return False
+    if len(text) > 6 and not _semantic_junk_hit(text[:6]):
+        return False
+    return True
+
 
 def _is_jd_noise_line(line):
     """整行仅由 UI 噪声 token 组成（空白 / · / | 分隔）→ True。"""
@@ -1913,9 +1947,11 @@ def _is_jd_noise_line(line):
 
 
 def strip_jd_noise(text):
-    """逐行剥离 JD 噪声行（详情页 UI 文案）；空行交由归一化处理。"""
+    """逐行剥离 JD 噪声行（详情页 UI 文案 + 页面模块文案）；空行交由归一化处理。"""
     lines = str(text or "").replace("\r\n", "\n").split("\n")
-    return "\n".join(line for line in lines if not _is_jd_noise_line(line))
+    return "\n".join(line for line in lines
+                     if not _is_jd_noise_line(line)
+                     and not _is_jd_page_module_line(line))
 
 
 # ============================================================
@@ -2422,12 +2458,145 @@ def _recruiter_footer_info(lines):
         start, status = card_info(marker_index)
         if start is not None:
             return start, status
+
+    # 结构特征没命中 → 按**内容特征**再找一次（卡片常在「BOSS 安全提示」之前；
+    # 尾巴上还有页面模块时，不能因为「最后一行不是卡片」就放弃）。
+    limit = end
+    try:
+        limit = min(limit, stripped_lines.index(DETAIL_SAFETY_MARKER))
+    except ValueError:
+        pass
+    start, status = _recruiter_card_tail(lines, limit)
+    if start is not None:
+        return start, status
+
     return card_info(end)
+
+
+# 招聘者卡片的**内容特征**（2026-10-22 审计补）。
+# 卡片是「姓名 → 活跃度 → 公司(·职位)」顺序的尾块；新版页面把它压成一行，
+# 或者只剩姓名行——旧判据（倒数第 2 行是孤立的「·」）对这些形态全部失配。
+_RECRUITER_NAME_RE = re.compile(
+    r"^[一-鿿]{1,3}(?:先生|女士)(?:[（(][^）)]{0,6}[）)])?$")
+_RECRUITER_POSITION_RE = re.compile(r"^[^·\n]{2,30}·[^·\n]{1,12}$")
+_RECRUITER_ACTIVITY_WORDS = ("已离职", "离职中", "在职", "可联系", "暂不可联系")
+
+
+def _is_recruiter_activity_line(text):
+    """招聘者活跃行：「在线」「今日活跃」「离职中」…"""
+    line = str(text or "").strip()
+    if not line:
+        return False
+    if _is_boss_activity_line(line):
+        return True
+    return line in _RECRUITER_ACTIVITY_WORDS
+
+
+def _is_recruiter_company_line(text):
+    """卡片里的公司行：短、不带句读；「公司·职位」也算。"""
+    line = str(text or "").strip()
+    if not (2 <= len(line) <= 30):
+        return False
+    if _RECRUITER_POSITION_RE.match(line):
+        return True
+    return not any(ch in line for ch in "。！？；，、:：!?,;")
+
+
+def _blank_line_before(lines, index):
+    """该行前面是否隔着一个空行（独立成块的信号）。"""
+    if index <= 0:
+        return False
+    return not lines[index - 1].strip()
+
+
+def _recruiter_card_tail(lines, limit=None):
+    """按**内容特征**识别 JD 尾部的招聘者卡片。
+
+    返回 ``(起始行号, 活跃度文案)``；没有卡片返回 ``(None, "")``。
+
+    判据是**组合特征**而不是关键词黑名单——正文里真的会出现「HR」「在线」
+    字样，所以只有「姓名 + 活跃度 + 公司」这种结构才算招聘者卡片。
+    """
+    region = lines[:limit] if limit is not None else lines
+    filled = [i for i, line in enumerate(region) if line.strip()]
+    if not filled:
+        return None, ""
+
+    def text_at(index):
+        return region[index].strip()
+
+    # 三行形态：姓名 + 活跃度 + 公司（公司·职位 或 纯公司名）
+    if len(filled) >= 3:
+        name, activity, company = (text_at(i) for i in filled[-3:])
+        if (_RECRUITER_NAME_RE.match(name)
+                and _is_recruiter_activity_line(activity)
+                and _is_recruiter_company_line(company)):
+            return filled[-3], activity
+    # 两行形态：姓名 + 公司·职位（职位明确，不会误伤正文）
+    if len(filled) >= 2:
+        name, second = text_at(filled[-2]), text_at(filled[-1])
+        if _RECRUITER_NAME_RE.match(name) and _RECRUITER_POSITION_RE.match(second):
+            return filled[-2], ""
+    # 单行形态：只剩姓名——要求它前面隔着一个空行（独立成块，不是正文句子）
+    if _RECRUITER_NAME_RE.match(text_at(filled[-1])):
+        if _blank_line_before(region, filled[-1]):
+            return filled[-1], ""
+    return None, ""
 
 
 def _recruiter_footer_start(lines):
     start, _status = _recruiter_footer_info(lines)
     return start
+
+
+def _cut_leading_description_marker(lines):
+    """切掉正文**首行**的「职位描述」小标题（含紧随其后的分隔符）。
+
+    只有标记位于**首行**时才切。正文中段再出现「职位描述」是招聘方自己写的
+    小标题（如「【职位描述】」或「职位描述：」），切了会把标记之前的正文整段
+    丢掉——2026-10-22 独立审计实测 10 条 JD 头部被截（最严重 81a080c6c9a9187e
+    交付 400 字 / 线上 619 字，丢了开头 219 字 / 35%），交付的 JD 以孤立的
+    「：」或「】」开头。
+    """
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if DETAIL_DESCRIPTION_MARKER not in line:
+            return lines
+        _, _, tail = line.partition(DETAIL_DESCRIPTION_MARKER)
+        tail = re.sub(r"^[\s:：\]】]+", "", tail)
+        return ([tail] if tail else []) + lines[index + 1:]
+    return lines
+
+
+def _is_skill_tag_line(line, tag_set):
+    """这一行是不是平台技能标签（整行都由标签拼成）。"""
+    parts = [part for part in str(line or "").split() if part]
+    if not parts:
+        return False
+    return all(part in tag_set for part in parts)
+
+
+def _strip_leading_skill_tags(lines, tags):
+    """去掉 JD 开头粘着的**平台技能标签**行。
+
+    页面容器兜底取正文时，技能标签（.job-keyword-list）和正文在同一块里 →
+    标签行粘在 JD 最前面（2026-10-22 审计实测 4 条：ab241aa3a8fc1f8f /
+    45da13a91f687539 / 0cf93290fe03340d / 6bcff8742cf1d857）。判定靠**内容**：
+    该行与详情侧抓到的技能标签完全一致 → 是平台标签，不是招聘方写的正文。
+    """
+    tag_set = {str(tag).strip() for tag in (tags or []) if str(tag).strip()}
+    if not tag_set:
+        return lines
+    out = list(lines)
+    while out:
+        index = next((i for i, line in enumerate(out) if line.strip()), None)
+        if index is None:
+            break
+        if not _is_skill_tag_line(out[index], tag_set):
+            break
+        del out[index]
+    return out
 
 
 def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
@@ -2454,12 +2623,21 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
         raise DetailExtractionError("detail page rendered navigation chrome without a JD")
 
     text = raw_jd
+    from_page_text = False
     if not text and DETAIL_DESCRIPTION_MARKER in page_text:
-        text = page_text
-    if DETAIL_DESCRIPTION_MARKER in text:
-        text = text.split(DETAIL_DESCRIPTION_MARKER, 1)[1]
+        # 页面正文兜底：标记之前全是页面框架（岗位名/导航/公司卡）→ 在标记处切
+        text = page_text.split(DETAIL_DESCRIPTION_MARKER, 1)[1]
+        from_page_text = True
 
-    lines = text.replace("\r\n", "\n").splitlines()
+    lines = text.replace("\r\n", "\n").split("\n")
+    # 1) 先剥 UI 文案行——否则「职位描述」前面隔着噪声行时判不出它在首行
+    lines = [line for line in lines if not _is_jd_noise_line(line)]
+    # 2) 「职位描述」小标题：只在**首行**切（正文中段出现的是招聘方自己写的）
+    if not from_page_text:
+        lines = _cut_leading_description_marker(lines)
+    # 3) 平台技能标签行（容器兜底取正文时粘在 JD 最前面）
+    lines = _strip_leading_skill_tags(lines, extracted.get("tags"))
+    # 4) 尾部：招聘者卡片（结构 + 内容两种特征）/ BOSS 安全提示
     footer_start, boss_active_status = _recruiter_footer_info(lines)
     if footer_start is not None:
         lines = lines[:footer_start]
@@ -2468,8 +2646,10 @@ def extract_detail_fields(extracted, min_length=MIN_DETAIL_TEXT_LENGTH):
             if line.strip() == DETAIL_SAFETY_MARKER:
                 lines = lines[:index]
                 break
+    # 5) 页面模块行（语义层唯一判定的垃圾尾标记）
+    lines = [line for line in lines if not _is_jd_page_module_line(line)]
 
-    jd = _normalize_detail_whitespace(strip_jd_noise("\n".join(lines)))
+    jd = _normalize_detail_whitespace("\n".join(lines))
     if len(jd) < min_length:
         raise DetailExtractionError(
             f"job description too short after validation: {len(jd)} < {min_length}"
@@ -3921,14 +4101,14 @@ def page_fingerprint(jobs):
 def scrape_list(keyword, city_input, max_pages, filters, output_path,
                 cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
                 max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr",
-                lock_already_held=False):
+                lock_already_held=False, filter_options=None):
     """列表抓取入口；默认持有 run 锁，显式上层持锁时只执行实际抓取。"""
     if lock_already_held:
         return _scrape_list_impl(
             keyword, city_input, max_pages, filters, output_path,
             cdp_port=cdp_port, fmt=fmt, allow_dom_fallback=allow_dom_fallback,
             max_jobs=max_jobs, max_concurrent=max_concurrent,
-            pages_parallel=pages_parallel, list_mode=list_mode)
+            pages_parallel=pages_parallel, list_mode=list_mode, filter_options=filter_options)
     if not acquire_scrape_lock(max_concurrent=max_concurrent):
         city_name, city_code = resolve_city(city_input)
         print("❌ 已有抓取任务在运行（并发已达上限），本次拒绝启动。")
@@ -3940,14 +4120,15 @@ def scrape_list(keyword, city_input, max_pages, filters, output_path,
             keyword, city_input, max_pages, filters, output_path,
             cdp_port=cdp_port, fmt=fmt, allow_dom_fallback=allow_dom_fallback,
             max_jobs=max_jobs, max_concurrent=max_concurrent,
-            pages_parallel=pages_parallel, list_mode=list_mode)
+            pages_parallel=pages_parallel, list_mode=list_mode, filter_options=filter_options)
     finally:
         release_scrape_lock()
 
 
 def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                       cdp_port=DEFAULT_CDP_PORT, fmt="json", allow_dom_fallback=False,
-                      max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr"):
+                      max_jobs=None, max_concurrent=1, pages_parallel=1, list_mode="xhr",
+                      filter_options=None):
     city_name, city_code = resolve_city(city_input)
     cdp = None
     tid = None
@@ -4334,6 +4515,12 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
 
     if all_jobs:
         # 最终写入（含时间戳更新 + run 级血缘字段 + B 增量观察集合）
+        # 相关度过滤在**最终写盘之前**应用 → 列表 JSON 与列表 CSV 的口径
+        # 与控制台、与详情阶段完全一致（独立审计 F2）。
+        if filter_options:
+            _filtered = {"jobs": all_jobs}
+            apply_run_filters(_filtered, args=filter_options, label="列表层相关度")
+            all_jobs = _filtered["jobs"]
         flush_jobs(output_path, {
             "keyword": keyword,
             "city": city_name,
@@ -4369,6 +4556,95 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
 # ============================================================
 # 抓取详情
 # ============================================================
+def apply_run_filters(list_data, args=None, keyword=None, label="相关度"):
+    """**唯一的过滤入口**（独立审计 F2/F3/F11 的根因修法）。
+
+    审计结论：过滤此前只在 main() 的一个分支里改了一份**内存副本** → 控制台说
+    "丢弃 N 条"，落盘 JSON/CSV 仍是全量；``--merge`` 又会把被丢掉的岗位从旧文件
+    复活并**再花详情额度**；``--input`` / ``--batch`` 两条入口干脆忽略参数。
+
+    这里把过滤收敛到一处，并**直接改 list_data**（后面所有写盘点都读同一份）→
+    控制台口径与落盘口径必然一致；调用点放在**合并之后**（旧数据也一起过滤）；
+    所有入口（含 ``--input`` / ``--batch``）都走这里。
+
+    Returns: (kept_count, dropped_count, dropped_detail)
+    """
+    if not isinstance(list_data, dict):
+        return 0, 0, {}
+    jobs = list_data.get("jobs")
+    if not isinstance(jobs, list) or not jobs:
+        return 0, 0, {}
+
+    def _opt(name, default=None):
+        """选项读取：args 可以是 argparse 命名空间，也可以是 dict。"""
+        if args is None:
+            return default
+        if isinstance(args, dict):
+            return args.get(name, default)
+        return getattr(args, name, default)
+
+    def _as_list(value):
+        """选项值可能是逗号分隔的字符串，也已经是列表 → 统一成列表。"""
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple, set)):
+            return [str(v).strip() for v in value if str(v).strip()]
+        return [part.strip() for part in str(value).split(",") if part.strip()]
+
+    recruit_types = (_as_list(_opt("recruit_type", "")) or None)
+    raw_allow = _opt("industry_allow", None)
+    industry_allow = (_as_list(raw_allow) or None) if raw_allow is not None else None
+    industry_block = (_as_list(_opt("industry_block", "")) or None)
+    only_title = bool(_opt("only_relevant_title", False))
+
+    if not (recruit_types or industry_allow or industry_block or only_title):
+        return len(jobs), 0, {}
+
+    before = len(jobs)
+    kept, dropped = _semantics.filter_by_relevance(
+        jobs, recruit_types=recruit_types, industry_allow=industry_allow,
+        industry_block=industry_block, only_relevant_title=only_title)
+    list_data["jobs"] = kept
+    list_data["total"] = len(kept)
+    list_data["job_count"] = len(kept)
+    dropped_total = before - len(kept)
+    print(f"🔎 {label}过滤：{before} → {len(kept)} 岗（丢弃 {dropped_total}）")
+    for key, label_text in (("recruit_type", "招聘类型不符"),
+                             ("industry_block", "行业在排除名单"),
+                             ("industry_allow", "行业不在白名单"),
+                             ("title_relevance", "标题不是产品/AI 方向")):
+        if dropped.get(key):
+            print(f"   {label_text}：{dropped[key]} 条")
+    if dropped.get("no_industry"):
+        print(f"   ⚠️ 行业字段缺失（无法判定）：{dropped['no_industry']} 条（已保留）")
+    for item in (dropped.get("items") or [])[:20]:
+        print(f"     · 丢弃：{str(item.get('title'))[:22]}｜{str(item.get('company'))[:16]}"
+              f"｜{item.get('reason')}")
+    if len(dropped.get("items") or []) > 20:
+        print(f"     … 另有 {len(dropped['items']) - 20} 条同类丢弃")
+    if dropped_total:
+        print("   → 这些岗不抓详情，**不消耗详情页额度**")
+    return len(kept), dropped_total, dropped
+
+
+def _filter_options(args):
+    """把 CLI 的过滤参数收成一份 dict（供 scrape_list 与 apply_run_filters 共用）。
+
+    同一处定义 → 各条入口（live 列表 / --input / --batch）行为必然一致
+    （独立审计 F11：此前 --input 与 --batch 完全忽略这些参数且无任何提示）。
+    """
+    if args is None:
+        return {}
+    if isinstance(args, dict):
+        return dict(args)
+    return {
+        "recruit_type": getattr(args, "recruit_type", None),
+        "industry_allow": getattr(args, "industry_allow", None),
+        "industry_block": getattr(args, "industry_block", None),
+        "only_relevant_title": bool(getattr(args, "only_relevant_title", False)),
+    }
+
+
 def build_detail_record(job, extracted):
     """详情记录 = **岗位模型记录**（列表侧 + 详情侧合一）。
 
@@ -4619,6 +4895,8 @@ def run_archive(result_dir=DEFAULT_RESULT_DIR, keep_latest=1):
 # --batch 批量任务编排
 # ============================================================
 FILTER_KEYS = ["scale", "stage", "salary", "experience", "degree", "industry"]
+# 相关度过滤参数（batch 任务级；独立审计 F11）
+RELEVANCE_FILTER_KEYS = ["recruit_type", "industry_allow", "industry_block", "only_relevant_title"]
 
 
 def load_batch_config(path):
@@ -4775,6 +5053,13 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
     failed = 0
     for i, task in enumerate(tasks):
         filters = {k: task[k] for k in FILTER_KEYS if k in task}
+        # 任务级过滤参数（独立审计 F11：--batch 此前完全忽略过滤参数且无提示）
+        task_filter_options = {
+            "recruit_type": task.get("recruit_type"),
+            "industry_allow": task.get("industry_allow"),
+            "industry_block": task.get("industry_block"),
+            "only_relevant_title": bool(task.get("only_relevant_title")),
+        }
         print(f"\n[{i + 1}/{len(tasks)}] {task['keyword']} @ {task['city']} "
               f"（{task['pages']} 页）")
         try:
@@ -4786,6 +5071,7 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                 pages_parallel=pages_parallel,
                 list_mode=list_mode,
                 lock_already_held=True,
+                filter_options=task_filter_options,
             )
         except Exception as e:  # 有意宽捕：任务级隔离，单个任务失败不中断整个批量
             failed += 1
@@ -8101,6 +8387,7 @@ def _run_cli_impl(p, args):
                 pages_parallel=args.pages_parallel,
                 list_mode=args.list_mode,
                 lock_already_held=True,
+                filter_options=_filter_options(args),
             )
         else:
             # §4.1 多关键词：依次抓取（复用单关键词链路），按 job_id 合并为一份列表
@@ -8118,6 +8405,7 @@ def _run_cli_impl(p, args):
                     pages_parallel=args.pages_parallel,
                     list_mode=args.list_mode,
                     lock_already_held=True,
+                    filter_options=_filter_options(args),
                 )
                 list_data = merge_list_data(list_data, part)
                 if idx < len(keywords):
@@ -8154,50 +8442,19 @@ def _run_cli_impl(p, args):
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
 
-        # ── 相关度过滤（零额外请求，在抓详情之前）────────────────────
-        # 平台对"产品经理"是**模糊召回**：会带回别的行业的产品经理岗。
-        # 2026-10-22 实测 933 条 / 90 个行业后结论：**行业 ≠ 相关性**（餐饮 4 条 100% 是产品
-        # 经理岗；房地产中介里也有正经 SaaS 产品岗）→ **默认按行业不过滤**，行业过滤只能是
-        # 用户显式指定的黑名单；相关性判定用**标题**（产品经理/AI 方向）。
-        # 丢掉的岗**不抓详情 → 不耗额度**；丢的是哪些逐条打出来（不静默丢）。
-        _recruit_types = ([t.strip() for t in str(args.recruit_type or "").split(",")
-                           if t.strip()] or None)
-        _industry_allow = ([t.strip() for t in str(args.industry_allow or "").split(",")
-                            if t.strip()] or None)
-        _industry_block = ([t.strip() for t in str(args.industry_block or "").split(",")
-                            if t.strip()] or None)
-        if (_recruit_types or _industry_allow or _industry_block
-                or getattr(args, "only_relevant_title", False)):
-            _before = len(list_data.get("jobs") or [])
-            _kept, _dropped = _semantics.filter_by_relevance(
-                list_data.get("jobs") or [],
-                recruit_types=_recruit_types, industry_allow=_industry_allow,
-                industry_block=_industry_block,
-                only_relevant_title=bool(getattr(args, "only_relevant_title", False)))
-            list_data["jobs"] = _kept
-            list_data["total"] = len(_kept)
-            _drop_total = _before - len(_kept)
-            print(f"🔎 相关度过滤：{_before} → {len(_kept)} 岗（丢弃 {_drop_total}）")
-            if _dropped.get("recruit_type"):
-                print(f"   招聘类型不符：{_dropped['recruit_type']} 条")
-            if _dropped.get("industry_block"):
-                print(f"   行业在排除名单：{_dropped['industry_block']} 条")
-            if _dropped.get("industry_allow"):
-                print(f"   行业不在白名单：{_dropped['industry_allow']} 条")
-            if _dropped.get("title_relevance"):
-                print(f"   标题不是产品/AI 方向：{_dropped['title_relevance']} 条")
-            if _dropped.get("no_industry"):
-                print(f"   ⚠️ 行业字段缺失（无法判定）：{_dropped['no_industry']} 条（已保留）")
-            for _item in (_dropped.get("items") or [])[:20]:
-                print(f"     · 丢弃：{_item.get('title')[:22]}｜{_item.get('company')[:16]}"
-                      f"｜{_item.get('reason')}")
-            if len(_dropped.get("items") or []) > 20:
-                print(f"     … 另有 {len(_dropped['items']) - 20} 条同类丢弃")
-            if _drop_total:
-                print("   → 这些岗不抓详情，**不消耗详情页额度**")
+        # 相关度过滤不在这里做：它必须**在合并之后、所有写盘之前**统一执行
+        # （独立审计 F2/F3/F11 的根因：过滤只改内存副本 → 落盘口径不一致；
+        #   --merge 把丢掉的岗位从旧文件复活并再花额度；--input/--batch 忽略参数）。
+        # 统一入口：apply_run_filters()（见下方「合并外部文件」之前）。
         if db_state is not None:
             db_state["list_data"] = list_data
         # sidecar 只在真正开始详情前创建，并由详情调用 finally 删除。
+
+    # ── 相关度过滤（**唯一入口** apply_run_filters）────────────────
+    # 独立审计 F2/F3/F11 的根因：过滤此前只在 main() 的一个分支里改了一份内存副本
+    # → 落盘 JSON/CSV 与控制台口径不一致；--merge 把丢掉的岗位从旧文件复活并再花
+    # 额度；--input / --batch 两条入口干脆忽略参数。现在收敛到一处，且**在合并之后**。
+    apply_run_filters(list_data, args=args)
 
     # 合并外部文件
     merged_details = None
@@ -8205,6 +8462,9 @@ def _run_cli_impl(p, args):
         merged_jobs = merge_jobs(args.merge, list_data.get("jobs", []))
         list_data["jobs"] = merged_jobs
         list_data["total"] = len(merged_jobs)
+        # 合并进来的旧岗位同样要过过滤（F3：否则被丢掉的岗位从旧文件复活，
+        # 还会**再花一次详情额度**）
+        apply_run_filters(list_data, args=args, label="合并后相关度")
         # 重新保存合并结果
         if args.output:
             flush_jobs(args.output, {

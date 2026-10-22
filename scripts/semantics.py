@@ -183,7 +183,11 @@ def check_invariants(jobs, meta=None):
     short = sum(1 for n in lens if n < 120)
     add("jd_length", short == 0, f"{short} 条 < 120 字（中位 {sorted(lens)[total // 2]}）")
 
-    junk = re.compile(r"薪资详情|社保类型|提成方式|刚刚活跃|今日活跃|本周活跃|·招聘专员")
+    # 垃圾尾标记表 = **唯一来源**（2026-10-22：验收器与实现侧各抄一份，已发生漂移 →
+    # 实现侧改为问这里；验收规格里的 junk_tail_extra_markers 也并进来）
+    junk = re.compile(
+        r"薪资详情|社保类型|提成方式|刚刚活跃|今日活跃|本周活跃|·招聘专员"
+        r"|奖金补贴|3日内活跃|2周内活跃|本月活跃|·招聘主管|·HRBP")
     dirty = sum(1 for j in jobs if junk.search(str(j.get("jd") or "")))
     add("no_junk_tail", dirty == 0, f"{dirty} 条 JD 尾部混进页面模块")
 

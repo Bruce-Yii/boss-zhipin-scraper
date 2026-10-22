@@ -386,7 +386,6 @@ def record(job_id, fingerprint="", reason="", path=None):
         entry = data.get(key)
         if not isinstance(entry, dict):
             entry = {}
-        now = time.time()
         if _nature_of(entry) != nature:
             # 性质变了（瞬时 → 结构性，或反过来）→ 跳过计数重来
             entry["skip_runs"] = 0

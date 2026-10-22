@@ -214,15 +214,8 @@
     "jd_min_length": 120
   },
   "thresholds_note": "jd_min_length 只作记录：JD 长度的**判定实现**在 scripts/semantics.py 的 check_invariants（单一实现，验收器不再持有第二份正则）。",
-  "junk_tail_extra_markers": [
-    "奖金补贴",
-    "3日内活跃",
-    "2周内活跃",
-    "本月活跃",
-    "·招聘主管",
-    "·HRBP"
-  ],
-  "junk_tail_note": "垃圾尾的**主判定**由 semantics.check_invariants.no_junk_tail 唯一负责（它覆盖 薪资详情/社保类型/提成方式/刚刚活跃/今日活跃/本周活跃/·招聘专员）。这里只补上它没覆盖的同族页面模块文案，避免验收能力倒退——验收器代码里**不再**持有任何垃圾尾正则。",
+  "junk_tail_extra_markers": [],
+  "junk_tail_note": "垃圾尾标记表已并入 scripts/semantics.py 的 check_invariants（单一来源）——此前验收规格与实现侧各存一份且已漂移。",
   "properties": [
     {
       "id": "P0_empty",
