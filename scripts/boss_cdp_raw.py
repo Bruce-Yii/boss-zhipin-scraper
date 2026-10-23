@@ -4737,6 +4737,37 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
 # ============================================================
 # 抓取详情
 # ============================================================
+def prefilter_detail_queue(list_data, keep_junk=False):
+    """详情前筛（用户 2026-10-23：筛完再爬，不浪费额度）。
+
+    scrape_details 之前对列表 jobs 跑一遍删库规则。列表阶段无 JD →
+    只走标题分支（+FDE 例外）；JD 疑似只预警。**直接改 list_data**
+    （后面详情队列与合并都读同一份）；丢掉的逐条打印，不断链。
+    默认开，``--keep-junk`` 跳过。返回 (kept, dropped)。
+    """
+    if not isinstance(list_data, dict):
+        return 0, 0
+    jobs = list_data.get("jobs")
+    if not jobs:
+        return 0, 0
+    if keep_junk or _semantics is None or not hasattr(_semantics, "drop_junk_jobs"):
+        return len(jobs), 0
+    try:
+        kept, dropped = _semantics.drop_junk_jobs(jobs)
+    except Exception as exc:  # pragma: no cover - 预筛失败不得阻塞抓取
+        print(f"⚠️ 详情前筛异常（已跳过预筛）：{exc}")
+        return len(jobs), 0
+    items = dropped.get("items", [])
+    if items:
+        list_data["jobs"] = kept
+        print(f"🧹 详情前筛：剔除 {len(items)} 条标题垃圾（不进详情、不耗额度）")
+        for it in items[:8]:
+            print(f"   - {it.get('title', '')[:24]}｜{it.get('company', '')[:16]}｜{it.get('reason', '')}")
+        if len(items) > 8:
+            print(f"   …等共 {len(items)} 条（见合并产物 dropped_junk）")
+    return len(kept), len(items)
+
+
 def apply_run_filters(list_data, args=None, keyword=None, label="相关度"):
     """**唯一的过滤入口**（独立审计 F2/F3/F11 的根因修法）。
 
@@ -5273,6 +5304,7 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                     and isinstance(list_data.get("jobs"), list)
                     and list_data["jobs"])
         if task_detail and has_jobs:
+            prefilter_detail_queue(list_data, keep_junk=keep_junk)
             raw_path = list_data.get("output_path")
             list_path = raw_path if isinstance(raw_path, str) else ""
             channel_stats = {}
@@ -8714,6 +8746,8 @@ def _run_cli_impl(p, args):
                 if preloaded_details:
                     print(f"🗄️  SQLite 命中 {len(preloaded_details)} 条历史详情（断点续抓）")
             # 供给 × 额度协调检查：把"今天的真实产出上限"算出来（额度 ≠ 供给）
+            # 详情前筛（用户 2026-10-23）：先筛标题垃圾再抓详情，供给口径按筛后算。
+            prefilter_detail_queue(list_data, keep_junk=args.keep_junk)
             supply_info = _check_supply_vs_budget(list_data)
             sidecar_owned = None
             try:

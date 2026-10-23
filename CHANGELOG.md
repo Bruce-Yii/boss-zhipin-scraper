@@ -12,6 +12,9 @@
   `dropped_junk`，疑似写进 `suspect_sales_jd` + warnings。
 - 方向词表去"治理"（用户从未认可）+ 注释订正（此前误写"用户明确纳入"）。
 - CLI `--keep-junk`；README 中英 + SKILL 同步；版本号 6 处同步 2.22.0。
+- 详情前筛（用户 2026-10-23：筛完再爬）：`scrape_details` 之前对列表 jobs 跑
+  一遍删库标题规则（无 JD 只走标题分支 + FDE 例外），垃圾不进详情队列、
+  不耗日预算；`--keep-junk` 跳过。供给×额度协调按筛后供给算。
 
 ## 未发布
 

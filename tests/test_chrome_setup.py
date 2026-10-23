@@ -2456,6 +2456,33 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertEqual(data.get("detail_channel"), "api")
             self.assertEqual(data["jobs"][0].get("jd"), "hello")
 
+    def test_prefilter_detail_queue_drops_title_junk(self):
+        """详情前筛：标题垃圾不进详情队列（用户 2026-10-23：筛完再爬）。"""
+        module = load_module()
+        list_data = {"jobs": [
+            {"job_id": "k", "title": "AI产品经理", "company_name": "好公司",
+             "jd": "负责AI产品规划"},
+            {"job_id": "s", "title": "AI产品销售经理", "company_name": "坏公司"},
+            {"job_id": "t", "title": "AI应用开发工程师", "company_name": "坏公司"},
+            {"job_id": "f", "title": "FDE 实习生", "company_name": "好公司"},
+        ]}
+        kept, dropped = module.prefilter_detail_queue(list_data)
+        self.assertEqual(kept, 2)
+        self.assertEqual(dropped, 2)
+        self.assertEqual(
+            sorted(j["job_id"] for j in list_data["jobs"]), ["f", "k"])
+
+    def test_prefilter_detail_queue_keep_junk_skips(self):
+        """--keep-junk 跳过预筛（排查用）。"""
+        module = load_module()
+        list_data = {"jobs": [
+            {"job_id": "k", "title": "AI产品经理", "company_name": "好公司"},
+            {"job_id": "s", "title": "AI产品销售经理", "company_name": "坏公司"},
+        ]}
+        kept, dropped = module.prefilter_detail_queue(list_data, keep_junk=True)
+        self.assertEqual((kept, dropped), (2, 0))
+        self.assertEqual(len(list_data["jobs"]), 2)
+
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()
         bucket = module.TokenBucket(rate=2.0, capacity=2)
