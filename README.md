@@ -159,6 +159,15 @@ python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --f
 
 # 5. 抓取后摘要和提示词
 python3 scripts/job_summary.py --top 15
+
+# 6. 交付物重建（列表+详情+旧交付走生产合并路径，不重新抓取）
+python3 scripts/build_deliverable.py \
+  --lists boss_list_A.json boss_list_B.json \
+  --details boss_details_A.json boss_details_B.json \
+  --old boss_jobs_旧交付.json --target boss_jobs_新交付.json \
+  --keyword "产品实习生,AI产品实习生" --city 杭州 \
+  --target-roots "产品实习,AI产品,FDE,AIGC,大模型" \
+  --scope "口径说明写这里"
 ```
 
 ## 参数

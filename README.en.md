@@ -156,6 +156,16 @@ python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --f
 
 # 5. Summary + prompt after scraping
 python3 scripts/job_summary.py --top 15
+
+# 6. Rebuild a deliverable (lists + details + old export through the
+# production merge path, no re-scraping)
+python3 scripts/build_deliverable.py \
+  --lists boss_list_A.json boss_list_B.json \
+  --details boss_details_A.json boss_details_B.json \
+  --old boss_jobs_old.json --target boss_jobs_new.json \
+  --keyword "产品实习生,AI产品实习生" --city 杭州 \
+  --target-roots "产品实习,AI产品,FDE,AIGC,大模型" \
+  --scope "scope note goes here"
 ```
 
 ## Parameters
