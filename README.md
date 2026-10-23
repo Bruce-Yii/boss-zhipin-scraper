@@ -1,11 +1,11 @@
-# BOSS直聘爬虫 · 职位抓取工具 v2.21.0（Chrome CDP / 明文薪资）
+# BOSS直聘爬虫 · 职位抓取工具 v2.22.0（Chrome CDP / 明文薪资）
 
 > 🌐 English documentation: [README.en.md](./README.en.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.21.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.22.0-orange.svg)
 
 一个轻量的 **BOSS直聘爬虫（spider / crawler / scraper）**：通过 Chrome DevTools Protocol 连接本地已登录的 Chrome，复用真实登录态调用 zhipin.com 搜索 API，绕过前端字体反爬，输出含**明文薪资**的职位数据（JSON / CSV），并生成薪资分布、技能词频和求职材料优化提示词。同时作为 Hermes Agent Skill 提供。
 
@@ -182,6 +182,7 @@ python3 scripts/job_summary.py --top 15
 | 坏页台账 | 抽取失败的岗位按**失败指纹**归类并沉淀（仓库外 `~/.boss-zhipin-scraper/known_bad_jobs.json`），命中即**跳过、不发请求、不消耗额度**；导出里每条记录带 `post_type`（发布主体类型）/ `active_state`（active/inactive/unknown）/ `dup_group`（同源重复标记），meta 带 `post_type_counts` / `duplicate_groups` / `title_groups` / `invariants`（自检） |
 | `--refresh-links EXPORT` | 按 job_id 用**新拉取的列表链接**刷新导出里的 `job_link`（链接含 securityId 段、不能由 job_id 重建；只发列表请求，不占详情页额度），并报告多少个 job_id 已查不到（岗位可能已下架） |
 | `--daily-detail-budget N` | 详情页访问日预算（请求次数，**跨 run 累计**，默认 700；0=不限）。计数文件在仓库外 `~/.boss-zhipin-scraper/daily_budget.json`，`BOSS_DAILY_BUDGET_PATH` 可覆盖。同一岗位当天第二次抓取**默认跳过且不消耗额度**（台账），日额度因此必然换来互不重复的岗位 |
+| `--keep-junk` | 保留销售/技术/噪声岗（默认**删库**：合并导出时直接剔除，只认 AI 非技术岗；FDE 例外保留；产品经理挂技术方向不算技术岗；JD 疑似销售只预警不删；抓详情前先过一遍标题筛，垃圾不进详情队列、不耗额度。删掉的清单写进 `dropped_junk`，可追溯） |
 | `--detail-channel` | 详情通道：`dom`（默认，整页渲染详情页，document 导航，**唯一有生产证据的形态**——2026-09-23 用它跑出 1005 条/天、只撞可人工解开的滑块验证码）/ `html`（**已封存**：详情页 HTML 直取。2026-10-22 真机实测：平台会间歇性对 fetch 请求返回**别的岗位**的 JD，且该路径用 textContent 抽取会带进 `display:none` 诱饵文本；绝对限速下零吞吐收益）/ `auto`（旧默认：有 securityId 走 API，缺凭证先试 encryptJobId API 再落 DOM）/ `api`·`encrypt`（详情 API 通道，**已封存**：该接口被平台限流并升级为短时账号封禁，见 tangzhiyao/boss-show-time#42）/ `panel`（复用搜索页点卡片读右面板 JD，零新增请求、串行；上游 #84 思路）。meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
 | `--retry-job JOB_ID` | 强制重试指定详情（可重复指定；无视 pending 重试上限，未记录的也会重抓） |
 | `--filter-inactive` | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃）；默认关闭 |

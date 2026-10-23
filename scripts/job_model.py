@@ -307,7 +307,7 @@ DERIVE_RULES = {
     "is_primary": "同源重复组内首条",
     "direction": "classify_direction：标题+JD+技能 → ai_pm|pm_only|ai_other|other",
     "salary_parts": "parse_salary_parts：拆 min/max/unit/months",
-    "link_verified_at": "抓取时刻（链接在该时刻被验证指向本岗位）",
+    "link_verified_at": "抓取时刻（链接在该时刻被验证指向本岗位）",
     "risk_flags": "risk_flags(job)：占位公司名/无区县/异地base/陈旧帖/薪资离群/兼职类",
 }
 
@@ -503,8 +503,9 @@ PM_DIRECTION_TERMS = (
     # 实习池里 7 条「ai产品实习生」被判成 ai_other（非 AI 方向），
     # 直接少给用户 7 个**确实是 AI 产品岗**的实习。称谓是同一个岗位的实习版。
     "产品实习",
-    # 用户明确纳入（2026-10-23）：AI 产品运营、AI 产品治理、AI 解决方案、FDE
-    "治理", "解决方案", "FDE", "部署工程师", "售前", "技术支持",
+    # 用户明确纳入（2026-10-23）：AI 产品运营、AI 解决方案、FDE。
+    # "AI产品治理"用户从未认可，已移除；FDE 用户明示保留（虽偏工程）。
+    "解决方案", "FDE", "部署工程师", "售前", "技术支持",
 )
 
 

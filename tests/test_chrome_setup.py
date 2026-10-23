@@ -1155,17 +1155,17 @@ class ChromeSetupTests(unittest.TestCase):
         with tempfile_profile() as paths:
             target = str(paths["cdp_profile"] / "boss_jobs_x.json")
             module.flush_jobs(target, {"keyword": "AI", "city": "上海"}, [
-                {"job_id": "a", "title": "A", "location": "上海",
+                {"job_id": "a", "title": "AI产品经理", "location": "上海",
                  "job_link": "https://www.zhipin.com/job_detail/a.html", "company_name": "C1"},
-                {"job_id": "b", "title": "B", "location": "上海",
+                {"job_id": "b", "title": "AI产品经理", "location": "上海",
                  "job_link": "https://www.zhipin.com/job_detail/b.html", "company_name": "C2"},
             ])
-            result = module._merge_jd_into_export(target, [{"job_id": "a", "jd": "岗位职责X"}])
+            result = module._merge_jd_into_export(target, [{"job_id": "a", "jd": "AI产品岗位职责X"}])
             self.assertEqual(result, (1, 1))
             with open(target, encoding="utf-8") as f:
                 data = json.load(f)
             self.assertEqual(len(data["jobs"]), 1)
-            self.assertEqual(data["jobs"][0]["jd"], "岗位职责X")
+            self.assertEqual(data["jobs"][0]["jd"], "AI产品岗位职责X")
             self.assertEqual(data["job_count"], 1)
             self.assertEqual(data["jd_coverage"]["with_jd"], 1)
             self.assertEqual(data["jd_coverage"]["total_before"], 2)
@@ -1183,18 +1183,18 @@ class ChromeSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = os.path.join(tmp, "jobs.json")
             base = {"jobs": [
-                {"job_id": "a", "title": "T", "location": "杭州", "job_link": "u",
+                {"job_id": "a", "title": "AI产品经理", "location": "杭州", "job_link": "u",
                  "company_name": "C", "boss_active_status": "在线"},
-                {"job_id": "b", "title": "T", "location": "杭州", "job_link": "u",
+                {"job_id": "b", "title": "AI产品经理", "location": "杭州", "job_link": "u",
                  "company_name": "C", "boss_active_status": ""},
-                {"job_id": "c", "title": "T", "location": "杭州", "job_link": "u",
+                {"job_id": "c", "title": "AI产品经理", "location": "杭州", "job_link": "u",
                  "company_name": "C", "boss_active_status": "刚刚活跃"},
             ]}
             module._atomic_write_export_json(target, base)
             module._merge_jd_into_export(target, [
-                {"job_id": "a", "jd": "JD-A", "boss_active_status": "刚刚活跃"},
-                {"job_id": "b", "jd": "JD-B", "boss_active_status": "今日活跃"},
-                {"job_id": "c", "jd": "JD-C", "boss_active_status": "在线"},
+                {"job_id": "a", "jd": "AI产品JD-A", "boss_active_status": "刚刚活跃"},
+                {"job_id": "b", "jd": "AI产品JD-B", "boss_active_status": "今日活跃"},
+                {"job_id": "c", "jd": "AI产品JD-C", "boss_active_status": "在线"},
             ])
             with open(target, encoding="utf-8") as handle:
                 merged = json.load(handle)
@@ -1206,7 +1206,7 @@ class ChromeSetupTests(unittest.TestCase):
         # 列表更精细 → 保留列表的（不被详情降级）
         self.assertEqual(by_id["c"]["boss_active_status"], "刚刚活跃")
         # jd 仍然并入
-        self.assertEqual(by_id["a"]["jd"], "JD-A")
+        self.assertEqual(by_id["a"]["jd"], "AI产品JD-A")
 
     def test_merge_jd_into_export_keep_without_jd(self):
         """--keep-without-jd：保留无 JD 岗位（仅标注），in_jd 统计仍准。"""
@@ -1214,9 +1214,9 @@ class ChromeSetupTests(unittest.TestCase):
         with tempfile_profile() as paths:
             target = str(paths["cdp_profile"] / "boss_jobs_x.json")
             module.flush_jobs(target, {"keyword": "AI"}, [
-                {"job_id": "a", "title": "A", "location": "上海",
+                {"job_id": "a", "title": "AI产品经理", "location": "上海",
                  "job_link": "https://www.zhipin.com/job_detail/a.html", "company_name": "C1"},
-                {"job_id": "b", "title": "B", "location": "上海",
+                {"job_id": "b", "title": "AI产品经理", "location": "上海",
                  "job_link": "https://www.zhipin.com/job_detail/b.html", "company_name": "C2"},
             ])
             result = module._merge_jd_into_export(
@@ -1234,7 +1234,7 @@ class ChromeSetupTests(unittest.TestCase):
         with tempfile_profile() as paths:
             target = str(paths["cdp_profile"] / "merged.json")
             base = {"keyword": "AI", "jobs": [
-                {"job_id": "a", "title": "A", "location": "上海",
+                {"job_id": "a", "title": "AI产品经理", "location": "上海",
                  "job_link": "https://x/a.html", "company_name": "C1"}]}
             result = module._merge_jd_into_export(target, [{"job_id": "a", "jd": "J"}], base=base)
             self.assertEqual(result, (1, 0))
@@ -1252,7 +1252,7 @@ class ChromeSetupTests(unittest.TestCase):
                 "cookie": "secret-cookie",
                 "jobs": [{
                     "job_id": "a",
-                    "title": "A",
+                    "title": "AI产品经理",
                     "location": "北京",
                     "job_link": ("https://www.zhipin.com/job_detail/a.html"
                                  "?securityId=secret-id&foo=ok"),
@@ -2444,7 +2444,7 @@ class ChromeSetupTests(unittest.TestCase):
         with tempfile_profile() as paths:
             p = str(paths["cdp_profile"] / "boss_jobs_x.json")
             module._atomic_write_json(p, {
-                "jobs": [{"job_id": "a", "title": "t", "location": "l",
+                "jobs": [{"job_id": "a", "title": "AI产品经理", "location": "l",
                           "job_link": "u", "company_name": "c"}],
                 "total": 1,
             })
@@ -2455,6 +2455,33 @@ class ChromeSetupTests(unittest.TestCase):
                 data = json.load(f)
             self.assertEqual(data.get("detail_channel"), "api")
             self.assertEqual(data["jobs"][0].get("jd"), "hello")
+
+    def test_prefilter_detail_queue_drops_title_junk(self):
+        """详情前筛：标题垃圾不进详情队列（用户 2026-10-23：筛完再爬）。"""
+        module = load_module()
+        list_data = {"jobs": [
+            {"job_id": "k", "title": "AI产品经理", "company_name": "好公司",
+             "jd": "负责AI产品规划"},
+            {"job_id": "s", "title": "AI产品销售经理", "company_name": "坏公司"},
+            {"job_id": "t", "title": "AI应用开发工程师", "company_name": "坏公司"},
+            {"job_id": "f", "title": "FDE 实习生", "company_name": "好公司"},
+        ]}
+        kept, dropped = module.prefilter_detail_queue(list_data)
+        self.assertEqual(kept, 2)
+        self.assertEqual(dropped, 2)
+        self.assertEqual(
+            sorted(j["job_id"] for j in list_data["jobs"]), ["f", "k"])
+
+    def test_prefilter_detail_queue_keep_junk_skips(self):
+        """--keep-junk 跳过预筛（排查用）。"""
+        module = load_module()
+        list_data = {"jobs": [
+            {"job_id": "k", "title": "AI产品经理", "company_name": "好公司"},
+            {"job_id": "s", "title": "AI产品销售经理", "company_name": "坏公司"},
+        ]}
+        kept, dropped = module.prefilter_detail_queue(list_data, keep_junk=True)
+        self.assertEqual((kept, dropped), (2, 0))
+        self.assertEqual(len(list_data["jobs"]), 2)
 
     def test_token_bucket_allows_burst_up_to_capacity(self):
         module = load_module()

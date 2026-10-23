@@ -243,5 +243,115 @@ class KnownBadPageSkipTests(unittest.TestCase):
         self.assertEqual(recorded["fingerprint"], "no_section")
 
 
+class DropJunkTests(unittest.TestCase):
+    """删库规则（用户 2026-10-23：销售/技术/噪声直接删库，不保留）。"""
+
+    def setUp(self):
+        self.s = load_module("semantics", ROOT / "scripts" / "semantics.py")
+
+    def _drop(self, jobs):
+        kept, dropped = self.s.drop_junk_jobs(jobs)
+        return kept, dropped
+
+    def test_sales_title_dropped(self):
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI产品销售经理",
+                                     "company_name": "X", "jd": "做AI产品"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["sales"], 1)
+
+    def test_sales_jd_suspect_not_dropped(self):
+        """JD 命中销售强特征词只预警不删（薪酬提成/客户资源等误伤太大）。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "产品经理",
+                                     "company_name": "X",
+                                     "jd": "负责提成和完成业绩指标，按回款拿佣金"}])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped["suspect"], 1)
+        self.assertEqual(dropped["suspect_items"][0]["job_id"], "a")
+
+    def test_product_jd_with_sales_word_not_hurt(self):
+        """产品岗 JD 仅含"销售"单字（如提升销售转化）不误伤——只认强特征词。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI产品经理",
+                                     "company_name": "X",
+                                     "jd": "负责AI产品规划，提升销售转化"}])
+        self.assertEqual(len(kept), 1)
+
+    def test_tech_title_dropped(self):
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI应用开发工程师",
+                                     "company_name": "X",
+                                     "jd": "参与AI应用开发"}])
+        self.assertEqual(kept, [])
+
+    def test_fde_exception_kept(self):
+        """FDE 用户明示保留：标题再技术也留。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "FDE 全栈工程师MJ000006",
+             "company_name": "靖安科技", "jd": "把需求转化为技术方案"},
+            {"job_id": "b", "title": "数据分析（FDE）",
+             "company_name": "预策科技", "jd": "业务分析"}])
+        self.assertEqual(len(kept), 2)
+
+    def test_pm_core_with_tech_prefix_kept(self):
+        """产品经理挂技术方向（算法/测试产品经理）是产品岗，不算技术岗。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "AIGC算法产品经理",
+             "company_name": "群核科技", "jd": "负责AIGC算法产品规划"},
+            {"job_id": "b", "title": "AI芯片测试产品经理",
+             "company_name": "Y", "jd": "负责AI芯片测试产品定义"}])
+        self.assertEqual(len(kept), 2)
+
+    def test_mismatch_dropped(self):
+        """JD 与岗名不符（引流帖）→ 删。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "产品经理",
+                                     "company_name": "上海趣泡",
+                                     "jd": "看清楚再投简历，谢谢招募小红书运营合伙人"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["mismatch"], 1)
+
+    def test_cross_industry_noise_dropped(self):
+        """标题是产品岗、JD 里无 AI → 跨行业噪声，删。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "软件产品助理",
+                                     "company_name": "有信科技",
+                                     "jd": "协助产品经理对接，原型设计"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["noise"], 1)
+
+    def test_b_layer_kept(self):
+        """B 层：标题普通但 JD 含 AI → 留。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "产品实习生",
+                                     "company_name": "每日互动",
+                                     "jd": "用大模型做用户增长分析"}])
+        self.assertEqual(len(kept), 1)
+
+    def test_skills_ai_kept(self):
+        """技能含 AI 也算证据 → 留。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "产品实习生",
+                                     "company_name": "国量测控",
+                                     "jd": "负责产品需求文档",
+                                     "skill_tags": ["AI产品"]}])
+        self.assertEqual(len(kept), 1)
+
+    def test_no_role_title_dropped(self):
+        """标题连岗名都说不清（纯AI应用/Agent实习生）→ 噪声，删。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI应用实习生",
+                                     "company_name": "艾麦物流",
+                                     "jd": "参与AI项目原型开发"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["noise"], 1)
+
+    def test_no_jd_kept(self):
+        """无 JD 的记录跳过 JD 相关规则。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI产品经理",
+                                     "company_name": "X"}])
+        self.assertEqual(len(kept), 1)
+
+    def test_dropped_items_auditable(self):
+        """丢弃清单带 job_id/title/company/reason，可追溯。"""
+        _, dropped = self._drop([{"job_id": "a", "title": "AI产品销售经理",
+                                  "company_name": "X", "jd": "做AI产品"}])
+        self.assertEqual(len(dropped["items"]), 1)
+        self.assertEqual(dropped["items"][0]["job_id"], "a")
+        self.assertIn("销售", dropped["items"][0]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

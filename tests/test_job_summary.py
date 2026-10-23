@@ -777,5 +777,47 @@ class SalaryAnalysisUpgradeTests(unittest.TestCase):
         self.assertIn("全部岗位", module._salary_market_line(summary))
 
 
+def load_semantics_module():
+    spec = importlib.util.spec_from_file_location(
+        "semantics", ROOT_PATH / "scripts" / "semantics.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class SalesTermsConsistencyTests(unittest.TestCase):
+    """删库词表与摘要词表同源（两边各写一份必然漂移，测试钉住一致）。"""
+
+    def test_sales_terms_match(self):
+        summary = load_summary_module()
+        semantics = load_semantics_module()
+        self.assertEqual(tuple(semantics._SALES_TITLE_TERMS),
+                         tuple(summary.SALES_TITLE_TERMS))
+        self.assertEqual(tuple(semantics._SALES_JD_TERMS),
+                         tuple(summary.SALES_JD_TERMS))
+
+
+class JdMatchConsistencyTests(unittest.TestCase):
+    """JD-岗名匹配两边同算法（语义层删库用，摘要层过滤用）。"""
+
+    def test_match_agrees_on_fixtures(self):
+        summary = load_summary_module()
+        semantics = load_semantics_module()
+        fixtures = [
+            {"title": "产品经理",
+             "jd": "看清楚再投简历，谢谢招募小红书运营合伙人"},
+            {"title": "软件产品助理",
+             "jd": "协助产品经理对接，原型设计"},
+            {"title": "AI产品经理", "jd": "负责AI产品规划，提升销售转化"},
+            {"title": "产品实习生", "jd": "用大模型做用户增长分析"},
+            {"title": "AI应用运营实习生", "jd": "协助整理AI项目数据"},
+        ]
+        for job in fixtures:
+            with self.subTest(title=job["title"]):
+                self.assertEqual(semantics._title_jd_match(job),
+                                 summary.jd_matches_title(job))
+
+
 if __name__ == "__main__":
     unittest.main()

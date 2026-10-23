@@ -1,11 +1,11 @@
-# BOSS Zhipin Scraper · Job Crawler v2.21.0 (Chrome CDP / Plaintext Salary)
+# BOSS Zhipin Scraper · Job Crawler v2.22.0 (Chrome CDP / Plaintext Salary)
 
 > 🌐 中文文档：[README.md](./README.md)
 
 ![Python](https://img.shields.io/badge/python-3.12+-blue.svg)
 ![License](https://img.shields.io/badge/license-MIT-green.svg)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
-![Version](https://img.shields.io/badge/version-2.21.0-orange.svg)
+![Version](https://img.shields.io/badge/version-2.22.0-orange.svg)
 
 A lightweight **BOSS Zhipin scraper / crawler** (a.k.a. spider) for job listings on [zhipin.com](https://www.zhipin.com). Instead of driving a heavy Selenium/Playwright browser, it connects to your **already-logged-in Chrome** via the Chrome DevTools Protocol (CDP), reuses the real session, and calls the in-page search API directly — bypassing the front-end font-based anti-scraping so you get the **plaintext salary** in every record. Output goes to JSON / CSV, plus an aggregated salary/skill analysis and a copy-paste prompt for polishing your job-application materials. Also ships as a Hermes Agent Skill.
 
@@ -179,6 +179,7 @@ python3 scripts/job_summary.py --top 15
 | Known-bad ledger | Pages whose extraction failed are fingerprinted and persisted (outside the repo, `~/.boss-zhipin-scraper/known_bad_jobs.json`); a hit is **skipped without a request and without consuming budget**. Each exported record carries `post_type` (direct / agency / anonymous), `active_state` (active / inactive / **unknown**) and `dup_group` (same-content duplicate marker); the export meta carries `post_type_counts` / `duplicate_groups` / `title_groups` / `invariants` (self-check) |
 | `--refresh-links EXPORT` | Refresh the export's `job_link` values with freshly pulled list links, matched by job_id (the URL carries a securityId segment and cannot be rebuilt from job_id; list requests only — they do not consume the detail budget), and report how many job_ids are no longer in the list |
 | `--daily-detail-budget N` | Daily detail-page budget (request count, **cumulative across runs**, default 700; 0 = unlimited). Counted in `~/.boss-zhipin-scraper/daily_budget.json` (outside the repo); `BOSS_DAILY_BUDGET_PATH` overrides the path. A job already fetched today is **skipped without consuming budget** (ledger), so the daily allowance always buys distinct jobs |
+| `--keep-junk` | Keep sales/tech/noise jobs (default is **purge on export**: sales, tech/design and noise jobs are removed; only AI non-tech roles kept; FDE exempt; "product manager with a tech prefix" does not count as a tech job; JD-suspected sales are only warned, not removed; title junk is filtered before detail fetching so it never consumes budget. The removed list goes to `dropped_junk` for audit) |
 | `--detail-channel` | Detail channel: `dom` (default; renders the detail page as a document navigation — the only shape with production evidence: 2026-09-23 produced 1005 records/day with it and only hit a manually solvable slider captcha) / `html` (**retired**: fetch the server-rendered detail HTML directly. Measured 2026-10-22: the platform intermittently serves the JD of a **different job** to fetch requests, and the textContent-based extraction drags `display:none` decoy text into the JD; zero throughput benefit under the absolute rate limit) / `auto` (old default: API when securityId is present, else try the encryptJobId API first and fall back to DOM) / `api`·`encrypt` (detail API channel, **retired**: the platform rate-limits that endpoint and escalates it to short-lived account bans — see tangzhiyao/boss-show-time#42) / `panel` (reuse the search page, click a card and read the right panel's JD — zero extra requests, serial; upstream #84 idea). The export meta records the real successful channel `api`/`encrypt`/`dom`/`panel`/`mixed` plus `detail_channel_counts` |
 | `--retry-job JOB_ID` | Force-retry a specific detail (repeatable; ignores the pending retry limit, also retries IDs not yet recorded) |
 | `--filter-inactive` | Drop long-inactive (zombie) jobs by HR activity (matches only "active N weeks/months/years ago"; does not drop this-week/this-month activity); off by default |
