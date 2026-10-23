@@ -642,7 +642,11 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
             data.setdefault("warnings", []).append(f"删库规则异常（已跳过删库）：{exc}")
     # 验收结论**跟着产物走**（独立审计：新验收器在生产代码里零引用 → 没人跑、
     # 结论进不了决策）。挂在最终产物出口，不是靠人记得手动跑。
-    attach_acceptance_result(data, source_path=target_path)
+    # 顺序修正（2026-10-23）：验收必须跑在**全部派生字段算完之后**——
+    # 重复组打标（dup_group/dup_size）、active_state、invariants、warnings 都
+    # 在下面的语义块里产生；此前验收跑在它们之前，合并已有 dup 标记的旧产物时
+    # 会读到陈旧 dup_size → P13 误报"组内条数不符"、P3 误报"重复未标记"。
+    # 现在挪到写盘前最后一步，验收看到的就是落盘的同一份状态。
     data["jd_coverage"] = {
         "with_jd": with_jd,
         "total_before": total_before,
@@ -718,6 +722,8 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
             f"导出为空（详情 {total_before} 条全部未拿到 JD）→ **未覆盖原文件**，"
             "保留列表侧数据；请检查登录状态/风控/坏页台账")
         data["warnings"] = warns
+    # 验收：**最后一步**，看到的就是即将落盘的同一份状态（见上方顺序修正说明）。
+    attach_acceptance_result(data, source_path=target_path)
     _atomic_write_json(target_path, _sanitize_payload(data))
     return len(kept), len(dropped_ids)
 
