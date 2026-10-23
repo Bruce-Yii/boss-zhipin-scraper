@@ -284,6 +284,178 @@ def filter_by_relevance(jobs, recruit_types=None, industry_allow=None,
     return kept, dropped
 
 
+# ---------------------------------------------------------------------------
+# 8) 删库规则（用户 2026-10-23 拍板：销售/技术/噪声直接删库，不保留）
+# ---------------------------------------------------------------------------
+# 旧规则是"摘要层过滤"（库里留、摘要里不报）→ 用户明示作废。
+# 本质标准只认一条：**AI 非技术岗**。FDE 用户明示保留，不删。
+#
+# 销售词表与 job_summary.SALES_*_TERMS 同源（那边是摘要口径，这里是删库口径；
+# tests/test_job_summary.py::SalesTermsConsistencyTests 钉住两边一致，防漂移）。
+
+_SALES_TITLE_TERMS = ("销售", "bd", "商务拓展", "客户经理", "sdr",
+                      "大客户", "渠道经理", "渠道销售", "招商")
+_SALES_JD_TERMS = ("提成", "业绩指标", "完成业绩", "回款", "签单",
+                   "客户资源", "销售目标", "销售任务", "佣金", "业绩考核")
+_TECH_TITLE_TERMS = ("开发", "研发", "算法", "测试", "工程师", "运维",
+                     "数据标注", "剪辑", "美工", "设计", "体验官", "管培",
+                     "运营合伙人", "招募", "技术支持")
+# 标题/JD/技能里算"有 AI 证据"的核心词。刻意比 AI_DIRECTION_TERMS 窄：
+# "算法/向量/CV"这类泛技术词不算（地质算法岗 JD 通篇算法但无 AI 产品语义，
+# 不能靠它留下来）。裸 "AI" 用前后瞻匹配（能命中"AI客服/AI应用/AI服务器"
+# 这类中英混写；(?<![a-z]) 挡掉 said/email 这类英文单词——Python 的 \b 把
+# 中文也当词字符，"AI服务器"反而匹配不上，不能用 \b）。
+_JD_AI_EVIDENCE_TERMS = ("ai产品", "aigc", "人工智能", "大模型", "llm",
+                         "gpt", "智能体", "agent", "大语言模型", "生成式",
+                         "多模态", "机器学习", "深度学习", "智驾", "adas",
+                         "自动驾驶")
+_BARE_AI_RE = re.compile(r"(?<![a-z])ai(?![a-z])", re.IGNORECASE)
+# 技术词命中时先看岗名核心：以"产品经理/产品运营"结尾的是产品岗挂技术方向
+# （如 AIGC算法产品经理、AI芯片测试产品经理），不算技术岗，放行到 AI 证据判定。
+_PRODUCT_CORE_SUFFIX = ("产品经理", "产品运营")
+
+
+def _has_ai_evidence(*texts):
+    """标题/JD/技能里有没有 AI 证据（大小写不敏感）。"""
+    for text in texts:
+        if not text:
+            continue
+        if isinstance(text, (list, tuple, set)):
+            text = " ".join(str(t) for t in text)
+        low = unicodedata.normalize("NFKC", str(text)).lower()
+        if any(t in low for t in _JD_AI_EVIDENCE_TERMS):
+            return True
+        if _BARE_AI_RE.search(low):
+            return True
+    return False
+
+
+def _title_jd_match(job, head=160):
+    """JD 是否与岗位名对得上（job_summary.jd_matches_title 的语义单源实现）。
+
+    平台模糊召回会带回别的岗位（如标题"产品经理"、JD 却是"招募小红书运营
+    合伙人"的引流帖）。标题切块后任一块（含 2 字滑窗兜底中文长词）在 JD
+    前 head 字里出现即算对上；标题或 JD 缺失时不判（返回 True）。
+    与 job_summary.jd_matches_title 同算法，两边由
+    tests/test_job_summary.py::JdMatchConsistencyTests 钉住一致，防漂移。
+    """
+    if not isinstance(job, dict):
+        return True
+    title = str(job.get("title") or "")
+    jd = str(job.get("jd") or "")
+    if not title or not jd:
+        return True
+    text = unicodedata.normalize("NFKC", jd).lower()
+    for chunk in re.split(r"[\s\-—_|/·、,，()（）【】\[\]]+",
+                          unicodedata.normalize("NFKC", title).strip().lower()):
+        chunk = chunk.strip()
+        if len(chunk) < 2:
+            continue
+        if chunk in text:
+            return True
+        if re.search(r"[\u4e00-\u9fff]", chunk) and len(chunk) > 3:
+            for i in range(len(chunk) - 1):
+                if chunk[i:i + 2] in text:
+                    return True
+    return False
+
+
+# 非技术岗的岗名词汇（删库规则的硬门槛）。本质标准是用户定的"AI 非技术岗"：
+# 技术还是非技术，看标题在说什么岗，不看 JD 里有多少 AI 词（AI 安全研究岗的
+# JD 通篇大模型/LLM/Agent，但它招的是做研究的人，不是产品/运营）。
+# FDE 不在此列（用户明示例外，单独保留）。
+_ROLE_WORDS = ("产品", "pm", "运营", "增长", "策略", "内容", "数据",
+               "助理", "专员", "项目", "营销")
+
+
+def drop_junk_jobs(jobs):
+    """删库：销售/技术/噪声直接删，不保留（用户 2026-10-23 口径）。
+
+    本质标准只认一条：**AI 非技术岗**。判定顺序：
+
+    1. 标题含 FDE → 直接保留（用户明示例外）；
+    2. 销售：标题命中销售词（强判定）→ 删；JD 命中销售强特征词 → 只预警
+   不删（JD 里单个销售词误伤太大：薪酬里的"提成"、任职要求里的"客户资源"、
+   产品经济测算里的"销售目标"都不是销售岗，删了就是漏岗）；
+    3. 技术/设计/杂：标题命中技术词 → 删；
+    4. 标题没有非技术岗名词汇（产品/运营/增长/策略/内容/数据/助理/专员/
+       项目/营销/pm）→ 删（噪声：连招什么岗都说不清，如纯"AI应用实习生"、
+       "AI Agent实习生"这类技术杂工标题）；
+    5. 标题/JD/技能三处都没有 AI 证据 → 删；再分两类：标题能对上 JD 的记
+       "跨行业噪声"（如传统软件产品助理），对不上的记"JD与岗名不符"
+       （如招募合伙人引流帖）。
+    有一处 AI 证据就留（A 层标题明示 + B 层标题普通但 JD/技能含 AI）。
+    无 JD 的记录跳过 JD 相关规则（只做标题规则；证据看标题+技能）。
+
+    返回 ``(kept, dropped)``：dropped 含各类计数 + **丢掉的清单**
+    （job_id/title/company/reason，不静默丢）。``suspect`` 是 JD 疑似销售岗，
+    只预警不删（见上），调用方应写进 warnings 提示人工复核。
+    """
+    kept = []
+    dropped = {"sales": 0, "tech": 0, "mismatch": 0, "noise": 0, "suspect": 0,
+               "items": [], "suspect_items": []}
+    for job in jobs or []:
+        if not isinstance(job, dict):
+            continue
+        title = str(job.get("title") or "")
+        low = title.lower()
+        reason = ""
+        if "fde" in low:
+            kept.append(job)  # FDE 例外：用户明示保留
+            continue
+        if any(t in low for t in _SALES_TITLE_TERMS):
+            reason = "销售岗（标题）"
+            dropped["sales"] += 1
+        elif any(t in low for t in _TECH_TITLE_TERMS):
+            core = re.split(r"[（(]", title)[0].strip()
+            if core.endswith(_PRODUCT_CORE_SUFFIX):
+                pass  # 产品经理挂技术方向（如算法/测试产品经理）→ 不是技术岗，转 AI 证据判定
+            else:
+                reason = "技术/设计岗（标题）"
+                dropped["tech"] += 1
+        if reason:
+            pass
+        elif not any(w in low for w in _ROLE_WORDS):
+            reason = "噪声（标题无岗名）"
+            dropped["noise"] += 1
+        else:
+            jd = str(job.get("jd") or "")
+            skills = job.get("skill_tags") or job.get("skills") or []
+            if not jd.strip() and not skills:
+                kept.append(job)
+                continue
+            jlow = _normalize_jd(jd)
+            if any(t in jlow for t in _SALES_JD_TERMS):
+                kept.append(job)  # JD 疑似：只预警不删（见函数 docstring）
+                dropped["suspect"] += 1
+                dropped["suspect_items"].append({
+                    "job_id": str(job.get("job_id") or ""),
+                    "title": title,
+                    "company": str(job.get("company_name") or ""),
+                    "reason": "销售疑似（JD），请人工复核",
+                })
+                continue
+            if not _has_ai_evidence(title, jd, skills):
+                if _title_jd_match(job):
+                    reason = "跨行业噪声（标题JD技能均无AI）"
+                else:
+                    reason = "JD与岗名不符"
+                dropped["noise" if "噪声" in reason else "mismatch"] += 1
+            else:
+                kept.append(job)
+                continue
+        if reason:
+            dropped["items"].append({
+                "job_id": str(job.get("job_id") or ""),
+                "title": title,
+                "company": str(job.get("company_name") or ""),
+                "reason": reason,
+            })
+            continue
+        kept.append(job)
+    return kept, dropped
+
+
 def list_stage_audit(jobs, keywords=None, job_expectation=""):
     """**列表层体检**（在抓详情之前做——问题要在便宜的一层暴露）。
 

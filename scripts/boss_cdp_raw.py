@@ -19,7 +19,7 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
   uv run python3 scripts/boss_cdp_raw.py --version
 """
 
-__version__ = "2.21.0"
+__version__ = "2.22.0"
 
 import argparse
 import base64
@@ -5166,6 +5166,7 @@ def _list_has_detail_risk(list_path):
 
 def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
               detail=True, detail_concurrency=1, keep_without_jd=False,
+              keep_junk=False,
               pages_parallel=1, list_mode="xhr", detail_channel="auto",
               lock_already_held=False, fmt="json", allow_dom_fallback=False,
               max_jobs=None, max_seconds=None, filter_inactive=False):
@@ -5174,7 +5175,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
         return _run_batch_impl(
             config_path, cdp_port=cdp_port, max_concurrent=max_concurrent,
             detail=detail, detail_concurrency=detail_concurrency,
-            keep_without_jd=keep_without_jd, pages_parallel=pages_parallel,
+            keep_without_jd=keep_without_jd, keep_junk=keep_junk, pages_parallel=pages_parallel,
             list_mode=list_mode, detail_channel=detail_channel,
             fmt=fmt, allow_dom_fallback=allow_dom_fallback,
             max_jobs=max_jobs, max_seconds=max_seconds,
@@ -5191,7 +5192,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
         return _run_batch_impl(
             config_path, cdp_port=cdp_port, max_concurrent=max_concurrent,
             detail=detail, detail_concurrency=detail_concurrency,
-            keep_without_jd=keep_without_jd, pages_parallel=pages_parallel,
+            keep_without_jd=keep_without_jd, keep_junk=keep_junk, pages_parallel=pages_parallel,
             list_mode=list_mode, detail_channel=detail_channel,
             fmt=fmt, allow_dom_fallback=allow_dom_fallback,
             max_jobs=max_jobs, max_seconds=max_seconds,
@@ -5202,6 +5203,7 @@ def run_batch(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
 
 def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                     detail=True, detail_concurrency=1, keep_without_jd=False,
+                    keep_junk=False,
                     pages_parallel=1, list_mode="xhr", detail_channel="auto",
                     fmt="json", allow_dom_fallback=False, max_jobs=None,
                     max_seconds=None, filter_inactive=False):
@@ -5298,6 +5300,7 @@ def _run_batch_impl(config_path, cdp_port=DEFAULT_CDP_PORT, max_concurrent=1,
                 merged_export = _merge_jd_into_export(
                     list_path, details_result, base=list_data,
                     keep_without_jd=keep_without_jd,
+                    keep_junk=keep_junk,
                     extra_meta=_detail_channel_metadata(
                         list_data, detail_channel, channel_stats,
                         stats_supplied=True))
@@ -8004,6 +8007,8 @@ def build_parser():
     g_detail.add_argument("--max-details", type=int, default=None, help="最多抓几个详情")
     g_detail.add_argument("--keep-without-jd", action="store_true",
                           help="保留无 JD 岗位（默认口径一：详情抓完后把 jd 并入列表并剔除无 JD 岗位）")
+    g_detail.add_argument("--keep-junk", action="store_true",
+                          help="保留销售/技术/噪声岗（默认删库：合并导出时直接剔除，用户 2026-10-23 口径）")
     g_detail.add_argument("--filter-inactive", action="store_true",
                           help="按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，"
                                "不误杀本周/本月活跃）；默认关闭")
@@ -8439,6 +8444,7 @@ def _run_cli_impl(p, args):
                            max_concurrent=args.max_concurrent,
                            detail=args.detail, detail_concurrency=args.concurrency,
                            keep_without_jd=args.keep_without_jd,
+                           keep_junk=args.keep_junk,
                            pages_parallel=args.pages_parallel,
                            list_mode=args.list_mode,
                            detail_channel=args.detail_channel,

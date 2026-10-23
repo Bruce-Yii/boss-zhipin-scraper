@@ -113,6 +113,18 @@ class DirectionTests(unittest.TestCase):
         self.assertTrue(is_ai_pm)
         self.assertEqual(label, "ai_pm")
 
+    def test_zhi_li_is_not_direction_signal(self):
+        """"治理"不是方向词（用户 2026-10-23：从未认可，已移除）。
+        只有"治理"撑着的标题不得判 ai_pm；真 AI 产品岗不受影响。"""
+        is_ai_pm, label, _ = self.model.classify_direction(
+            {"title": "AI治理专员", "jd": "负责数据治理规范"})
+        self.assertFalse(is_ai_pm)
+        self.assertNotEqual(label, "ai_pm")
+        is_ai_pm2, label2, _ = self.model.classify_direction(
+            {"title": "AI产品经理", "jd": "负责 AI 产品规划"})
+        self.assertTrue(is_ai_pm2)
+        self.assertEqual(label2, "ai_pm")
+
 
 class SalaryPartsTests(unittest.TestCase):
 

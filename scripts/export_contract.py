@@ -539,7 +539,7 @@ def attach_acceptance_result(payload, source_path=None):
 
 
 def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
-                          extra_meta=None):
+                          extra_meta=None, keep_junk=False):
     """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
 
     - 每条 job 追加 `jd` 字段（有详情时）
@@ -547,6 +547,8 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
       列表的「在线」/空），不因合并而降级
     - `keep_without_jd=False`（默认）：**剔除无 JD 的岗位**——用户口径"没 JD 的
       岗位毫无意义"，避免下游再筛
+    - `keep_junk=False`（默认）：**删库**——销售/技术/噪声岗直接剔除（用户
+      2026-10-23 口径，旧"摘要层过滤"作废）；`--keep-junk` 可保留
     - meta 记录 `jd_coverage`（with_jd/total_before/dropped_no_jd）与 `dropped_no_jd`
       （被剔除 job_id 列表，可追溯）；`job_count`/`total` 同步为保留数
 
@@ -611,6 +613,33 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
     data["jobs"] = kept
     data["job_count"] = len(kept)
     data["total"] = len(kept)
+    # ── 删库（2026-10-23 用户口径）──────────────────────────────
+    # 销售/技术/噪声岗直接剔除，不保留（旧"摘要层过滤"作废）。
+    # --keep-junk 可保留（排查用）。删库在自检/验收之前，结果写进
+    # data["dropped_junk"]（job_id/title/company/reason，可追溯）。
+    # 极端情况（全删光）会走到下面的空导出保护，保留列表原数据并告警。
+    junk = {}
+    if not keep_junk and _semantics is not None and hasattr(_semantics, "drop_junk_jobs"):
+        try:
+            kept2, junk = _semantics.drop_junk_jobs(kept)
+            if junk.get("items"):
+                data["jobs"] = kept2
+                data["job_count"] = len(kept2)
+                data["total"] = len(kept2)
+                data["dropped_junk"] = junk["items"]
+                data.setdefault("warnings", []).append(
+                    f"删库：已剔除 {len(junk['items'])} 条销售/技术/噪声岗"
+                    "（用户 2026-10-23 口径，见 dropped_junk）")
+                print(f"🗑️ 删库：剔除 {len(junk['items'])} 条销售/技术/噪声岗"
+                      f"（{', '.join(sorted({it['reason'].split('（')[0] for it in junk['items']})[:4])}）")
+                kept = kept2
+            if junk.get("suspect_items"):
+                data["suspect_sales_jd"] = junk["suspect_items"]
+                data.setdefault("warnings", []).append(
+                    f"销售疑似（JD）：{len(junk['suspect_items'])} 条 JD 命中销售强特征词，"
+                    "未删库，请人工复核（见 suspect_sales_jd）")
+        except Exception as exc:  # pragma: no cover - 删库失败不得影响导出
+            data.setdefault("warnings", []).append(f"删库规则异常（已跳过删库）：{exc}")
     # 验收结论**跟着产物走**（独立审计：新验收器在生产代码里零引用 → 没人跑、
     # 结论进不了决策）。挂在最终产物出口，不是靠人记得手动跑。
     attach_acceptance_result(data, source_path=target_path)

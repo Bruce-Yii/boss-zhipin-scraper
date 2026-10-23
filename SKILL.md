@@ -1,7 +1,7 @@
 ---
 name: boss-zhipin-scraper
 description: "Scrape BOSS直聘 (job listing site) via Chrome CDP. Searches jobs by keyword/city/filters, fetches JD details, outputs structured JSON/CSV with plaintext salary, and can summarize scraped results into a job-market prompt. Use when user wants to search/analyze jobs on BOSS直聘 or zhipin.com."
-version: 2.21.0
+version: 2.22.0
 author: eatmoreduck
 license: MIT
 platforms: [macos, linux, windows]
@@ -10,7 +10,7 @@ metadata:
     tags: [scraper, jobs, career, cdp, chrome, zhipin, boss直聘]
 ---
 
-# BOSS直聘职位抓取工具 v2.21.0
+# BOSS直聘职位抓取工具 v2.22.0
 
 通过 Chrome CDP 协议抓取 BOSS直聘 (zhipin.com) 职位数据，输出结构化 JSON/CSV（含明文薪资），并可对已抓取结果生成聚合摘要和求职材料优化提示词。
 
@@ -187,6 +187,7 @@ python3 -m py_compile scripts/boss_cdp_raw.py scripts/ratelimit.py scripts/expor
 | `--detail-channel` | dom | 详情通道：dom（默认，整页渲染，document 导航，唯一有生产证据的形态）/ html（**已封存**：平台会间歇性返回别的岗位的 JD，且 textContent 抽取会带进 display:none 诱饵文本；绝对限速下零吞吐收益）/ auto/api/encrypt/panel（api·encrypt 已封存）；meta 记录真实成功通道 `api`/`encrypt`/`dom`/`panel`/`mixed` 及 `detail_channel_counts` |
 | `--max-concurrent N` | 1 | 并发抓取任务数上限（规格硬防线；仅指令显式开启，任一任务风控即全停） |
 | `--keep-without-jd` | 关闭 | 保留无 JD 岗位（默认口径一：详情抓完后剔除无 JD 岗位） |
+| `--keep-junk` | 关闭 | 保留销售/技术/噪声岗（默认删库：合并导出时直接剔除，只认 AI 非技术岗；FDE 例外保留；JD 疑似销售只预警不删） |
 | `--retry-job JOB_ID` | - | 强制重试指定 job_id（可重复指定） |
 | `--allow-dom-fallback` | 关闭 | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--filter-inactive` | 关闭 | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃） |
