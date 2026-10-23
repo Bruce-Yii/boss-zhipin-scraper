@@ -203,10 +203,13 @@ def _canon_key(text):
 
 
 def _title_terms(title):
-    """岗位名里的候选词（**通用词被剔除**）。
+    """岗位名里的候选词（**与消费端 job_summary.jd_matches_title 同口径**）。
 
-    判定"JDs 与岗位名对得上"时，只有**有区分度**的词才算命中依据：
-    「产品」「经理」这类通用词不算（P5 太弱的根因）。
+    判定"JD 与岗位名对得上"时，标题的任一片段（含 2 字滑窗）出现在 JD 里
+    就算命中。**不**剔除"通用词"——剔除通用词会把「产品经理」这种标题削成
+    一个滑窗造出来的伪词「品经」，导致大量真岗位被误判成 mismatch（实测
+    466 条里 70 条假阳性）。消费端的权威口径是"任一标题片段命中"，验收器
+    必须与之同口径，否则验收结论与实际过滤结果矛盾。
     """
     text = _norm(title)
     terms = set()
@@ -219,7 +222,19 @@ def _title_terms(title):
         if re.search(r"[一-鿿]", chunk) and len(chunk) > 3:
             for i in range(len(chunk) - 1):
                 terms.add(chunk[i:i + 2])
-    return {t for t in terms if len(t) >= 2 and t not in _GENERIC_TITLE_TERMS}
+    # 注意：**不要**在这里剔除"通用词"。
+    #
+    # 这是 2026-10-22 独立审计给 P5 加的"通用词过滤"导致的回归：把
+    # 「产品」「经理」这类词全部剔除后，「产品经理」这种标题只剩一个滑窗
+    # 造出来的伪词「品经」，而真实 JD 里根本不会有「品经」——于是 466 条里
+    # 70 条**真正对得上**的岗位被误判成"JD 与岗位名对不上"（实测 acceptance
+    # 报 72 条、job_summary.jd_matches_title 只报 2 条，两者口径打架）。
+    #
+    # 消费端（job_summary.jd_matches_title）的定义才是"JD 是否与岗位名对得上"
+    # 的权威口径：任一标题片段（含 2 字滑窗）出现在 JD 里就算对得上。验收器
+    # 必须与消费端同口径，否则验收结论与实际过滤结果矛盾。通用词**不**剔除：
+    # 「产品」出现在 JD 里本身就是岗位相关的证据，剔除它反而把信号削没了。
+    return {t for t in terms if len(t) >= 2}
 
 
 def _content_lens(record, head=180):
@@ -517,7 +532,8 @@ def _check_p4(records):
 
 
 def _check_p5(records):
-    """P5（信号，warn）：JD 必须出现岗位名里有区分度的词。"""
+    """P5（信号，warn）：JD 必须出现岗位名里的词（与 job_summary.jd_matches_title
+    同口径：任一标题片段/2 字滑窗命中即算对得上）。"""
     mismatch = []
     for record in records:
         title = str(record.get("title") or "")
@@ -533,7 +549,7 @@ def _check_p5(records):
     samples = "；".join(str(r.get("title") or "")[:20] for r in mismatch[:5])
     return [_finding(
         "P5_jd_matches_its_title", "warn",
-        f"有 {len(mismatch)} 条 JD 与岗位名对不上（通用词不算命中，"
+        f"有 {len(mismatch)} 条 JD 与岗位名对不上（标题片段/滑窗均未出现在 JD，"
         f"疑似张冠李戴）：{samples}", len(mismatch))]
 
 

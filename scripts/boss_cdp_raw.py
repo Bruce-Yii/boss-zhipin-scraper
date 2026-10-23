@@ -86,6 +86,7 @@ merge_unique = _export_contract.merge_unique
 _atomic_write_json = _export_contract._atomic_write_json
 _atomic_write_export_json = _export_contract._atomic_write_export_json
 cleanup_stale_tmp_files = _export_contract.cleanup_stale_tmp_files
+cleanup_corrupted_json = _export_contract.cleanup_corrupted_json
 flush_jobs = _export_contract.flush_jobs
 _merge_jd_into_export = _export_contract._merge_jd_into_export
 
@@ -3823,70 +3824,17 @@ def merge_jobs(external_path, new_jobs):
     # 链接取新（2026-10-22）：同一 job_id 再次出现时**新链接覆盖旧链接**，其余字段保持
     # 旧记录。注：链接本身是稳的（实测隔天用真导航打开仍是同一岗位），这里只是保证
     # 合并时用最新一次列表拿到的链接。
-    refreshed = _refresh_links_in_jobs(merged, new_jobs)
-    if refreshed:
-        print(f"🔗 链接刷新: {refreshed} 条改用本次的新链接（平台 URL 是短时效凭证）")
+    # 链接刷新已移除（见上方说明）：job_id=md5(job_link)，刷新 job_link 会改变 job_id
     added = len(merged) - len(old_jobs)
     print(f"合并: 旧文件 {len(old_jobs)} 条 + 新抓取 {len(new_jobs)} 条 = {len(merged)} 条 (新增 {added})")
     return merged
 
 
-def _refresh_links_in_jobs(jobs, fresh_jobs):
-    """把同 job_id 的**新链接**覆盖到旧记录上，返回更新条数。
-
-    平台 `job_detail` URL 含 securityId 段（只用 job_id 拼会 404）→ 链接**不能由
-    job_id 重建**，耐久主键是 job_id、链接需要单独刷新。
-    实测：链接字符串跨天稳定，隔天用真导航打开仍是同一岗位；真正会"取到别的岗位"的是
-    fetch(XHR) 取页面时命中平台诱饵（渲染通道不受影响）。
-    """
-    fresh = {}
-    for job in fresh_jobs or []:
-        if not isinstance(job, dict):
-            continue
-        jid = job.get("job_id")
-        link = job.get("job_link") or job.get("link")
-        if jid and link:
-            fresh[jid] = link
-    changed = 0
-    stamp = datetime.now().isoformat(timespec="seconds")
-    for job in jobs or []:
-        if not isinstance(job, dict):
-            continue
-        jid = job.get("job_id")
-        if jid in fresh and job.get("job_link") != fresh[jid]:
-            job["job_link"] = fresh[jid]
-            job["link"] = fresh[jid]
-            job["link_verified_at"] = stamp
-            changed += 1
-    return changed
-
-
-def refresh_links_in_export(export_path, fresh_jobs):
-    """按 job_id 用新鲜链接刷新导出里的 job_link（链接失效后的恢复手段）。
-
-    返回 ``(updated, missing)``：``updated`` = 刷新的条数；``missing`` = 列表里已不再
-    出现（岗位下架或换了关键词）的 job_id 数量。
-    """
-    try:
-        with open(export_path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        raise DetailExtractionError(f"导出文件读取失败: {exc}") from exc
-    jobs = data.get("jobs") if isinstance(data, dict) else data
-    if not isinstance(jobs, list):
-        raise DetailExtractionError("导出文件里没有 jobs 列表")
-    updated = _refresh_links_in_jobs(jobs, fresh_jobs)
-    fresh_ids = {j.get("job_id") for j in (fresh_jobs or [])
-                 if isinstance(j, dict) and j.get("job_id")}
-    missing = [j.get("job_id") for j in jobs
-               if isinstance(j, dict) and j.get("job_id") not in fresh_ids]
-    if isinstance(data, dict):
-        data["links_refreshed_at"] = datetime.now().isoformat(timespec="seconds")
-        data["links_missing_count"] = len(missing)
-        if missing:
-            data["links_missing_job_ids"] = missing[:200]
-        _atomic_write_export_json(export_path, data)
-    return updated, len(missing)
+# ── 链接刷新（已移除，2026-10-23）──────────────────────────────────────
+# 根因：job_id = md5(job_link)，刷新 job_link 会改变 job_id，导致按 job_id
+# 匹配永远找不到。设计上 job_link 跨天稳定（实测），refresh_links 从未起过作用。
+# 如需重新获取链接，直接重新抓取（--merge 会去重）。
+# ─────────────────────────────────────────────────────────────────────────
 
 
 def merge_details(external_path, new_details):
@@ -4350,7 +4298,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
 
     # run 级血缘字段：本次运行是谁、什么代码、何时开始（record_counts 由 flush_jobs 累积）
     run_id = uuid.uuid4().hex
-    run_started_at = datetime.now().isoformat()
+    run_started_at = datetime.now().astimezone().isoformat()
     # B 增量同步观察集合：本 run 观察到的全部 job_id（新增+重复，raw 事实，
     # 独立于累积 jobs 数组；B 方案 A 契约字段 observed_jobs）
     observed_ids = []
@@ -4652,7 +4600,7 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
                     "city": city_name,
                     "filters": filters,
                     "filter_desc": filter_desc,
-                    "scraped_at": datetime.now().isoformat(),
+                    "scraped_at": datetime.now().astimezone().isoformat(),
                     "page_count": pg,
                     "warnings": warnings,
                     "run_id": run_id,
@@ -4752,17 +4700,22 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
             "city": city_name,
             "filters": filters,
             "filter_desc": filter_desc,
-            "scraped_at": datetime.now().isoformat(),
+            "scraped_at": datetime.now().astimezone().isoformat(),
             "page_count": actual_pages or 1,
             "warnings": warnings,
             "run_id": run_id,
             "scraper_version": __version__,
             "started_at": run_started_at,
-            "ended_at": datetime.now().isoformat(),
+            "ended_at": datetime.now().astimezone().isoformat(),
             "mode": "incremental",
             "observed_jobs": sorted(set(observed_ids)),
             "exhausted": exhausted,
             "list_stage_audit": list_audit,
+            # 目标词根（机器可用，供 acceptance P11 核对"是不是这次要找的岗"）：
+            # 关键词是**搜索词**，平台对它模糊召回 → 搜 "AI产品经理" 会回来
+            # "AI出海产品经理" 这类命中目标但标题不含完整串的岗位 →
+            # 命中判定按词根算，不按整串。词根取自关键词按常见分隔符拆分。
+            "target_roots": [r.strip() for r in str(keyword or "").replace("，", ",").split(",") if r.strip()],
             "raw_sources": {"list": raw_path} if raw_path else {},
             "fidelity": fidelity_report or {},
         }, all_jobs)
@@ -7999,10 +7952,6 @@ def build_parser():
     g_search.add_argument("--only-relevant-title", action="store_true",
                           help=("只保留标题是产品经理/AI 方向的岗位（列表阶段过滤，丢掉的岗"
                                 "不抓详情 → 不耗额度）"))
-    g_search.add_argument("--refresh-links", metavar="EXPORT_PATH", default=None,
-                          help="按 job_id 用**新拉取的列表链接**刷新导出里的 job_link"
-                               "（链接含 securityId 段、不能由 job_id 重建；本模式只发列表"
-                               "请求，不占详情页日额度）并报告多少个 job_id 已查不到")
     g_search.add_argument("--max-jobs", type=int, default=None,
                           help="列表条数上限，抓够即停（BOSS 每页 30 条，实际条数可能略超；不设则按 --pages 抓满）")
     g_search.add_argument("--max-concurrent", type=int, default=1,
@@ -8422,6 +8371,9 @@ def _run_cli_impl(p, args):
 
     # 启动清扫残留 .tmp（崩溃/断电遗留），只删超保留期的，防误删并发进程正在写的
     cleanup_stale_tmp_files(DEFAULT_RESULT_DIR)
+    corrupted = cleanup_corrupted_json(DEFAULT_RESULT_DIR)
+    if corrupted:
+        print(f"🧹 启动清扫：隔离了 {corrupted} 个损坏的 JSON 文件（移入 quarantine/）")
     cleanup_security_sidecars()  # 清理过期 securityId sidecar（P1 双通道）
     cleanup_stale_tmp_files(os.path.dirname(SCRAPE_LOCK_PATH))
 
@@ -8671,7 +8623,7 @@ def _run_cli_impl(p, args):
                 "keyword": list_data.get("keyword", ""),
                 "city": list_data.get("city", ""),
                 "filters": filters,
-                "scraped_at": datetime.now().isoformat(),
+                "scraped_at": datetime.now().astimezone().isoformat(),
                 "multi_keyword": keywords,
             }, list_data.get("jobs") or [])
             list_data["output_path"] = merged_path
@@ -8679,18 +8631,6 @@ def _run_cli_impl(p, args):
             if args.format == "csv":
                 write_csv(merged_path.rsplit(".", 1)[0] + ".csv",
                           list_data.get("jobs") or [])
-        # ── --refresh-links：只刷新链接，不抓详情 ──
-        if args.refresh_links:
-            fresh_jobs = list_data.get("jobs") or []
-            updated, missing = refresh_links_in_export(
-                args.refresh_links, fresh_jobs)
-            print(f"🔗 链接刷新完成：{updated}/{len(fresh_jobs)} 条用上新链接"
-                  f"｜列表里已找不到的岗位 {missing} 个（已下架或换了关键词）")
-            print(f"   刷新目标：{args.refresh_links}")
-            if missing:
-                print("   ⚠️ 这些 job_id 在当前列表里查不到（岗位可能已下架）——"
-                      "耐久主键是 job_id，需要时可按它重新检索")
-            return 0
 
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
@@ -8725,7 +8665,7 @@ def _run_cli_impl(p, args):
                 "city": list_data.get("city", ""),
                 "filters": list_data.get("filters", {}),
                 "filter_desc": list_data.get("filter_desc", []),
-                "scraped_at": datetime.now().isoformat(),
+                "scraped_at": datetime.now().astimezone().isoformat(),
                 "merged_from": args.merge,
             }, merged_jobs)
             print(f"合并结果已保存: {args.output}")

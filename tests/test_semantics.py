@@ -246,38 +246,5 @@ class KnownBadPageSkipTests(unittest.TestCase):
         self.assertEqual(recorded["fingerprint"], "no_section")
 
 
-class LinkRefreshTests(unittest.TestCase):
-    """链接是短时效凭证：必须能"取新"且能"刷新回来"。"""
-
-    def setUp(self):
-        self.module = load_module("boss_cdp_raw", ROOT / "scripts" / "boss_cdp_raw.py")
-
-    def test_new_link_replaces_stale_link_for_same_job_id(self):
-        jobs = [{"job_id": "a", "job_link": "https://x/OLD.html"}]
-        fresh = [{"job_id": "a", "job_link": "https://x/NEW.html"}]
-        changed = self.module._refresh_links_in_jobs(jobs, fresh)
-        self.assertEqual(changed, 1)
-        self.assertEqual(jobs[0]["job_link"], "https://x/NEW.html")
-        self.assertTrue(jobs[0]["link_verified_at"])
-
-    def test_refresh_links_in_export_updates_and_reports_missing(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "export.json")
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump({"jobs": [
-                    {"job_id": "a", "job_link": "https://x/OLD.html"},
-                    {"job_id": "b", "job_link": "https://x/OLD2.html"},
-                ]}, handle)
-            fresh = [{"job_id": "a", "job_link": "https://x/NEW.html"}]
-            updated, missing = self.module.refresh_links_in_export(path, fresh)
-            self.assertEqual(updated, 1)
-            self.assertEqual(missing, 1)      # b 在新列表里查不到
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
-            self.assertEqual(data["jobs"][0]["job_link"], "https://x/NEW.html")
-            self.assertEqual(data["links_missing_count"], 1)
-            self.assertTrue(data["links_refreshed_at"])
-
-
 if __name__ == "__main__":
     unittest.main()

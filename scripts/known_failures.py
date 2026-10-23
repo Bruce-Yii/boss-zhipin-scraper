@@ -43,6 +43,14 @@ import threading
 import time
 import uuid
 
+try:
+    from scripts import file_lock as _file_lock
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import file_lock as _file_lock
+
+acquire_guard = _file_lock.acquire_guard
+atomic_replace = _file_lock.atomic_replace
+
 KNOWN_BAD_PATH_ENV = "BOSS_KNOWN_BAD_PATH"
 STATE_DIR_ENV = "BOSS_STATE_DIR"
 # 强制重试名单（除命令行 --retry-job 外的第二个入口，给批处理/子进程用）
@@ -55,6 +63,9 @@ TRANSIENT = "transient"     # 瞬时：渲染没完成 / 网络抖动 → 只本
 # 只有这些指纹算**结构性失败**。其余一律按**瞬时**处理（fail-open）：
 # 认不出来的一律当瞬时——多试一次的代价（1 次详情额度）远小于岗位被永久拉黑的代价。
 STRUCTURAL_FINGERPRINTS = frozenset({"no_section"})
+# fail-open：只有明确的结构性指纹才进长期台账；认不出来的一律当瞬时。
+# "too_short" 保持瞬时：页面可能没渲染完（瞬时），重试的代价（1 次详情额度）
+# 远小于岗位被永久拉黑的代价。MAX_SKIP_RUNS=5 是安全阀。
 
 # ── 台账时效 ────────────────────────────────────────────────────────────────
 # 结构性条目的 TTL：**30 天**。
@@ -232,11 +243,7 @@ def _guard_path(path=None):
 
 
 def _with_guard(action, path=None, timeout=GUARD_TIMEOUT_SECONDS):
-    """用 O_CREAT|O_EXCL guard 文件对台账读-改-写做**进程间**互斥。
-
-    与 ``boss_cdp_raw._with_scrape_lock_guard`` 同思路（原子创建 = 互斥）。
-    抢不到锁不算错误：等一会儿（超时就**放弃本次写入**，台账丢一条不影响抓取）。
-    """
+    """用 guard 文件对台账读-改-写做**进程间**互斥（委托给 file_lock）。"""
     guard = _guard_path(path)
     directory = os.path.dirname(guard)
     if directory:
@@ -244,37 +251,13 @@ def _with_guard(action, path=None, timeout=GUARD_TIMEOUT_SECONDS):
             os.makedirs(directory, exist_ok=True)
         except OSError:
             return False
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            fd = os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            break
-        except FileExistsError:
-            # 陈旧 guard（持有进程崩溃残留）→ 超过阈值就清掉再抢
-            try:
-                age = time.time() - os.path.getmtime(guard)
-            except OSError:
-                age = 0.0
-            if age > GUARD_STALE_SECONDS:
-                try:
-                    os.remove(guard)
-                except OSError:
-                    pass
-                continue
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(GUARD_POLL_SECONDS)
-        except OSError:
-            return False
     try:
-        action()
-        return True
-    finally:
-        try:
-            os.remove(guard)
-        except OSError:
-            pass
+        with acquire_guard(guard, timeout=timeout,
+                           stale_threshold=GUARD_STALE_SECONDS):
+            action()
+            return True
+    except _file_lock.GuardAcquisitionError:
+        return False
 
 
 def _read(path=None):
@@ -294,35 +277,24 @@ def _write(data, path=None):
     if directory:
         os.makedirs(directory, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False)
-    delay = REPLACE_BACKOFF_SECONDS
-    last_error = None
-    for _ in range(REPLACE_RETRIES):
-        fd, tmp = tempfile.mkstemp(prefix=".known_bad-", dir=directory or None)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, target)
+    fd, tmp = tempfile.mkstemp(prefix=".known_bad-", dir=directory or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if atomic_replace(tmp, target):
             return True
-        except PermissionError as exc:
-            # 并发占用（另一个进程/杀软正开着目标文件）→ 退避重试，不是错误
-            last_error = exc
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            time.sleep(delay)
-            delay = min(delay * 2, 0.5)
-            continue
-        except BaseException:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
-    if last_error is not None:
-        raise last_error
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
     raise OSError("台账写入失败")
 
 

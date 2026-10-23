@@ -58,6 +58,13 @@ import tempfile
 import threading
 import time
 
+try:
+    from scripts import file_lock as _file_lock
+except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+    import file_lock as _file_lock
+
+acquire_guard = _file_lock.acquire_guard
+atomic_replace = _file_lock.atomic_replace
 DEFAULT_DAILY_DETAIL_BUDGET = 700
 BUDGET_PATH_ENV = "BOSS_DAILY_BUDGET_PATH"
 STATE_DIR_ENV = "BOSS_STATE_DIR"
@@ -285,37 +292,28 @@ def _write_state(state, path=None):
     payload = dict(state)
     payload["seq"] = int(payload.get("seq") or 0) + 1
     data = json.dumps(payload, ensure_ascii=False)
-    delay = REPLACE_BACKOFF_SECONDS
-    last_error = None
-    for _ in range(REPLACE_RETRIES):
-        fd, tmp = tempfile.mkstemp(prefix=".daily_budget-", dir=directory or None)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(data)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, target)
+    fd, tmp = tempfile.mkstemp(prefix=".daily_budget-", dir=directory or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if atomic_replace(tmp, target):
             _LAST_GOOD[target] = dict(payload)
             if payload["seq"] > _LAST_SEQ.get(target, 0):
                 _LAST_SEQ[target] = payload["seq"]
             return payload
-        except PermissionError as exc:
-            # 并发占用（别的进程正开着目标文件）→ 退避重试，不是错误
-            last_error = exc
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            time.sleep(delay)
-            delay = min(delay * 2, 0.5)
-            continue
-        except BaseException:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-            raise
-    _warn(f"日预算计数写入失败（{last_error}）：本进程计数留在内存快照里，"
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    _warn("日预算计数写入失败（os.replace 重试耗尽）：本进程计数留在内存快照里，"
           "跨进程口径可能偏低（请检查状态目录权限/占用）")
     _LAST_GOOD[target] = dict(payload)
     return payload
@@ -330,14 +328,7 @@ def _lock_path(target):
 
 
 def _with_file_lock(action, path=None, timeout=LOCK_TIMEOUT_SECONDS):
-    """用 O_CREAT|O_EXCL guard 文件对计数文件的读-改-写做**进程间**互斥。
-
-    与 ``boss_cdp_raw._with_scrape_lock_guard`` 同思路：guard 原子创建保证同一
-    时刻只有一个进程做 RMW；抢不到就自旋等待（带微小抖动）。
-
-    返回 ``True``（已执行 action）或 ``False``（抢不到锁——调用方必须**保守
-    处理**，不能当作"计数为 0"继续）。action 的结果通过闭包回传。
-    """
+    """用 guard 文件对计数文件的读-改-写做**进程间**互斥（委托给 file_lock）。"""
     target = path or budget_path()
     guard = _lock_path(target)
     directory = os.path.dirname(guard)
@@ -346,37 +337,13 @@ def _with_file_lock(action, path=None, timeout=LOCK_TIMEOUT_SECONDS):
             os.makedirs(directory, exist_ok=True)
         except OSError:
             return False
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            fd = os.open(guard, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            break
-        except FileExistsError:
-            try:
-                age = time.time() - os.path.getmtime(guard)
-            except OSError:
-                age = 0.0
-            if age > LOCK_STALE_SECONDS:
-                # 陈旧 guard（持锁进程崩溃残留）→ 清掉再抢
-                try:
-                    os.remove(guard)
-                except OSError:
-                    pass
-                continue
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(LOCK_POLL_SECONDS)
-        except OSError:
-            return False
     try:
-        action()
-        return True
-    finally:
-        try:
-            os.remove(guard)
-        except OSError:
-            pass
+        with acquire_guard(guard, timeout=timeout,
+                           stale_threshold=LOCK_STALE_SECONDS):
+            action()
+            return True
+    except _file_lock.GuardAcquisitionError:
+        return False
 
 
 # ---------------------------------------------------------------------------
