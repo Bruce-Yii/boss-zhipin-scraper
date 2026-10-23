@@ -18,6 +18,7 @@
 
 ## 未发布
 
+- 列表侧自带 link_verified_at（issue #142）：from_list_payload 默认打当前时间戳，P6 不再 warn；合并透传保持，超 24 小时旧数据 P13 正常报。
 - 验收规格登记 `tier`/`tier_evidence`（issue #132）：分层交付物写这两个字段，
   验收器 P2 误报"规格未登记"。只补登记，不改判定逻辑。
 
