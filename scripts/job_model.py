@@ -744,8 +744,12 @@ class JobRecord:
 
     # -- 构造 ----------------------------------------------------------
     @classmethod
-    def from_list_payload(cls, raw) -> JobRecord:
-        """平台 joblist.json 原始条目 → JobRecord。"""
+    def from_list_payload(cls, raw, link_verified_at=None) -> JobRecord:
+        """平台 joblist.json 原始条目 → JobRecord。
+
+        列表侧链接也是“抓取时刻有效”的临时入口（P6）：默认带当前时间戳；
+        传参用于测试固定时间，传 "" 则不设（兼容旧用例）。
+        """
         if not isinstance(raw, dict):
             return cls({})
         encrypt_job_id = str(raw.get("encryptJobId") or "")
@@ -806,6 +810,11 @@ class JobRecord:
             ),
             "welfare": " | ".join(raw.get("welfareList") or []),
         }
+        if link_verified_at is None:
+            import datetime as _dt
+            link_verified_at = _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+        if link_verified_at:
+            data["link_verified_at"] = link_verified_at
         record = cls(data)
         record.data["job_id"] = compute_job_id(
             record.data.get("job_link") or record.data.get("title") or "")

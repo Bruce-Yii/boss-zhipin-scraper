@@ -137,7 +137,7 @@ class JobModelContractTests(unittest.TestCase):
             "job_type", "experience", "education", "company_scale", "company_stage",
             "company_industry", "job_labels", "skills", "security_id", "lid",
             "encrypt_job_id", "encrypt_boss_id", "encrypt_brand_id", "job_link",
-            "company_link", "welfare",
+            "company_link", "welfare", "link_verified_at",
         }
         self.assertEqual(set(row) - {"job_id"}, js_keys)
         self.assertEqual(row["job_link"],
@@ -175,6 +175,23 @@ class JobModelContractTests(unittest.TestCase):
         self.assertTrue(record.is_direct_social)
         record = self.model.JobRecord({"company_name": "闪念科技", "job_type": "4"})
         self.assertFalse(record.is_direct_social)
+
+    def test_list_payload_stamps_link_verified_at(self):
+        """P6：列表侧建记录自带 link_verified_at，可解析且带时区。"""
+        from datetime import datetime
+        raw = {"jobName": "AI产品经理", "encryptJobId": "ejid"}
+        row = self.model.JobRecord.from_list_payload(raw).to_dict()
+        stamp = row.get("link_verified_at") or ""
+        self.assertTrue(stamp, "列表记录必须自带 link_verified_at")
+        parsed = datetime.fromisoformat(stamp)
+        self.assertIsNotNone(parsed.tzinfo, "必须带时区，P13 才能核对时效")
+
+    def test_list_payload_explicit_empty_keeps_old_shape(self):
+        """传空串则不设戳（兼容旧用例/回放）。"""
+        raw = {"jobName": "AI产品经理", "encryptJobId": "ejid"}
+        row = self.model.JobRecord.from_list_payload(
+            raw, link_verified_at="").to_dict()
+        self.assertNotIn("link_verified_at", row)
 
     # ---------- 其它模块不得重复实现记录级语义 ----------
     def test_other_modules_do_not_reimplement_record_semantics(self):
