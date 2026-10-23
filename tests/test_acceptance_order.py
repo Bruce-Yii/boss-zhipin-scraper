@@ -3,6 +3,9 @@
 此前 attach_acceptance_result 跑在重复组打标之前，合并带陈旧 dup_size 的
 旧产物时会误报 P13“组内条数不符”、P3“重复未标记”。现在验收挪到写盘前
 最后一步，看到的就是即将落盘的同一份状态。
+
+另有 P13 时效合并级回归（issue #144）：旧戳重合并后，P13 要在产物验收里
+报 stale（验收器层面的旧戳用例见 c21，这里验证合并透传不断链）。
 """
 
 import importlib.util
@@ -12,6 +15,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
@@ -77,6 +81,34 @@ class AcceptanceOrderTests(unittest.TestCase):
                    if f.get("id") == "P13_identity_freshness_credentials"
                    and "组内实际条数" in str(f.get("detail"))]
             self.assertEqual(bad, [])
+
+    def test_stale_stamp_survives_merge_and_is_reported(self):
+        """旧戳重合并：P13 要在产物验收里报超 24 小时（issue #142 的预期）。"""
+        old_stamp = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jobs.json")
+            payload = {
+                "keyword": "AI产品经理", "city": "杭州",
+                "total": 1, "job_count": 1,
+                "jobs": [_job("s0", job_id="s0",
+                               job_link="https://x/s0.html",
+                               link_verified_at=old_stamp)],
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            jd = "负责AI产品规划与设计。" * 30
+            details = [{"job_id": "s0", "jd": jd,
+                        "link_verified_at": old_stamp}]
+            kept, _ = self.ec._merge_jd_into_export(
+                path, details, keep_junk=True)
+            self.assertEqual(kept, 1)
+            with open(path, encoding="utf-8") as handle:
+                data = json.load(handle)
+            findings = (data.get("acceptance") or {}).get("findings") or []
+            stale = [f for f in findings
+                     if f.get("id") == "P13_identity_freshness_credentials"
+                     and "超过" in str(f.get("detail"))]
+            self.assertEqual(len(stale), 1, f"旧戳重合并必须报 P13：{findings}")
 
 
 if __name__ == "__main__":
