@@ -260,13 +260,50 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(dropped["sales"], 1)
 
     def test_sales_jd_suspect_not_dropped(self):
-        """JD 命中销售强特征词只预警不删（薪酬提成/客户资源等误伤太大）。"""
-        kept, dropped = self._drop([{"job_id": "a", "title": "产品经理",
+        """JD 命中销售强特征词只预警不删（有 AI 证据才进疑似）。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI产品经理",
                                      "company_name": "X",
-                                     "jd": "负责提成和完成业绩指标，按回款拿佣金"}])
+                                     "jd": "负责AI产品规划，提成和完成业绩指标，按回款拿佣金"}])
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped["suspect"], 1)
         self.assertEqual(dropped["suspect_items"][0]["job_id"], "a")
+
+    def test_sales_jd_without_ai_dropped(self):
+        """没 AI 证据+JD 命中销售词 → 直接删，不进疑似（实测产品运营@拙诚润泽）。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "产品运营",
+                                     "company_name": "X",
+                                     "jd": "负责课程销售，提成和完成业绩指标，按回款拿佣金"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["suspect"], 0)
+
+    def test_incidental_ai_not_evidence(self):
+        """JD 只有顺口提 AI（对 AI 感兴趣/使用 AI 工具提效）→ 不算证据，删。"""
+        kept, _ = self._drop([{"job_id": "a", "title": "新媒体运营",
+                               "company_name": "X",
+                               "jd": "对 AI 感兴趣，会使用 AI 工具提效，负责新媒体内容更新"}])
+        self.assertEqual(kept, [])
+        kept, _ = self._drop([{"job_id": "b", "title": "电商网络渠道助理",
+                               "company_name": "X",
+                               "jd": "可利用 AI 辅助，负责渠道对接"}])
+        self.assertEqual(kept, [])
+
+    def test_true_ai_phrase_kept(self):
+        """岗位本体的 AI 提法（车端 AI 功能/AI 科技）→ 算证据，留。"""
+        kept, _ = self._drop([{"job_id": "a", "title": "产品实习生",
+                               "company_name": "X",
+                               "jd": "负责车端 AI 功能的产品定义"}])
+        self.assertEqual(len(kept), 1)
+
+    def test_outbound_and_engineering_terms_dropped(self):
+        """外呼标题算销售，工程标题算技术（2026-10-23 补词）。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI外呼专员",
+                                     "company_name": "X", "jd": "做AI产品"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["sales"], 1)
+        kept, dropped = self._drop([{"job_id": "b", "title": "AI应用工程专员",
+                                     "company_name": "X", "jd": "做AI产品"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["tech"], 1)
 
     def test_product_jd_with_sales_word_not_hurt(self):
         """产品岗 JD 仅含"销售"单字（如提升销售转化）不误伤——只认强特征词。"""

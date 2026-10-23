@@ -294,40 +294,77 @@ def filter_by_relevance(jobs, recruit_types=None, industry_allow=None,
 # tests/test_job_summary.py::SalesTermsConsistencyTests 钉住两边一致，防漂移）。
 
 _SALES_TITLE_TERMS = ("销售", "bd", "商务拓展", "客户经理", "sdr",
-                      "大客户", "渠道经理", "渠道销售", "招商")
+                      "大客户", "渠道经理", "渠道销售", "招商", "外呼")
 _SALES_JD_TERMS = ("提成", "业绩指标", "完成业绩", "回款", "签单",
                    "客户资源", "销售目标", "销售任务", "佣金", "业绩考核")
 _TECH_TITLE_TERMS = ("开发", "研发", "算法", "测试", "工程师", "运维",
                      "数据标注", "剪辑", "美工", "设计", "体验官", "管培",
-                     "运营合伙人", "招募", "技术支持")
+                     "运营合伙人", "招募", "技术支持", "工程")
 # 标题/JD/技能里算"有 AI 证据"的核心词。刻意比 AI_DIRECTION_TERMS 窄：
 # "算法/向量/CV"这类泛技术词不算（地质算法岗 JD 通篇算法但无 AI 产品语义，
-# 不能靠它留下来）。裸 "AI" 用前后瞻匹配（能命中"AI客服/AI应用/AI服务器"
-# 这类中英混写；(?<![a-z]) 挡掉 said/email 这类英文单词——Python 的 \b 把
-# 中文也当词字符，"AI服务器"反而匹配不上，不能用 \b）。
+# 不能靠它留下来）。
 _JD_AI_EVIDENCE_TERMS = ("ai产品", "aigc", "人工智能", "大模型", "llm",
                          "gpt", "智能体", "agent", "大语言模型", "生成式",
                          "多模态", "机器学习", "深度学习", "智驾", "adas",
                          "自动驾驶")
+# 裸 "AI" 用前后瞻匹配（能命中"AI客服/AI应用/AI服务器"这类中英混写；
+# (?<![a-z]) 挡掉 said/email 这类英文单词——Python 的 \b 把中文也当词字符，
+# "AI服务器"反而匹配不上，不能用 \b）。
 _BARE_AI_RE = re.compile(r"(?<![a-z])ai(?![a-z])", re.IGNORECASE)
+# "顺口提一句 AI"的措辞（2026-10-23 实测）：JD 里"对 AI 感兴趣""使用 AI 工具
+# 提效""可利用 AI 辅助"这类**不是岗位本体**的提法，会把纯运营/渠道/游戏社区岗
+# 误判成 AI 岗（实测混进妆食记新媒体、电商网络渠道助理、电魂游戏社区运营）。
+# 判定裸 "AI" 证据前先把这些措辞抹掉；"AI 功能/AI 科技/AI 创新产品"这类
+# 描述岗位本体的提法不受影响（心识宇宙、万兴、新知物联实测因此保住）。
+_AI_INCIDENTAL_RE = re.compile(
+    r"(?:对|使用|会用|会|熟练使用|熟练|借助|利用|通过|配合|掌握|熟悉|了解|具备|优先)\s*ai"
+    r"|ai\s*(?:工具|辅助|提效|编程|助手|技能|能力辅助|剪辑|作图|绘画|配音|修图)",
+    re.IGNORECASE)
 # 技术词命中时先看岗名核心：以"产品经理/产品运营"结尾的是产品岗挂技术方向
 # （如 AIGC算法产品经理、AI芯片测试产品经理），不算技术岗，放行到 AI 证据判定。
 _PRODUCT_CORE_SUFFIX = ("产品经理", "产品运营")
 
 
-def _has_ai_evidence(*texts):
-    """标题/JD/技能里有没有 AI 证据（大小写不敏感）。"""
-    for text in texts:
+def _ai_evidence_level(title, jd, skills):
+    """AI 证据强度：``"strong"`` / ``"jd_only"`` / ``""``（无）。
+
+    为什么分两级（2026-10-23 实测修）：JD 里一句"对 AI 感兴趣""会用 AI 工具"
+    会让纯运营/渠道岗被当成 AI 岗留下来（实测混进妆食记新媒体、电商网络渠道
+    助理、启能机器人市场实习）。所以：
+
+    - **strong**：标题或技能里出现 AI（岗位本身就是 AI 岗，如"AI 应用运营实习生"）
+      ——裸 "AI" 也算，标题写 AI 就是明示；
+    - **jd_only**：标题/技能没有，但 JD 里有**核心词**（AI产品/AIGC/大模型/
+      智能体…）或**非顺口提的裸 AI**（"车端 AI 功能""AI 科技"算；"对 AI 感兴趣"
+      "使用 AI 工具提效"不算，见 ``_AI_INCIDENTAL_RE``）；
+    - 空：JD 只有顺口提的 AI → 不算证据。
+    """
+    for text in (title, skills):
         if not text:
             continue
         if isinstance(text, (list, tuple, set)):
             text = " ".join(str(t) for t in text)
         low = unicodedata.normalize("NFKC", str(text)).lower()
-        if any(t in low for t in _JD_AI_EVIDENCE_TERMS):
-            return True
-        if _BARE_AI_RE.search(low):
-            return True
-    return False
+        if any(t in low for t in _JD_AI_EVIDENCE_TERMS) or _BARE_AI_RE.search(low):
+            return "strong"
+    if jd:
+        jlow = unicodedata.normalize("NFKC", str(jd)).lower()
+        if any(t in jlow for t in _JD_AI_EVIDENCE_TERMS):
+            return "jd_only"
+        masked = _AI_INCIDENTAL_RE.sub("", jlow)
+        if _BARE_AI_RE.search(masked):
+            return "jd_only"
+    return ""
+
+
+def _has_ai_evidence(*texts):
+    """标题/JD/技能里有没有 AI 证据（任一级别）。保留给旧调用方。"""
+    if not texts:
+        return False
+    title = texts[0] if len(texts) > 0 else ""
+    jd = texts[1] if len(texts) > 1 else ""
+    skills = texts[2] if len(texts) > 2 else ""
+    return bool(_ai_evidence_level(title, jd, skills))
 
 
 def _title_jd_match(job, head=160):
@@ -425,8 +462,18 @@ def drop_junk_jobs(jobs):
                 kept.append(job)
                 continue
             jlow = _normalize_jd(jd)
-            if any(t in jlow for t in _SALES_JD_TERMS):
-                kept.append(job)  # JD 疑似：只预警不删（见函数 docstring）
+            # 顺序关键（2026-10-23 实测修）：**先判 AI 证据，再判销售词**。
+            # 此前销售词在前，会把"没 AI 的课程销售/教培销售"以"疑似"为名留下来
+            # （实测产品运营@拙诚润泽：JD 通篇卖课+提成，无一处 AI）。
+            # 现在没 AI 证据一律删；有 AI 证据才把销售词降级成预警。
+            if not _ai_evidence_level(title, jd, skills):
+                if _title_jd_match(job):
+                    reason = "跨行业噪声（标题JD技能均无AI）"
+                else:
+                    reason = "JD与岗名不符"
+                dropped["noise" if "噪声" in reason else "mismatch"] += 1
+            elif any(t in jlow for t in _SALES_JD_TERMS):
+                kept.append(job)  # 有 AI 证据 + JD 命中销售词 → 只预警不删
                 dropped["suspect"] += 1
                 dropped["suspect_items"].append({
                     "job_id": str(job.get("job_id") or ""),
@@ -435,12 +482,6 @@ def drop_junk_jobs(jobs):
                     "reason": "销售疑似（JD），请人工复核",
                 })
                 continue
-            if not _has_ai_evidence(title, jd, skills):
-                if _title_jd_match(job):
-                    reason = "跨行业噪声（标题JD技能均无AI）"
-                else:
-                    reason = "JD与岗名不符"
-                dropped["noise" if "噪声" in reason else "mismatch"] += 1
             else:
                 kept.append(job)
                 continue
