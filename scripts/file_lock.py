@@ -73,11 +73,11 @@ def acquire_guard(path, timeout=30.0, stale_threshold=20.0):
                         continue
                     if time.monotonic() >= deadline:
                         raise GuardAcquisitionError(
-                            f"无法在 {timeout}s 内获取 guard：{guard}")
+                            f"无法在 {timeout}s 内获取 guard：{guard}") from None
                     time.sleep(GUARD_POLL_SECONDS)
-                except OSError:
+                except OSError as err:
                     raise GuardAcquisitionError(
-                        f"获取 guard 失败：{guard}")
+                        f"获取 guard 失败：{guard}") from err
             yield
         finally:
             if acquired:
