@@ -691,3 +691,39 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         data["warnings"] = warns
     _atomic_write_json(target_path, _sanitize_payload(data))
     return len(kept), len(dropped_ids)
+
+
+def cleanup_corrupted_json(directory):
+    """启动时检测并隔离损坏的 JSON 文件（不可解析或零字节）。
+
+    根因：进程被杀/断电/旧版本非原子写可能留下损坏文件。损坏文件不可解析，
+    但占空间且让溯源/校验失败。隔离（移入 quarantine/）而非删除，便于恢复。
+    返回隔离的文件数。
+    """
+    import json
+    import os
+    import shutil
+    if not directory or not os.path.isdir(directory):
+        return 0
+    quarantined = 0
+    quarantine_dir = os.path.join(directory, "quarantine")
+    for name in os.listdir(directory):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            size = os.path.getsize(path)
+            if size == 0:
+                raise ValueError("zero-byte file")
+            with open(path, encoding="utf-8") as handle:
+                json.load(handle)
+        except (json.JSONDecodeError, OSError, ValueError, UnicodeDecodeError):
+            os.makedirs(quarantine_dir, exist_ok=True)
+            try:
+                shutil.move(path, os.path.join(quarantine_dir, name))
+                quarantined += 1
+            except OSError:
+                pass
+    return quarantined

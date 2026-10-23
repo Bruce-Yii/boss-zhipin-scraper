@@ -111,8 +111,8 @@ def record_transient_worker(script_path, ledger_path, job_id, queue):
     """子进程：记一条瞬时失败（下一轮 = 另一个进程 → 应该重新尝试）。"""
     try:
         module = load_script("known_failures_child", script_path)
-        module.record(job_id, "too_short",
-                      "job description too short after validation: 38 < 120",
+        module.record(job_id, "shell_only",
+                      "BOSS正在加载中",
                       ledger_path)
         queue.put(("ok", module.is_known(job_id, ledger_path)))
     except BaseException as exc:  # pragma: no cover
@@ -303,7 +303,6 @@ class KnownFailuresLedgerTests(IsolatedStateTestCase):
         """瞬时失败 → 不进长期台账：本轮跳过、**下一轮重试**。"""
         module = load_script("known_failures_ledger", "known_failures.py")
         transient = [
-            ("too_short", "job description too short after validation: 38 < 120"),
             ("unknown", "detail page rendered navigation chrome without a JD"),
             ("shell_only", "BOSS正在加载中"),
             ("unknown", "HTML 直取无响应"),

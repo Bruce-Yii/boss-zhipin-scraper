@@ -362,12 +362,21 @@ def classify_extract_failure(message, page_text=""):
     ``risk_page`` / ``unknown`` 的字符串。
     """
     text = f"{message or ''}\n{page_text or ''}"
-    if "too short" in text or "职位描述" not in text and "no_section" not in text:
-        if "too short" in text:
-            return "too_short"
-    if "职位描述" in text and "too short" not in text:
-        # 有"职位描述"却抽不出正文 → 结构/选择器不匹配
+    if "too short" in text:
+        return "too_short"
+    # 页面特征模式（shell_only/login_wall/risk_page）优先于结构判定
+    for _name, _markers in _EXTRACT_FAILURE_PATTERNS:
+        if _name in ("shell_only", "login_wall", "risk_page"):
+            for _marker in _markers:
+                if _marker and _marker in text:
+                    return _name
+    # "职位描述"在文本中 → 有标题但取不到正文块 → 结构不匹配
+    if "职位描述" in text:
         return "no_section"
+    # 有页面内容但无"职位描述"段落 → 无JD段落（audit: navigation chrome without a JD）
+    if page_text and "职位描述" not in page_text:
+        return "no_section"
+    return "unknown"
     for name, markers in _EXTRACT_FAILURE_PATTERNS:
         for marker in markers:
             if marker and marker in text:
