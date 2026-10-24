@@ -620,7 +620,7 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
     retained_jobs, retained_details, sales_filtered = filter_summary_inputs(
         jobs, details or []
     )
-    return _build_summary_from_retained(
+    summary = _build_summary_from_retained(
         retained_jobs,
         retained_details,
         search_keyword=search_keyword,
@@ -628,6 +628,13 @@ def build_summary(jobs, details=None, search_keyword="", city="", top=10):
         top=top,
         sales_filtered=sales_filtered,
     )
+    # 对账（issue #172）：输入多少、进入统计多少、被过滤多少，守恒数进结论。
+    # filtered_out 是精确并集（销售 ∩ JD 与岗名不符的重叠不会被重复扣减），
+    # 与下方按原因展示的 sales/mismatch 行互为补充。
+    input_jobs = len([job for job in (jobs or []) if isinstance(job, dict)])
+    summary["input_jobs"] = input_jobs
+    summary["filtered_out"] = input_jobs - int(summary.get("total_jobs") or 0)
+    return summary
 
 
 def _build_summary_from_retained(
@@ -862,6 +869,10 @@ def format_summary(summary):
         f"岗位市场摘要: {title}",
         f"列表岗位: {summary['total_jobs']} 条；详情 JD: {summary['total_details']} 条",
     ]
+    if summary.get("input_jobs") is not None:
+        lines.append(
+            f"对账: 输入 {summary['input_jobs']} 条 → 进入统计 "
+            f"{summary['total_jobs']} 条（剔除 {summary.get('filtered_out') or 0} 条）")
     if summary.get("sales_filtered"):
         lines.insert(1, f"⚠️ 已剔除 {summary['sales_filtered']} 条疑似销售岗（关键词模糊匹配混入）")
     if summary.get("mismatch_filtered"):
