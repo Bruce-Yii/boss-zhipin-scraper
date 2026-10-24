@@ -39,6 +39,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import importlib.util
 import json
@@ -1024,6 +1025,88 @@ def check_export(payload, spec=None, sample_title_check=True):
 
     ok = not any(f["level"] == "error" for f in findings)
     return ok, findings
+
+
+# ---------------------------------------------------------------------------
+# CSV 随附文件验收（issue #171，链路地图「还没立住」#6）
+# ---------------------------------------------------------------------------
+
+# 列表档 CSV 必需列（消费者按 job_id 对账、按这些列使用）
+CSV_REQUIRED_COLUMNS = ("job_id", "title", "salary", "company_name",
+                        "location", "job_link")
+# 详情档 CSV 必需列
+DETAIL_CSV_REQUIRED_COLUMNS = ("job_id", "title", "jd", "job_link")
+
+
+def csv_companion_path(payload_path):
+    """产物 json 的随附 CSV 路径（同目录同名 .csv）；非 .json 路径返回 None。"""
+    if not str(payload_path).lower().endswith(".json"):
+        return None
+    return str(payload_path)[:-5] + ".csv"
+
+
+def check_csv_companion(payload_path, payload=None):
+    """随附 CSV 验收：行数/job_id 与 JSON 对账 + 必需列齐全 + 可解析。
+
+    CSV 不存在 → 返回 []（CSV 是可选产物，缺失不算缺陷）；存在则任何
+    对不上都是 error（CSV 与 JSON 口径不一致 = 交付物自相矛盾）。
+    """
+    csv_path = csv_companion_path(payload_path)
+    if not csv_path or not os.path.exists(csv_path):
+        return []
+    if payload is None:
+        with open(payload_path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    if isinstance(payload, dict):
+        records = payload.get("jobs") or []
+        required = CSV_REQUIRED_COLUMNS
+    elif isinstance(payload, list):
+        records = payload
+        required = DETAIL_CSV_REQUIRED_COLUMNS
+    else:
+        return []
+    records = [r for r in records if isinstance(r, dict)]
+    try:
+        with open(csv_path, encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            header = list(reader.fieldnames or [])
+            rows = list(reader)
+    except (OSError, UnicodeDecodeError, csv.Error) as exc:
+        return [_finding("csv_unreadable", "error",
+                         f"随附 CSV 无法解析（utf-8 BOM）：{exc}")]
+    findings = []
+    missing_cols = [c for c in required if c not in header]
+    if missing_cols:
+        findings.append(_finding(
+            "csv_missing_columns", "error",
+            f"随附 CSV 缺必需列：{', '.join(missing_cols)}"))
+    json_ids = [str(r.get("job_id") or "") for r in records]
+    csv_ids = [str((r or {}).get("job_id") or "").strip() for r in rows]
+    if len(rows) != len(records):
+        findings.append(_finding(
+            "csv_row_count", "error",
+            f"随附 CSV 行数 {len(rows)} ≠ JSON 岗位数 {len(records)}"))
+    dupes = sorted({i for i in csv_ids if i and csv_ids.count(i) > 1})
+    if dupes:
+        findings.append(_finding("csv_duplicate_ids", "error",
+                                 f"随附 CSV job_id 重复：{', '.join(dupes[:5])}"))
+    only_csv = sorted(set(csv_ids) - set(json_ids) - {""})
+    if only_csv:
+        findings.append(_finding(
+            "csv_extra_rows", "error",
+            f"随附 CSV 有 JSON 里没有的岗位 {len(only_csv)} 条"
+            f"（如 {', '.join(only_csv[:3])}）"))
+    only_json = sorted(set(json_ids) - set(csv_ids))
+    if only_json:
+        findings.append(_finding(
+            "csv_missing_rows", "error",
+            f"随附 CSV 缺了 JSON 里的岗位 {len(only_json)} 条"
+            f"（如 {', '.join(only_json[:3])}）"))
+    empty_ids = sum(1 for i in csv_ids if not i)
+    if empty_ids:
+        findings.append(_finding("csv_empty_job_id", "error",
+                                 f"随附 CSV 有 {empty_ids} 行 job_id 为空"))
+    return findings
 
 
 def format_findings(findings, limit=20):
