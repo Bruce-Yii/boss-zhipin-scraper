@@ -90,7 +90,7 @@ class BuildDeliverableTests(unittest.TestCase):
                 _job("ta"), _job("tb", job_type="")]})
             details = self._write(tmp, "det.json", [
                 {"job_id": "ta", "jd": JD},
-                {"job_id": "tb", "jd": "负责AI产品规划，提成和完成业绩指标"}])
+                {"job_id": "tb", "jd": "负责AI产品规划与需求分析"}])
             target = os.path.join(tmp, "out.json")
             code = self.module.main([
                 "--result-dir", tmp,

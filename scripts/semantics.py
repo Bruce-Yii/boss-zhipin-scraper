@@ -408,25 +408,24 @@ _ROLE_WORDS = ("产品", "pm", "运营", "增长", "策略", "内容", "数据",
 def drop_junk_jobs(jobs):
     """删库：销售/技术/噪声直接删，不保留（用户 2026-10-23 口径）。
 
-    本质标准只认一条：**AI 非技术岗**。判定顺序：
+    本质标准只认一条：**AI 非技术岗**。判定顺序（用户 2026-10-24 口径：
+    名字没问题就行，只看标题 + JD 明着卖货就删）：
 
     1. 标题含 FDE → 直接保留（用户明示例外）；
-    2. 销售：标题命中销售词（强判定）→ 删；JD 命中销售强特征词 → 只预警
-   不删（JD 里单个销售词误伤太大：薪酬里的"提成"、任职要求里的"客户资源"、
-   产品经济测算里的"销售目标"都不是销售岗，删了就是漏岗）；
-    3. 技术/设计/杂：标题命中技术词 → 删；
+    2. 销售：标题命中销售词（强判定）→ 删；
+    3. 技术/设计/杂：标题命中技术词 → 删（产品经理/产品运营结尾不算）；
     4. 标题没有非技术岗名词汇（产品/运营/增长/策略/内容/数据/助理/专员/
-       项目/营销/pm）→ 删（噪声：连招什么岗都说不清，如纯"AI应用实习生"、
-       "AI Agent实习生"这类技术杂工标题）；
-    5. 标题/JD/技能三处都没有 AI 证据 → 删；再分两类：标题能对上 JD 的记
-       "跨行业噪声"（如传统软件产品助理），对不上的记"JD与岗名不符"
-       （如招募合伙人引流帖）。
-    有一处 AI 证据就留（A 层标题明示 + B 层标题普通但 JD/技能含 AI）。
-    无 JD 的记录跳过 JD 相关规则（只做标题规则；证据看标题+技能）。
+       项目/营销/pm）→ 删（噪声：连招什么岗都说不清）；
+    5. 无 JD → 留（标题没问题就行，抓到 JD 再判；漏比费贵）；
+    6. JD 与岗名对不上（引流帖）→ 删；
+    7. JD 命中销售强特征词（提成/业绩/回款/签单那套明着卖货的）→ 删
+       （只预警等于留垃圾，不再设疑似）；
+    8. 标题带 AI（标题/技能明示）→ 名字没问题，不再拿 JD 查 AI，直接留；
+       标题没 AI 的，JD 必须有 AI 证据，否则跨行业噪声 → 删。
 
     返回 ``(kept, dropped)``：dropped 含各类计数 + **丢掉的清单**
-    （job_id/title/company/reason，不静默丢）。``suspect`` 是 JD 疑似销售岗，
-    只预警不删（见上），调用方应写进 warnings 提示人工复核。
+    （job_id/title/company/reason，不静默丢）。``suspect`` 保留字段恒为 0
+    （JD 销售直接删，不再设疑似）。
     """
     kept = []
     dropped = {"sales": 0, "tech": 0, "mismatch": 0, "noise": 0, "suspect": 0,
@@ -458,33 +457,31 @@ def drop_junk_jobs(jobs):
         else:
             jd = str(job.get("jd") or "")
             skills = job.get("skill_tags") or job.get("skills") or []
-            if not jd.strip() and not skills:
+            if not jd.strip():
+                # 没 JD 不判无 AI（issue #156）：标题没问题就留，
+                # 抓到 JD 再判。漏比费贵。
                 kept.append(job)
                 continue
             jlow = _normalize_jd(jd)
-            # 顺序关键（2026-10-23 实测修）：**先判 AI 证据，再判销售词**。
-            # 此前销售词在前，会把"没 AI 的课程销售/教培销售"以"疑似"为名留下来
-            # （实测产品运营@拙诚润泽：JD 通篇卖课+提成，无一处 AI）。
-            # 现在没 AI 证据一律删；有 AI 证据才把销售词降级成预警。
-            if not _ai_evidence_level(title, jd, skills):
-                if _title_jd_match(job):
-                    reason = "跨行业噪声（标题JD技能均无AI）"
-                else:
-                    reason = "JD与岗名不符"
-                dropped["noise" if "噪声" in reason else "mismatch"] += 1
-            elif any(t in jlow for t in _SALES_JD_TERMS):
-                kept.append(job)  # 有 AI 证据 + JD 命中销售词 → 只预警不删
-                dropped["suspect"] += 1
-                dropped["suspect_items"].append({
-                    "job_id": str(job.get("job_id") or ""),
-                    "title": title,
-                    "company": str(job.get("company_name") or ""),
-                    "reason": "销售疑似（JD），请人工复核",
-                })
-                continue
-            else:
+            # JD 明着卖货（强特征词）→ 删。用户 2026-10-24 拍板：
+            # 名字没问题才留；JD 里明着卖货（提成/业绩/回款/签单那套）的，
+            # 标题再 AI 也删——只预警等于留垃圾。
+            if any(t in jlow for t in _SALES_JD_TERMS):
+                reason = "销售岗（JD）"
+                dropped["sales"] += 1
+            # 标题带 AI（产品/运营岗名）→ 名字没问题，不再拿 JD 查 AI，直接留；
+            # 标题没 AI 的，JD 必须有 AI 证据；都没有 → 看标题对得上对不上：
+            # 对不上是引流帖（JD与岗名不符），对上是跨行业噪声。
+            elif _ai_evidence_level(title, "", skills) or \
+                    _ai_evidence_level(title, jd, skills):
                 kept.append(job)
                 continue
+            elif not _title_jd_match(job):
+                reason = "JD与岗名不符"
+                dropped["mismatch"] += 1
+            else:
+                reason = "跨行业噪声（标题JD技能均无AI）"
+                dropped["noise"] += 1
         if reason:
             dropped["items"].append({
                 "job_id": str(job.get("job_id") or ""),
