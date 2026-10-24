@@ -709,11 +709,20 @@ def is_agency_like(job) -> bool:
 
 
 def classify_recruit_type(job) -> str:
-    """招聘类型：``social`` / ``intern`` / ``campus``（平台 jobType：4=实习、5=校招）。"""
+    """招聘类型：``social`` / ``intern`` / ``campus``（平台 jobType：4=实习、5=校招）。
+
+    平台近半数列表不打 jobType 标记（空值按原口径是社招），但标题自称实习的
+    （如“AI产品经理实习生”，实测 30 条）不能跟着丢掉：标题自己说了算，
+    空标记 + 标题含“实习”→ 实习。有明确标记的（4/5）一律以平台为准，不动。
+    """
     if not isinstance(job, dict):
         return "social"
     raw = str(job.get("job_type") or "").strip()
-    return RECRUIT_TYPE_BY_JOB_TYPE.get(raw, "social")
+    if raw:
+        return RECRUIT_TYPE_BY_JOB_TYPE.get(raw, "social")
+    if "实习" in str(job.get("title") or ""):
+        return "intern"
+    return "social"
 
 
 def active_state(status) -> str:

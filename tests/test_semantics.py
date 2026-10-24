@@ -150,12 +150,16 @@ class FourFixesTests(unittest.TestCase):
           17/24 标题含"实习"
         - jobType=5 → 校招岗：**11/11 经验要求 = "在校/应届"**
         - jobType 空 → 社招岗：259 条全是月薪制、经验要求有值
+        - jobType 空但标题自称实习 → 实习（平台近半数列表不打标记，标题为准）
         """
         self.assertEqual(self.s.classify_recruit_type({"job_type": "4"}), "intern")
         self.assertEqual(self.s.classify_recruit_type({"job_type": "5"}), "campus")
-        self.assertEqual(self.s.classify_recruit_type({"job_type": ""}), "social")
+        self.assertEqual(self.s.classify_recruit_type(
+            {"job_type": "", "title": "AI产品经理"}), "social")
         self.assertEqual(self.s.classify_recruit_type({}), "social")
         self.assertEqual(self.s.classify_recruit_type(None), "social")
+        self.assertEqual(self.s.classify_recruit_type(
+            {"job_type": "", "title": "AI产品经理实习生"}), "intern")
 
     # ---------- ① 失败指纹归类 ----------
     def test_classify_extract_failure_fingerprints(self):
