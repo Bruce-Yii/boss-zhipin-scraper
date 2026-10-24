@@ -415,7 +415,9 @@ def drop_junk_jobs(jobs):
     2. 销售：标题命中销售词（强判定）→ 删；
     3. 技术/设计/杂：标题命中技术词 → 删（产品经理/产品运营结尾不算）；
     4. 标题没有非技术岗名词汇（产品/运营/增长/策略/内容/数据/助理/专员/
-       项目/营销/pm）→ 删（噪声：连招什么岗都说不清）；
+       项目/营销/pm）且标题不含 AIGC（issue #155 用户口径：aigc 没问题——
+       AIGC 本身就是岗位领域明示，放行到 JD 层再判）→ 删（噪声：连招什么岗
+       都说不清）；
     5. 无 JD → 留（标题没问题就行，抓到 JD 再判；漏比费贵）；
     6. JD 与岗名对不上（引流帖）→ 删；
     7. JD 命中销售强特征词（提成/业绩/回款/签单那套明着卖货的）→ 删
@@ -451,7 +453,11 @@ def drop_junk_jobs(jobs):
                 dropped["tech"] += 1
         if reason:
             pass
-        elif not any(w in low for w in _ROLE_WORDS):
+        elif not any(w in low for w in _ROLE_WORDS) and "aigc" not in low:
+            # 标题含 AIGC 的不算"连招什么岗都说不清"（issue #155 用户口径：
+            # aigc 没问题）——AIGC 本身就是岗位领域明示，放行到 JD 层再判。
+            # 裸 "AI"/"Agent" 这类泛前缀不算（AI应用实习生 → 仍噪声，
+            # 既有判定 test_no_role_title_dropped 钉住）；销售/技术判定仍在其前。
             reason = "噪声（标题无岗名）"
             dropped["noise"] += 1
         else:
