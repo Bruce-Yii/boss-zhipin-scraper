@@ -174,6 +174,20 @@ class AcceptanceCounterexampleTests(unittest.TestCase):
         self.assertFalse(ok)
         self._assert_red(findings, "P12_semantic_cross_consistency")
 
+    def test_c03b_intern_without_job_type_tag_is_not_flagged(self):
+        """空标记 + 标题自称实习 → 实习，不算矛盾（issue #159；与模型同口径）。"""
+        job = _record(title="AI产品经理实习生", title_key="ai产品经理实习生",
+                      recruit_type="intern", job_type="",
+                      salary="150-200元/天", salary_min="150",
+                      salary_max="200", salary_unit="day",
+                      tags="实习 | 本科", experience="")
+        ok, findings = self._check(_payload([job]))
+        bad = [f for f in findings
+               if f["id"] == "P12_semantic_cross_consistency"
+               and "recruit_type 与 job_type 矛盾" in str(f.get("detail", ""))]
+        self.assertEqual(bad, [],
+                         f"空标记实习岗不应报 P12：{json.dumps(findings, ensure_ascii=False)[:1000]}")
+
     def test_c04_valid_status_0_but_active_is_red(self):
         """第 4 类：job_valid_status=0 却 active_state=active。"""
         job = _record(job_valid_status="0", active_state="active")
