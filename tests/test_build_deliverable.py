@@ -48,7 +48,7 @@ class BuildDeliverableTests(unittest.TestCase):
         return path
 
     def test_full_assemble_keeps_intern_and_backfills_old(self):
-        """列表过滤 intern + 旧交付 JD 回填 + 落盘 JSON/CSV。"""
+        """指定 intern：列表过滤 + 旧交付 JD 回填 + 落盘 JSON/CSV。"""
         with tempfile.TemporaryDirectory() as tmp:
             list1 = self._write(tmp, "list1.json", {"jobs": [
                 _job("ta"), _job("tb", job_type="")]})  # tb 社招被过滤
@@ -67,6 +67,7 @@ class BuildDeliverableTests(unittest.TestCase):
                 "--keyword", "AI产品实习", "--city", "杭州",
                 "--scope", "测试口径",
                 "--target-roots", "AI产品,产品",
+                "--recruit-type", "intern",
             ])
             self.assertEqual(code, 0)
             with open(target, encoding="utf-8") as handle:
@@ -81,6 +82,28 @@ class BuildDeliverableTests(unittest.TestCase):
             with open(csv_path, encoding="utf-8-sig") as handle:
                 header = handle.readline()
             self.assertIn("job_id", header)
+
+    def test_default_recruit_type_is_all(self):
+        """不指定类型=全要：社招也不过滤（用户口径，issue #152）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            list1 = self._write(tmp, "list1.json", {"jobs": [
+                _job("ta"), _job("tb", job_type="")]})
+            details = self._write(tmp, "det.json", [
+                {"job_id": "ta", "jd": JD},
+                {"job_id": "tb", "jd": "负责AI产品规划，提成和完成业绩指标"}])
+            target = os.path.join(tmp, "out.json")
+            code = self.module.main([
+                "--result-dir", tmp,
+                "--lists", list1,
+                "--details", details,
+                "--target", target,
+                "--keyword", "AI产品", "--city", "杭州",
+            ])
+            self.assertEqual(code, 0)
+            with open(target, encoding="utf-8") as handle:
+                final = json.load(handle)
+            # tb 有 AI 证据+销售词 → 疑似保留；不指定类型时不过滤
+            self.assertIn("tb", [j["job_id"] for j in final["jobs"]])
 
     def test_missing_input_returns_2(self):
         """输入文件不存在 → 报错退出码 2，不写盘。"""
