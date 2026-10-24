@@ -348,8 +348,14 @@ def _expected_post_type(record):
 
 
 def _expected_recruit_type(record):
-    """按 job_type 推 recruit_type（4=实习 / 5=校招 / 其它=社招）。"""
+    """按 job_type 推 recruit_type（4=实习 / 5=校招 / 其它=社招）。
+
+    空标记 + 标题自称实习 → 实习（与 job_model.classify_recruit_type
+    同口径，issue #159；独立实现，角度交叉验证）。
+    """
     raw = str(record.get("job_type") or "").strip()
+    if not raw and "实习" in str(record.get("title") or ""):
+        return "intern"
     return _RECRUIT_TYPE_BY_JOB_TYPE.get(raw, "social")
 
 
@@ -735,10 +741,13 @@ def _check_p12(records):
                 buckets["recruit_type"].append(
                     f"{str(record.get('title') or '')[:16]}: recruit_type={recruit_type}"
                     f" 但 job_type={record.get('job_type')!r} 推出 {expected}")
-            if recruit_type == "intern" and str(record.get("job_type") or "").strip() != "4":
+            if recruit_type == "intern" and str(record.get("job_type") or "").strip() != "4" \
+                    and not (not str(record.get("job_type") or "").strip()
+                             and "实习" in str(record.get("title") or "")):
                 buckets["recruit_type"].append(
                     f"{str(record.get('title') or '')[:16]}: 标了实习但 job_type="
-                    f"{record.get('job_type')!r}（实习必须 job_type=4）")
+                    f"{record.get('job_type')!r}（实习要求 job_type=4，"
+                    f"无标记但标题自称实习的除外）")
             if recruit_type == "campus" and str(record.get("job_type") or "").strip() != "5":
                 buckets["recruit_type"].append(
                     f"{str(record.get('title') or '')[:16]}: 标了校招但 job_type="
