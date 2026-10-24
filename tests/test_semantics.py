@@ -341,6 +341,33 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped["noise"], 0)
 
+    def test_aigc_title_passes_role_gate(self):
+        """标题含 AIGC 不用岗名词兜底（issue #155 用户口径：aigc 没问题）：
+        AIGC编导这类岗此前连 JD 层都到不了，现在放行到 JD 层。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AIGC编导实习生",
+                                     "company_name": "X"}])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped["noise"], 0)
+
+    def test_role_gate_still_guards_non_ai_and_bare_ai_titles(self):
+        """岗名门只给 AIGC 放行：无岗名又无 AIGC 的标题（含裸 AI 前缀）仍判噪声。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "神秘高薪岗位",
+                                     "company_name": "X"},
+                                    {"job_id": "b", "title": "AI训练师",
+                                     "company_name": "Y"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["noise"], 2)
+
+    def test_role_gate_pass_does_not_bypass_sales_tech(self):
+        """放行不越过销售/技术判定：AIGC剪辑仍删技术，AIGC外呼仍删销售。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AIGC视频剪辑专员",
+                                     "company_name": "X"},
+                                    {"job_id": "b", "title": "AIGC外呼专员",
+                                     "company_name": "Y"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["tech"], 1)
+        self.assertEqual(dropped["sales"], 1)
+
     def test_fde_exception_kept(self):
         """FDE 用户明示保留：标题再技术也留。"""
         kept, dropped = self._drop([
