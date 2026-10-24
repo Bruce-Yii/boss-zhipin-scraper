@@ -1,5 +1,9 @@
 # Changelog
 
+## 未发布
+
+- 合并用详情新戳（issue #150）：`merge_detail` 取合并后戳（详情有取详情，无取列表），此前用列表旧戳盖掉详情新戳，P13 一直误报 stale。
+
 ## v2.23.0 (2026-10-24)
 
 - 交付物可重建（issue #146）：新增 `scripts/build_deliverable.py`，列表+详情+旧交付走生产合并路径落盘（配 `--target-roots` 供 P11 用），用它重建 143 与交付物逐条一致；README 中英补用法。

@@ -918,7 +918,11 @@ class JobRecord:
 
     # -- 合并与输出 ----------------------------------------------------
     def merge_detail(self, detail) -> JobRecord:
-        """并入详情侧字段（详情优先），再重算派生语义。"""
+        """并入详情侧字段（详情优先），再重算派生语义。
+
+        链接戳取合并后的值：详情带戳用详情的（详情抓取晚于列表，
+        是更新的验证时刻），详情没戳才回退列表侧。
+        """
         detail = detail or {}
         merged = dict(self.data)
         for key, value in detail.items():
@@ -926,7 +930,7 @@ class JobRecord:
                 continue
             merged[key] = value
         record = JobRecord(merged)
-        record.apply_derived(link_verified_at=self.data.get("link_verified_at", ""))
+        record.apply_derived(link_verified_at=merged.get("link_verified_at", ""))
         return record
 
     def to_dict(self) -> dict:
