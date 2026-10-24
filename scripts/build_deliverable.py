@@ -181,9 +181,9 @@ def main(argv=None):
                              "P11 优先用它核对标题命中率，不给就退回 keyword 切分）")
     parser.add_argument("--scope", default="",
                         help="写入 extra_meta.scope 的口径说明")
-    parser.add_argument("--recruit-type", default="intern",
+    parser.add_argument("--recruit-type", default="all",
                         choices=("all", "intern", "social", "campus"),
-                        help="列表阶段招聘类型过滤（默认 intern，用户既定链路）")
+                        help="招聘类型过滤（用户口径：不指定=全要；指定了严格按指定的来）")
     parser.add_argument("--keep-junk", action="store_true",
                         help="保留销售/技术/噪声岗（排查用，默认删库）")
     parser.add_argument("--no-csv", action="store_true",
