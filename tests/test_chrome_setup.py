@@ -4335,6 +4335,16 @@ class ChromeSetupTests(unittest.TestCase):
         with self.assertRaisesRegex(module.DetailExtractionError, "too short"):
             module.extract_job_description({"jd": "职位描述\n只有一句话"})
 
+    def test_jd_floor_is_50(self):
+        """JD 底线 50 字（用户 2026-10-24 拍板）：60 字过，49 字拦。"""
+        module = load_module()
+        self.assertEqual(module.MIN_DETAIL_TEXT_LENGTH, 50)
+        ok_text = "负责AI产品需求分析与设计。" * 5
+        self.assertGreaterEqual(len(ok_text), 50)
+        self.assertTrue(module.extract_job_description({"jd": ok_text}))
+        with self.assertRaisesRegex(module.DetailExtractionError, "too short"):
+            module.extract_job_description({"jd": "x" * 49})
+
     def test_detail_url_adds_security_context_without_changing_job_link(self):
         module = load_module()
         job = {
