@@ -66,6 +66,79 @@ class EmptyExportGuardTests(unittest.TestCase):
             self.assertEqual(len(data["jobs"]), 1)
             self.assertNotIn("empty_export_blocked", data)
 
+    def test_incremental_merge_preserves_no_jd_history(self):
+        """增量合入：无 JD 丢弃历史累计保留，coverage 与清单对得上账（issue #167）。
+
+        旧行为第二轮合入后 jd_coverage 缩成单轮数字（1/1/0），与残留的
+        dropped_no_jd 清单矛盾。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._list_file(tmp)
+            details = [{"job_id": "j0", "jd": "岗位职责：" + "描述内容。" * 30}]
+            self.ec._merge_jd_into_export(path, details)
+            with open(path, encoding="utf-8") as handle:
+                first = json.load(handle)
+            self.assertEqual(first["dropped_no_jd"], ["j1", "j2"])
+            self.assertEqual(first["jd_coverage"],
+                             {"with_jd": 1, "total_before": 3, "dropped_no_jd": 2})
+            self.ec._merge_jd_into_export(path, details)
+            with open(path, encoding="utf-8") as handle:
+                second = json.load(handle)
+            self.assertEqual(second["dropped_no_jd"], ["j1", "j2"])
+            self.assertEqual(second["jd_coverage"],
+                             {"with_jd": 1, "total_before": 3, "dropped_no_jd": 2})
+
+    def test_dropped_junk_accumulates_across_merges(self):
+        """删库清单跨轮累计：第二轮无新增时不被空结果覆盖，coverage 仍对账。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._list_file(tmp, count=2)
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload["jobs"][1]["title"] = "AI产品销售经理"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            details = [
+                {"job_id": "j0", "jd": "岗位职责：" + "描述内容。" * 30},
+                {"job_id": "j1", "jd": "岗位职责：" + "描述内容。" * 30},
+            ]
+            kept, _ = self.ec._merge_jd_into_export(path, details)
+            self.assertEqual(kept, 1)
+            with open(path, encoding="utf-8") as handle:
+                first = json.load(handle)
+            self.assertEqual([x["job_id"] for x in first["dropped_junk"]], ["j1"])
+            self.assertEqual(first["jd_coverage"],
+                             {"with_jd": 2, "total_before": 2, "dropped_no_jd": 0})
+            self.ec._merge_jd_into_export(path, details)
+            with open(path, encoding="utf-8") as handle:
+                second = json.load(handle)
+            self.assertEqual([x["job_id"] for x in second["dropped_junk"]], ["j1"])
+            self.assertEqual(second["jd_coverage"],
+                             {"with_jd": 2, "total_before": 2, "dropped_no_jd": 0})
+
+    def test_job_returning_to_product_leaves_dropped_list(self):
+        """岗位回炉（重新进产物）→ 旧丢弃记录不残留，清单只描述不在产物里的。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._list_file(tmp, count=2)
+            details1 = [{"job_id": "j0", "jd": "岗位职责：" + "描述内容。" * 30}]
+            self.ec._merge_jd_into_export(path, details1)
+            with open(path, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle)["dropped_no_jd"], ["j1"])
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload["jobs"].append({"job_id": "j1", "title": "AI产品经理",
+                                    "company_name": "公司1", "salary": "20-30K",
+                                    "location": "杭州",
+                                    "job_link": "https://x/1.html"})
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            details2 = details1 + [{"job_id": "j1",
+                                    "jd": "岗位职责：" + "描述内容。" * 30}]
+            self.ec._merge_jd_into_export(path, details2)
+            with open(path, encoding="utf-8") as handle:
+                final = json.load(handle)
+            self.assertNotIn("dropped_no_jd", final)
+            self.assertEqual(final["jd_coverage"],
+                             {"with_jd": 2, "total_before": 2, "dropped_no_jd": 0})
+
 
 if __name__ == "__main__":
     unittest.main()
