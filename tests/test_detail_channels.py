@@ -159,7 +159,9 @@ class DetailChannelTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(stats, {"panel": 1})
 
-    def test_panel_no_session_still_writes_output_and_pending(self):
+    def test_panel_no_session_writes_pending_but_no_empty_output(self):
+        """panel 会话失败：pending 照写（续抓状态不丢）；空详情文件不再
+        落盘（issue #154：空 [] 会遮蔽早先的真实详情文件）。"""
         module = load_module()
         with tempfile.TemporaryDirectory() as tmp:
             output = str(pathlib.Path(tmp) / "details.json")
@@ -169,7 +171,8 @@ class DetailChannelTests(unittest.TestCase):
                     output, 9222, "json", existing_ids=set(),
                     pending_ids={"j0": 1})
             self.assertEqual(result, [])
-            self.assertTrue(pathlib.Path(output).exists())
+            self.assertFalse(pathlib.Path(output).exists(),
+                             "0 条新增且无历史可续时不应写空详情文件")
             pending = json.loads(pathlib.Path(output + ".pending.json").read_text(
                 encoding="utf-8"))
             self.assertEqual(pending, [{"job_id": "j0", "attempts": 1}])
@@ -401,6 +404,65 @@ class DetailChannelTests(unittest.TestCase):
         self.assertEqual(merged["extra_meta"]["detail_channel"], "mixed")
         self.assertEqual(merged["extra_meta"]["detail_channel_counts"],
                          {"api": 1, "dom": 1, "panel": 1})
+
+
+class EmptyDetailsGuardTests(unittest.TestCase):
+    """issue #154：0 条新增且无可续历史时，不写空详情文件、改为告警。
+
+    旧行为把空 [] 写进输出路径——遮蔽今天早先的真实详情文件（后者才是
+    find_latest_detail_file 应命中的），控制台还打印"详情已保存"。
+    """
+
+    def setUp(self):
+        self.module = load_module()
+
+    def _run(self, output, count, concurrency=1, effects=None):
+        effects = effects or [failure("skipped_today", "dom", f"j{i}")
+                              for i in range(count)]
+        with mock.patch.object(self.module, "_open_dom_tab",
+                               return_value=[mock.Mock(), "t", "s", 0]), \
+                mock.patch.object(self.module, "_close_api_tab"), \
+                mock.patch.object(self.module, "_scrape_one_detail",
+                                  side_effect=effects), \
+                mock.patch.object(self.module.time, "sleep"):
+            return self.module.scrape_details(
+                {"jobs": jobs(count)}, output_path=output,
+                detail_channel="dom", concurrency=concurrency,
+                channel_stats={})
+
+    def test_serial_all_skipped_today_writes_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(pathlib.Path(tmp) / "details.json")
+            result = self._run(output, 2)
+            self.assertEqual(result, [])
+            self.assertFalse(pathlib.Path(output).exists(),
+                             "全跳过时不应写出空详情文件")
+
+    def test_serial_success_still_writes_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(pathlib.Path(tmp) / "details.json")
+            self._run(output, 1, effects=[success("dom", "j0")])
+            self.assertTrue(pathlib.Path(output).exists())
+
+    def test_resume_existing_file_preserved_and_rewritten(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(pathlib.Path(tmp) / "details.json")
+            existing = [{"job_id": "j0", "jd": "旧详情"}]
+            with open(output, "w", encoding="utf-8") as handle:
+                json.dump(existing, handle, ensure_ascii=False)
+            result = self._run(output, 1)
+            self.assertEqual(len(result), 1, "历史详情要保留在结果里")
+            with open(output, encoding="utf-8") as handle:
+                self.assertEqual(json.load(handle), existing,
+                                 "已有文件内容不被清空")
+
+    def test_parallel_all_skipped_today_writes_no_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(pathlib.Path(tmp) / "details.json")
+            result = self._run(output, 2, concurrency=2)
+            self.assertEqual(result, [])
+            self.assertFalse(pathlib.Path(output).exists(),
+                             "并发路径同样不应写出空详情文件")
 
 
 if __name__ == "__main__":
