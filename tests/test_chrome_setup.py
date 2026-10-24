@@ -5192,11 +5192,12 @@ class ChromeSetupTests(unittest.TestCase):
         self.assertEqual(rows[0]["jd"], "Build AI agents")
 
     def test_scrape_details_final_save_handles_bare_filename(self):
-        """--detail-output 传不带目录的裸文件名时，最终保存不应崩溃。
+        """--detail-output 传不带目录的裸文件名时，收尾逻辑不应崩溃。
 
-        空 jobs 列表不触发 CDP，可直接走到最终保存逻辑；此前最终保存用
-        os.makedirs(os.path.dirname(path))，dirname 为空字符串会抛
-        FileNotFoundError，丢掉收尾保存和 CSV 导出。
+        此前收尾保存用 os.makedirs(os.path.dirname(path))，dirname 为空
+        字符串会抛 FileNotFoundError，丢掉收尾保存和 CSV 导出。
+        issue #154 起 0 条新增不再写空详情文件，但收尾（告警/pending 清理）
+        仍必须无异常跑完；有结果时裸文件名照样能保存（原回归点）。
         """
         module = load_module()
         with tempfile_profile() as paths:
@@ -5206,6 +5207,24 @@ class ChromeSetupTests(unittest.TestCase):
             os.chdir(workdir)
             try:
                 module.scrape_details({"jobs": []}, output_path="boss_details.json")
+                self.assertFalse(
+                    (workdir / "boss_details.json").exists(),
+                    "0 条新增且无历史可续时不应写空详情文件（issue #154）")
+                with mock.patch.object(module, "_open_dom_tab",
+                                       return_value=[mock.Mock(), "t", "s", 0]), \
+                        mock.patch.object(module, "_close_api_tab"), \
+                        mock.patch.object(module, "_scrape_one_detail",
+                                          side_effect=[{
+                                              "ok": True,
+                                              "detail": {"job_id": "j0",
+                                                         "jd": "岗位职责"},
+                                              "job_id": "j0", "reason": "",
+                                              "message": "", "channel": "dom"}]), \
+                        mock.patch.object(module.time, "sleep"):
+                    module.scrape_details(
+                        {"jobs": [{"job_id": "j0", "title": "岗",
+                                   "job_link": "https://x/j0.html"}]},
+                        output_path="boss_details.json", detail_channel="dom")
                 self.assertTrue((workdir / "boss_details.json").exists())
             finally:
                 os.chdir(cwd)

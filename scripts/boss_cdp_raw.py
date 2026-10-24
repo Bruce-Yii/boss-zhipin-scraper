@@ -6139,6 +6139,23 @@ def _check_supply_vs_budget(list_data, detail_budget=None):
             "need_combos": need_combos, "ceiling": ceiling}
 
 
+def _print_empty_details_notice(output_path, done=0, skipped_today=0):
+    """issue #154：0 条新增且无可续历史时，不写空详情文件，改为明确告警。
+
+    空 [] 详情文件会把今天早些时候的真实详情**遮蔽成"最新"**（后续
+    find_latest_detail_file 命中它），控制台还打印"详情已保存"，让人
+    误以为有产出。改为：不落空文件 + 说清数据在哪、怎么续用。
+    """
+    print("\n⚠️ 详情 0 条新增且无可续历史 → 未写空详情文件"
+          "（空文件会遮蔽早先的真实详情，还显得像有产出）。")
+    if skipped_today:
+        print(f"   其中 {skipped_today}/{done or skipped_today} 条「今天已抓过」跳过"
+              "（不重复耗额度）：数据在早先的详情文件里，重跑时把 --detail-output "
+              "指向该文件即可续用；或开 --db 跨 run 续抓。")
+    else:
+        print("   失败/跳过原因见上方统计；处理后重跑即可。")
+
+
 def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
                    concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
@@ -6255,10 +6272,14 @@ def scrape_details(list_data, max_details=None, output_path=None,
             channel_stats=channel_stats)
         if pending:
             print(resume_hint(pending, output_path))
-        print(f"\n详情已保存: {output_path}")
-        if fmt == "csv":
-            csv_path = output_path.rsplit(".", 1)[0] + ".csv"
-            write_detail_csv(csv_path, results)
+        if results:
+            print(f"\n详情已保存: {output_path}")
+            if fmt == "csv":
+                csv_path = output_path.rsplit(".", 1)[0] + ".csv"
+                write_detail_csv(csv_path, results)
+        else:
+            # issue #154：与串行路径同规则，不写空详情文件（persist 同步守卫）
+            _print_empty_details_notice(output_path)
         return results
 
     consecutive_cdp_errors = 0
@@ -6556,7 +6577,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
         _close_api_tab(dom_session)
 
     # 最终保存（dirname 为空时回退到当前目录，与循环内/其它写文件处保持一致）
-    _atomic_write_export_json(output_path, results)
+    # issue #154：0 条新增时不写空详情文件——空 [] 会把今天早先的真实详情
+    # 遮蔽成"最新"，还打印"已保存"误导产出判断；改为明确告警。
+    if results:
+        _atomic_write_export_json(output_path, results)
     save_pending_ids(output_path, pending)
     if serial_done:
         print(run_summary(time.time() - start_time,
@@ -6564,11 +6588,16 @@ def scrape_details(list_data, max_details=None, output_path=None,
         print_dom_stage_timings(serial_done)
     if pending:
         print(resume_hint(pending, output_path))
-    print(f"\n详情已保存: {output_path}")
+    if results:
+        print(f"\n详情已保存: {output_path}")
 
-    if fmt == "csv":
-        csv_path = output_path.rsplit(".", 1)[0] + ".csv"
-        write_detail_csv(csv_path, results)
+        if fmt == "csv":
+            csv_path = output_path.rsplit(".", 1)[0] + ".csv"
+            write_detail_csv(csv_path, results)
+    else:
+        _print_empty_details_notice(
+            output_path, done=serial_done,
+            skipped_today=serial_reasons.get("skipped_today", 0))
 
     # 详情页原文落盘（详情侧保真核对的依据）
     detail_raw_path = None
@@ -6763,15 +6792,19 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             _close_api_tab(session)
         if dom_session is not None:
             _close_api_tab(dom_session)
-    if output_path:
+    if output_path and results:
         _atomic_write_export_json(output_path, results)
     save_pending_ids(output_path, pending)
     if pending:
         print(resume_hint(pending, output_path))
-    print(f"\n详情已保存: {output_path}")
-    if fmt == "csv":
-        csv_path = output_path.rsplit(".", 1)[0] + ".csv"
-        write_detail_csv(csv_path, results)
+    if results:
+        print(f"\n详情已保存: {output_path}")
+        if fmt == "csv":
+            csv_path = output_path.rsplit(".", 1)[0] + ".csv"
+            write_detail_csv(csv_path, results)
+    else:
+        # issue #154：与串行/并行路径同规则，不写空详情文件
+        _print_empty_details_notice(output_path)
     return results
 
 
@@ -6849,7 +6882,10 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
 
     def persist():
         if output_path:
-            _atomic_write_export_json(output_path, results)
+            # issue #154：尚无任何结果时不写空详情文件（中途落盘等首批结果；
+            # 全跳过收尾时由调用方打告警）
+            if results:
+                _atomic_write_export_json(output_path, results)
             save_pending_ids(output_path, pending)
 
     def handle_result(job, result):
