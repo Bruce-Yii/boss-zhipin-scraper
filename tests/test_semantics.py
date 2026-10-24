@@ -259,14 +259,23 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(dropped["sales"], 1)
 
-    def test_sales_jd_suspect_not_dropped(self):
-        """JD 命中销售强特征词只预警不删（有 AI 证据才进疑似）。"""
+    def test_sales_jd_dropped(self):
+        """JD 明着卖货（提成/业绩/回款）→ 直接删，不再设疑似（issue #157）。
+        标题再 AI 也删：只预警等于留垃圾。"""
         kept, dropped = self._drop([{"job_id": "a", "title": "AI产品经理",
                                      "company_name": "X",
                                      "jd": "负责AI产品规划，提成和完成业绩指标，按回款拿佣金"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["sales"], 1)
+        self.assertEqual(dropped["suspect"], 0)
+
+    def test_title_ai_skips_jd_ai_check(self):
+        """标题带 AI（issue #157）：名字没问题，不再拿 JD 查 AI。
+        JD 无 AI、非销售、能对上标题 → 留（等 JD 层没有别的毛病）。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI产品经理",
+                                     "company_name": "X",
+                                     "jd": "负责产品规划与需求分析，协调研发按期交付"}])
         self.assertEqual(len(kept), 1)
-        self.assertEqual(dropped["suspect"], 1)
-        self.assertEqual(dropped["suspect_items"][0]["job_id"], "a")
 
     def test_sales_jd_without_ai_dropped(self):
         """没 AI 证据+JD 命中销售词 → 直接删，不进疑似（实测产品运营@拙诚润泽）。"""
@@ -317,6 +326,16 @@ class DropJunkTests(unittest.TestCase):
                                      "company_name": "X",
                                      "jd": "参与AI应用开发"}])
         self.assertEqual(kept, [])
+
+    def test_no_jd_skips_ai_check(self):
+        """没 JD 不判无 AI（issue #156）：标题没问题就留，抓到 JD 再判。
+        实测智海星河数据产品经理：标题无 AI 字样、技能无 AI，无 JD 时被误删；
+        有 JD 后（Agent 业务）本应留下。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "数据产品经理实习生",
+                                     "company_name": "智海星河",
+                                     "skill_tags": ["Excel", "SQL"]}])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped["noise"], 0)
 
     def test_fde_exception_kept(self):
         """FDE 用户明示保留：标题再技术也留。"""
