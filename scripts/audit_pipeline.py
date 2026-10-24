@@ -153,6 +153,13 @@ def self_check(paths=None, repo_root=None, write_into=None):
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
         ok, findings = acc.check_export(payload)
+        # CSV 随附文件进验收范围（issue #171）：存在同名 .csv 时对账，
+        # error 级 findings 拉低产物结论；CSV 不存在不加分（可选产物）。
+        csv_findings = acc.check_csv_companion(path, payload=payload)
+        if csv_findings:
+            findings = findings + csv_findings
+            if any(f["level"] == "error" for f in csv_findings):
+                ok = False
         results.append({"path": os.path.basename(path), "ok": ok, "findings": findings})
 
     ok = all(item["ok"] for item in results) and (suite_ok is True) and not gaps

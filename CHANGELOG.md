@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- CSV 进验收范围（issue #171）：`check_csv_companion` 对同名随附 CSV 做行数/job_id 对账（多行/缺行/重复/空 id 均 error）、必需列齐全（列表档 6 列、详情档 4 列）、utf-8 BOM 可解析；接进 `audit_pipeline self-check`，error 拉低产物结论。CSV 缺失不算缺陷（可选产物）。
 - 漏斗 meta 跨轮累计（issue #167）：增量合入时 `dropped_junk`/`dropped_no_jd` 不再被本轮覆盖（此前 115 条历史被 4 条盖掉），按 job_id 累计去重、回炉岗位自动出清；`jd_coverage` 在口径一下按累计口径对账（with_jd=保留+删库，total=with_jd+无 JD），全量重建路径数值与旧行为逐字一致；`keep_without_jd` 模式维持本轮口径。
 - 全跳过不再写空详情文件（issue #154）：0 条新增且无可续历史时，不再把空 [] 写进输出路径（会把今天早先的真实详情遮蔽成"最新"、还打印"详情已保存"误导产出判断），改为明确告警并说明数据在哪、怎么续用；串行/并发/panel 三条路径同规则。
 - 标题含 AIGC 放行过岗名门（issue #155）：AIGC编导这类标题此前在「标题无岗名」一步被删、连 JD 层都到不了；用户口径 AIGC 即岗位领域明示，放行到 JD 层再判。裸 AI/Agent 泛前缀（AI应用实习生这类）维持删，销售/技术判定不变。
