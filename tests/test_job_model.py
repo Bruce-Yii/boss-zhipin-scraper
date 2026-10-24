@@ -170,6 +170,23 @@ class JobModelContractTests(unittest.TestCase):
         self.assertEqual(merged["active_state"], "active")
         self.assertEqual(merged["title_key"], "ai产品经理")
 
+    def test_merge_detail_prefers_fresh_detail_stamp(self):
+        """两边都有戳时详情胜（详情抓取晚于列表，issue #150）。"""
+        job = {"job_id": "j1", "title": "AI产品经理",
+               "link_verified_at": "2026-10-23T01:10:02+08:00"}
+        detail = {"job_id": "j1", "jd": "岗位职责正文" * 10,
+                  "link_verified_at": "2026-10-24T09:51:12+08:00"}
+        merged = self.model.JobRecord(job).merge_detail(detail).to_dict()
+        self.assertEqual(merged["link_verified_at"], "2026-10-24T09:51:12+08:00")
+
+    def test_merge_detail_keeps_list_stamp_without_detail_stamp(self):
+        """详情没戳时回退列表戳（不丢信息）。"""
+        job = {"job_id": "j1", "title": "AI产品经理",
+               "link_verified_at": "2026-10-24T09:00:00+08:00"}
+        detail = {"job_id": "j1", "jd": "岗位职责正文" * 10}
+        merged = self.model.JobRecord(job).merge_detail(detail).to_dict()
+        self.assertEqual(merged["link_verified_at"], "2026-10-24T09:00:00+08:00")
+
     def test_record_exposes_is_direct_social(self):
         record = self.model.JobRecord({"company_name": "闪念科技", "job_type": ""})
         self.assertTrue(record.is_direct_social)
