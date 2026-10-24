@@ -91,6 +91,28 @@ class JobModelContractTests(unittest.TestCase):
         self.assertEqual(self.model.classify_recruit_type({"job_type": "5"}), "campus")
         self.assertEqual(self.model.classify_recruit_type({}), "social")
 
+    def test_empty_job_type_with_intern_title_is_intern(self):
+        """平台近半数列表不打标记：空标记 + 标题自称实习 → 实习（实测 30 条，
+        如拓竹模型评测产品经理实习生、井唐AI产品经理实习生）；
+        有明确标记的一律以平台为准。"""
+        self.assertEqual(
+            self.model.classify_recruit_type(
+                {"job_type": "", "title": "模型评测产品经理实习生"}),
+            "intern")
+        self.assertEqual(
+            self.model.classify_recruit_type(
+                {"title": "AI产品经理实习生"}),
+            "intern")
+        self.assertEqual(
+            self.model.classify_recruit_type(
+                {"job_type": "", "title": "AI产品经理"}),
+            "social")
+        # 有标记的不受标题影响
+        self.assertEqual(
+            self.model.classify_recruit_type(
+                {"job_type": "5", "title": "AI产品经理实习生"}),
+            "campus")
+
     def test_active_state_three_states(self):
         self.assertEqual(self.model.active_state(""), "unknown")
         self.assertEqual(self.model.active_state("刚刚活跃"), "active")
