@@ -819,5 +819,49 @@ class JdMatchConsistencyTests(unittest.TestCase):
                                  summary.jd_matches_title(job))
 
 
+class SummaryAccountingTests(unittest.TestCase):
+    """摘要对账（issue #172）：输入/统计/剔除 守恒数进结论，不再只散落原因行。"""
+
+    def setUp(self):
+        self.module = load_summary_module()
+
+    def _job(self, job_id, title, **extra):
+        base = {
+            "job_id": job_id, "title": title, "company_name": "公司",
+            "salary": "20-30K", "location": "杭州·西湖区",
+            "job_link": f"https://x/{job_id}.html",
+            "boss_active_status": "今日活跃",
+        }
+        base.update(extra)
+        return base
+
+    def test_conservation_line_reflects_filtering(self):
+        clean = self._job("a", "AI产品经理")
+        sales = self._job("b", "AI课程销售经理", jd="负责课程销售，有提成")
+        summary = self.module.build_summary([clean, sales],
+                                            search_keyword="AI产品", city="杭州")
+        self.assertEqual(summary["input_jobs"], 2)
+        self.assertEqual(summary["total_jobs"], 1)
+        self.assertEqual(summary["filtered_out"], 1)
+        text = self.module.format_summary(summary)
+        self.assertIn("对账: 输入 2 条 → 进入统计 1 条（剔除 1 条）", text)
+
+    def test_zero_drop_still_shows_conservation(self):
+        clean = self._job("a", "AI产品经理")
+        summary = self.module.build_summary([clean],
+                                            search_keyword="AI产品", city="杭州")
+        text = self.module.format_summary(summary)
+        self.assertIn("对账: 输入 1 条 → 进入统计 1 条（剔除 0 条）", text)
+
+    def test_overlap_not_double_counted(self):
+        """既是销售、JD 又与岗名不符 → 剔除数按并集算 1，不按原因相加成 2。"""
+        both = self._job("b", "AI课程销售经理", jd="招募合伙人，负责课程销售，有提成")
+        clean = self._job("a", "AI产品经理")
+        summary = self.module.build_summary([clean, both],
+                                            search_keyword="AI产品", city="杭州")
+        self.assertEqual(summary["total_jobs"], 1)
+        self.assertEqual(summary["filtered_out"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
