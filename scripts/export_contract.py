@@ -538,6 +538,25 @@ def attach_acceptance_result(payload, source_path=None):
     return payload
 
 
+def _merge_dropped_items(prev, new, present_ids=()):
+    """丢弃清单**累计去重**（按 job_id，保持先出现顺序）。
+
+    增量合入同一文件时，本轮丢弃记录不覆盖历史（issue #167：dropped_junk
+    115 条被本轮 4 条盖掉）。``present_ids`` 里的 job_id（= 已回到产物里
+    的岗位）从清单剔除——清单始终只描述"不在产物里的"。
+    """
+    merged = {}
+    for item in list(prev or []) + list(new or []):
+        if not isinstance(item, dict):
+            continue
+        jid = str(item.get("job_id") or "")
+        if jid and jid not in merged:
+            merged[jid] = item
+    for jid in present_ids:
+        merged.pop(jid, None)
+    return list(merged.values())
+
+
 def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
                           extra_meta=None, keep_junk=False):
     """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
@@ -550,7 +569,8 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
     - `keep_junk=False`（默认）：**删库**——销售/技术/噪声岗直接剔除（用户
       2026-10-23 口径，旧"摘要层过滤"作废）；`--keep-junk` 可保留
     - meta 记录 `jd_coverage`（with_jd/total_before/dropped_no_jd）与 `dropped_no_jd`
-      （被剔除 job_id 列表，可追溯）；`job_count`/`total` 同步为保留数
+      （被剔除 job_id 列表，可追溯；**跨轮累计去重**，见 #167）；`job_count`/`total`
+      同步为保留数
 
     Args:
         target_path: 列表文件路径（存在则以其为准，否则用 base）
@@ -626,10 +646,13 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
                 data["jobs"] = kept2
                 data["job_count"] = len(kept2)
                 data["total"] = len(kept2)
-                data["dropped_junk"] = junk["items"]
+                # 累计去重而非覆盖：增量合入时历史删库记录不丢（issue #167）
+                data["dropped_junk"] = _merge_dropped_items(
+                    data.get("dropped_junk"), junk["items"])
                 data.setdefault("warnings", []).append(
-                    f"删库：已剔除 {len(junk['items'])} 条销售/技术/噪声岗"
-                    "（用户 2026-10-23 口径，见 dropped_junk）")
+                    f"删库：本次剔除 {len(junk['items'])} 条销售/技术/噪声岗"
+                    f"（累计 {len(data['dropped_junk'])} 条，"
+                    "用户 2026-10-23 口径，见 dropped_junk）")
                 print(f"🗑️ 删库：剔除 {len(junk['items'])} 条销售/技术/噪声岗"
                       f"（{', '.join(sorted({it['reason'].split('（')[0] for it in junk['items']})[:4])}）")
                 kept = kept2
@@ -647,17 +670,42 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
     # 在下面的语义块里产生；此前验收跑在它们之前，合并已有 dup 标记的旧产物时
     # 会读到陈旧 dup_size → P13 误报"组内条数不符"、P3 误报"重复未标记"。
     # 现在挪到写盘前最后一步，验收看到的就是落盘的同一份状态。
-    data["jd_coverage"] = {
-        "with_jd": with_jd,
-        "total_before": total_before,
-        "dropped_no_jd": len(dropped_ids),
-    }
-    if dropped_ids:
-        data["dropped_no_jd"] = dropped_ids
+    # 漏斗 meta（issue #167）：默认口径一（剔无 JD）下按**累计口径**对账——
+    # dropped 清单是跨轮累计的，with_jd/total_before 必须与之一致才对得上账；
+    # 全量重建（正常路径）时累计值 == 单轮值，与旧行为逐字一致。
+    # keep_without_jd 模式 kept 可含无 JD 记录，累计口径不成立 → 维持本轮口径。
+    job_ids_now = {str(j.get("job_id") or "")
+                   for j in data["jobs"] if isinstance(j, dict)}
+    prev_junk = data.get("dropped_junk") or []
+    junk_items = _merge_dropped_items(prev_junk, [], present_ids=job_ids_now)
+    if prev_junk:
+        data["dropped_junk"] = junk_items
+    junk_total = len(junk_items)
+    prev_nojd = [str(x) for x in (data.get("dropped_no_jd") or []) if str(x)]
+    cumulative_nojd = [jid for jid in dict.fromkeys(prev_nojd + dropped_ids)
+                       if jid not in job_ids_now]
+    if keep_without_jd:
+        data["jd_coverage"] = {
+            "with_jd": with_jd,
+            "total_before": total_before,
+            "dropped_no_jd": len(dropped_ids),
+        }
+        cumulative_nojd = list(dropped_ids)
+    else:
+        with_jd_total = len(data["jobs"]) + junk_total
+        data["jd_coverage"] = {
+            "with_jd": with_jd_total,
+            "total_before": with_jd_total + len(cumulative_nojd),
+            "dropped_no_jd": len(cumulative_nojd),
+        }
+    if cumulative_nojd:
+        data["dropped_no_jd"] = cumulative_nojd
         warnings = list(data.get("warnings") or [])
         warnings.append(
-            f"口径一：已剔除 {len(dropped_ids)} 条无 JD 岗位（见 meta.dropped_no_jd）")
+            f"口径一：已剔除 {len(cumulative_nojd)} 条无 JD 岗位（见 meta.dropped_no_jd）")
         data["warnings"] = warnings
+    elif "dropped_no_jd" in data:
+        del data["dropped_no_jd"]  # 全部回炉 → 旧清单不残留
     # ── 语义层统计与自检（2026-10-22）──────────────────────────────
     # 把"逐条读数据才能发现的问题"变成机器检查：发布主体类型分布、同源重复投放、
     # JD 污染/长度、关键字段空值率、链接时效标注。任一项不达标 → 写进 warnings。
