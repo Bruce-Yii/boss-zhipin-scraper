@@ -139,6 +139,7 @@ upsert_db_details = _db_store.upsert_details
 load_db_details = _db_store.load_details
 db_store_stats = _db_store.stats
 record_db_run = _db_store.record_run
+cross_run_delta = _db_store.cross_run_delta
 
 try:
     from scripts import audit as _audit
@@ -8063,8 +8064,11 @@ def build_parser():
                           help="合并已有 JSON 文件 (按 job_id 去重)")
     g_output.add_argument("--db", nargs="?", const=DEFAULT_DB_PATH, default=None,
                           metavar="PATH",
-                          help="启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；"
-                               f"不带值用默认库 {DEFAULT_DB_PATH}（仓库外，不进 git）")
+                          help="SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；"
+                               f"不带值用默认库 {DEFAULT_DB_PATH}（仓库外，不进 git）；"
+                               "默认即启用默认库（跨 run 新增/消失对账），--no-db 关闭")
+    g_output.add_argument("--no-db", action="store_true",
+                          help="禁用 SQLite 跨 run 对账/断点续抓")
 
     # ---- 详情抓取 ----
     g_detail = p.add_argument_group("详情抓取")
@@ -8578,14 +8582,23 @@ def _run_cli_impl(p, args):
             filters[key] = val
 
     # SQLite run lineage：先落 started run，再进行列表/详情等任何抓取。
+    # #175：--db **默认启用**默认库（跨 run 新增/消失对账）；--no-db 关闭；
+    # 显式 --db 打不开保持硬失败，默认库打不开只告警继续（DB 是辅助，别挡抓取）。
     db_conn = None
     db_run_id = None
     db_state = None
-    if args.db:
+    db_explicit = bool(args.db)  # 用户显式传了 --db（含不带值的 const 形式）
+    db_path = args.db if args.db else (
+        None if getattr(args, "no_db", False) else DEFAULT_DB_PATH)
+    if db_path:
         try:
-            db_conn = open_db_store(args.db)
+            db_conn = open_db_store(db_path)
         except (OSError, sqlite3.Error, DbSchemaError) as e:
-            p.error(f"无法打开 SQLite 库 {args.db}: {e}")
+            if db_explicit:
+                p.error(f"无法打开 SQLite 库 {db_path}: {e}")
+            print(f"⚠️  默认 SQLite 库打开失败（{e}）——本次无跨 run 对账/续抓，继续抓取")
+            db_path = None
+    if db_conn is not None:
         db_run_id = uuid.uuid4().hex
         db_state = {
             "conn": db_conn, "run_id": db_run_id,
@@ -8595,7 +8608,7 @@ def _run_cli_impl(p, args):
         record_db_run(
             db_conn, db_run_id, mode="single", keyword=args.keyword,
             city=args.city, finished_at=None)
-        print(f"🗄️  SQLite 增量层已启用: {args.db}")
+        print(f"🗄️  SQLite 增量层已启用: {db_path}")
 
     # 加载或抓取列表
     sidecar_owned = None  # 本次详情窗口自建的 securityId sidecar
@@ -8749,9 +8762,38 @@ def _run_cli_impl(p, args):
         # 同时加载旧详情，供后续详情抓取/分析合并（按 job_id 去重）
         merged_details = merge_details(args.merge, [])
 
+    # 跨 run 对账（#175）：入库**前**对同城市历史做快照（入库后再算，新增全成
+    # 仍在）；结果写进列表文件 meta.cross_run——「今天新增哪些」从此机器可答。
+    if db_conn is not None:
+        delta = cross_run_delta(
+            db_conn, list_data.get("city") or args.city,
+            [j.get("job_id") for j in list_data.get("jobs", [])
+             if isinstance(j, dict)])
+        if delta is not None:
+            list_data["cross_run"] = delta
+            if delta.get("baseline"):
+                print(f"🆕 跨 run 对账（{delta['scope_city']}）：基线首次建立，"
+                      f"本次 {delta['added_count']} 条全部计为已知")
+            else:
+                print(f"🆕 跨 run 对账（{delta['scope_city']}）：新增 "
+                      f"{delta['added_count']}｜本次没搜到 {delta['removed_count']}"
+                      f"｜仍在 {delta['kept_count']}")
+            out_path = list_data.get("output_path")
+            if out_path and os.path.exists(out_path):
+                try:
+                    with open(out_path, encoding="utf-8") as f:
+                        payload = json.load(f)
+                    if isinstance(payload, dict):
+                        payload["cross_run"] = delta
+                        _atomic_write_export_json(out_path, payload)
+                except (OSError, json.JSONDecodeError, ValueError) as e:
+                    log.warning("cross_run 写回列表文件失败 %s: %s", out_path, e)
+
     # P4c-2：列表增量入库（唯一键 upsert，与 JSON/CSV 并存）
     if db_conn is not None:
-        ins, upd = upsert_db_jobs(db_conn, list_data.get("jobs", []), run_id=db_run_id)
+        ins, upd = upsert_db_jobs(db_conn, list_data.get("jobs", []),
+                                  run_id=db_run_id,
+                                  city=list_data.get("city") or args.city)
         print(f"🗄️  列表入库: 新增 {ins}，更新 {upd}")
 
     # 抓详情

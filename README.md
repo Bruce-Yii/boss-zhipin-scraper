@@ -200,7 +200,7 @@ python3 scripts/build_deliverable.py \
 | `--analysis` | 分析报告 |
 | `--merge FILE` | 合并已有数据（按 job_id 去重） |
 | `--input FILE` | 从已有列表 JSON 继续处理；优先读取未过期 securityId sidecar，auto 模式缺凭据时先试 encrypt API，再按规则回退 DOM；不会改写输入列表 |
-| `--db [PATH]` | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值时用默认库 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
+| `--db [PATH]` | **默认启用**（默认库 `~/.boss-zhipin-scraper/boss.db`，仓库外、不进 git）：SQLite 增量存储（WAL）+ 跨 run 详情断点续抓 + **跨 run 新增/消失对账**（列表 meta `cross_run`）；`--no-db` 关闭；JSON/CSV 导出照旧 |
 | `--allow-dom-fallback` | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--check` | 环境检查（CDP + 依赖 + 登录态） |
 | `--status` | 状态总览（运行态 + 缓存态，接管用；**不发请求**，登录态仍需 `--check`） |
@@ -274,7 +274,7 @@ python3 scripts/build_deliverable.py \
 - **口径一（默认）：jd 并入导出并剔除无 JD 岗位**（2026-09-22）：详情抓完后每条 job 直接带 `jd`，无 JD 的岗位被剔除（meta 记录 `jd_coverage` 与 `dropped_no_jd`）；`--keep-without-jd` 可保留（仅标注）
 - **显式多通道 + 真实通道统计**（2026-09-22；2026-09-23 增 encrypt）：详情抓取在 meta 记录实际成功结果的 `detail_channel`（`api`/`encrypt`/`dom`/`panel`/`mixed`）及 `detail_channel_counts`；失败尝试不计入通道统计。缺凭据先试 **encryptJobId API**（仅带 jobId 的轻量 XHR），接口拒绝/解析类失败才回退 DOM，真实风控仍 fail-closed
 - **securityId 受限 sidecar**（2026-09-22，红线例外）：live list run 只在进入详情窗口时写入 `~/.boss-zhipin-scraper/.session/`（仓库外），权限 `600`、TTL 60 分钟，并在详情调用 `finally` 中删除；`--input` 只读既有 sidecar、不取得所有权；**绝不进导出/日志/git**，登录 cookie 绝不落盘。详见 `AGENTS.md`/`CONTRIBUTING.md`
-- **SQLite 增量存储（可选，P4c-2）**：`--db [PATH]` 启用（默认 `~/.boss-zhipin-scraper/boss.db`，**仓库外、不进 git**；零新依赖——stdlib `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 不变、`updated_at` 覆盖），与 JSON/CSV **并存不替换**；库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓）。入库前统一脱敏（cookie/token/securityId/内部标识不落库）。未来 schema 会被旧代码拒绝而不会降级写回，`--stats` 使用只读连接；异常中断保留 `finished_at=NULL` 的 run lineage
+- **SQLite 增量存储（P4c-2，默认启用）**：默认开默认库 `~/.boss-zhipin-scraper/boss.db`（**仓库外、不进 git**；`--db PATH` 指定库，`--no-db` 关闭；零新依赖——stdlib `sqlite3`）。WAL 模式 + `job_id` 唯一键增量 upsert（`first_seen_at` 不变、`updated_at` 覆盖），与 JSON/CSV **并存不替换**；库中已有详情作为跨 run 续抓种子（换输出文件也能续、免重抓）。**跨 run 对账（#175）**：每次列表入库前对同城市历史做快照，列表 meta 记 `cross_run`（added=今天新增 / removed=本次没搜到，只是信号不等于下架 / kept_count=仍在）。入库前统一脱敏（cookie/token/securityId/内部标识不落库）。未来 schema 会被旧代码拒绝而不会降级写回，`--stats` 使用只读连接；异常中断保留 `finished_at=NULL` 的 run lineage
 - 抓取结束输出结构化结果行：`EXPORT_OK jobs=N city=X keyword=Y path=Z`（风控中断为 `EXPORT_FAIL reason=...`）
 
 ## 抓取后摘要与提示词

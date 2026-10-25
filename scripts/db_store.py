@@ -32,7 +32,7 @@ _sanitize_job = _export_contract._sanitize_job
 
 # 默认库路径：仓库外（用户状态目录），与 job-result/、.session/ 同源约定
 DEFAULT_DB_PATH = os.path.expanduser("~/.boss-zhipin-scraper/boss.db")
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2：jobs 表加 keyword/city（跨 run 按城市口径对账，#175）
 
 
 class DbSchemaError(RuntimeError):
@@ -61,7 +61,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     payload       TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    run_id        TEXT
+    run_id        TEXT,
+    keyword       TEXT,
+    city          TEXT
 );
 CREATE TABLE IF NOT EXISTS details (
     job_id        TEXT PRIMARY KEY,
@@ -111,10 +113,23 @@ def _stored_schema_version(conn):
         raise DbSchemaError(f"schema_version 非法: {row[0]!r}") from exc
 
 
+def _migrate_v1_to_v2(conn):
+    """v1 → v2：jobs 表补 keyword/city 列（跨 run 按城市口径对账，#175）。
+
+    旧行两列为 NULL → 不参与任何城市口径比对，记忆从此刻开始积累。幂等。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    if "keyword" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN keyword TEXT")
+    if "city" not in cols:
+        conn.execute("ALTER TABLE jobs ADD COLUMN city TEXT")
+
+
 def open_store(path=None):
     """打开（必要时创建）SQLite 库并确保 schema，返回连接。
 
     已存在且版本高于当前代码时立即拒绝，不执行 WAL/DDL/版本覆盖等写操作。
+    低版本库就地迁移到当前版本（v1 → v2 补列，数据不动）。
     """
     db_path = os.path.expanduser(path or DEFAULT_DB_PATH)
     parent = os.path.dirname(db_path)
@@ -133,7 +148,13 @@ def open_store(path=None):
         conn.executescript(_SCHEMA)
         if stored is None:
             conn.execute(
-                "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+        elif stored < SCHEMA_VERSION:
+            _migrate_v1_to_v2(conn)
+            conn.execute(
+                "UPDATE schema_meta SET value=? WHERE key='schema_version'",
                 (str(SCHEMA_VERSION),),
             )
         conn.commit()
@@ -191,8 +212,12 @@ def _upsert_rows(conn, table, rows, *, with_jd=False):
     return inserted, len(ids) - inserted
 
 
-def upsert_jobs(conn, jobs, *, run_id=None, now=None):
-    """列表记录增量入库（唯一键 upsert，与 JSON/CSV 并存）。"""
+def upsert_jobs(conn, jobs, *, run_id=None, keyword=None, city=None, now=None):
+    """列表记录增量入库（唯一键 upsert，与 JSON/CSV 并存）。
+
+    ``keyword``/``city`` 记录该行**最近所属口径**（跨 run 按城市对账用，#175）；
+    ON CONFLICT 用 COALESCE——调用方没传口径时**绝不把已有口径洗成 NULL**。
+    """
     ts = now or _utcnow()
     rows = []
     for job in jobs or []:
@@ -201,8 +226,29 @@ def upsert_jobs(conn, jobs, *, run_id=None, now=None):
         job_id = str(job.get("job_id") or "").strip()
         if not job_id:
             continue
-        rows.append((job_id, _payload_json(job), ts, ts, run_id))
-    return _upsert_rows(conn, "jobs", rows)
+        rows.append((job_id, _payload_json(job), ts, ts, run_id, keyword, city))
+    if not rows:
+        return 0, 0
+    ids = [row[0] for row in rows]
+    existing = set()
+    for chunk in _chunked(ids, _SQLITE_MAX_VARS):
+        placeholders = ",".join("?" for _ in chunk)
+        existing.update(
+            str(row[0]) for row in conn.execute(
+                "SELECT job_id FROM jobs WHERE job_id IN (" + placeholders + ")", chunk)
+        )
+    inserted = sum(1 for jid in ids if jid not in existing)
+    sql = (
+        "INSERT INTO jobs (job_id, payload, first_seen_at, updated_at, run_id, "
+        "keyword, city) VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(job_id) DO UPDATE SET payload=excluded.payload, "
+        "updated_at=excluded.updated_at, run_id=excluded.run_id, "
+        "keyword=COALESCE(excluded.keyword, jobs.keyword), "
+        "city=COALESCE(excluded.city, jobs.city)"
+    )
+    conn.executemany(sql, rows)
+    conn.commit()
+    return inserted, len(ids) - inserted
 
 
 def upsert_details(conn, details, *, run_id=None, now=None):
@@ -223,6 +269,42 @@ def upsert_details(conn, details, *, run_id=None, now=None):
 def load_job_ids(conn):
     """库内全部列表 job_id 集合。"""
     return {str(row[0]) for row in conn.execute("SELECT job_id FROM jobs")}
+
+
+def load_city_job_ids(conn, city):
+    """同城市口径的历史 job_id 集合（city 列 NULL 的旧行不参与，#175）。"""
+    city = str(city or "").strip()
+    if not city:
+        return set()
+    return {str(row[0]) for row in conn.execute(
+        "SELECT job_id FROM jobs WHERE city = ?", (city,))}
+
+
+def cross_run_delta(conn, city, current_job_ids):
+    """同城市口径的跨 run 对账（#175）：新增 / 本次没搜到 / 仍在。
+
+    - added：本次列表里、库里该城市从没见过的（= 今天新增候选）
+    - removed：库里该城市见过、本次列表没有的（下架/改口候选，**只是信号**——
+      平台模糊召回本来就会漏，不等于真下架）
+    - 首次运行（库内该城市还没有任何记录）→ baseline=True，全部算已知
+    - 城市为空 → None（无口径可比）
+    """
+    city = str(city or "").strip()
+    if not city:
+        return None
+    current = sorted({str(j).strip() for j in (current_job_ids or [])
+                      if str(j).strip()})
+    known = load_city_job_ids(conn, city)
+    if not known:
+        return {"baseline": True, "scope_city": city,
+                "added": current, "added_count": len(current),
+                "removed": [], "removed_count": 0, "kept_count": 0}
+    added = [jid for jid in current if jid not in known]
+    removed = sorted(known - set(current))
+    return {"baseline": False, "scope_city": city,
+            "added": added, "added_count": len(added),
+            "removed": removed, "removed_count": len(removed),
+            "kept_count": len(current) - len(added)}
 
 
 def load_detail_ids(conn):
