@@ -192,7 +192,8 @@ python3 -m py_compile scripts/boss_cdp_raw.py scripts/ratelimit.py scripts/expor
 | `--allow-dom-fallback` | 关闭 | API 无数据时允许降级 DOM 提取；默认关闭，薪资可能不可信 |
 | `--filter-inactive` | 关闭 | 按 HR 活跃度剔除长期未活跃岗位（仅匹配「周/月/年前活跃」，不误杀本周/本月活跃） |
 | `--merge FILE` | - | 合并已有 JSON（按 job_id 去重） |
-| `--db [PATH]` | 关闭 | 启用 SQLite 增量存储（WAL）+ 跨 run 详情断点续抓；不带值用 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
+| `--db [PATH]` | 默认启用 | SQLite 增量存储（WAL）+ 跨 run 详情断点续抓 + 跨 run 新增/消失对账（列表 meta `cross_run`）；不带值用 `~/.boss-zhipin-scraper/boss.db`（仓库外，不进 git）；JSON/CSV 导出照旧 |
+| `--no-db` | 关闭 | 禁用 SQLite 跨 run 对账/断点续抓 |
 | `--cdp-port` | 45222 | CDP 端口 |
 | `--setup-chrome` | 关闭 | 一键启动 Chrome CDP（持久隔离 profile） |
 | `--copy-login-state` | 关闭 | 手动导入主 Chrome 的 Local State + Cookie 相关文件到隔离 profile；默认、首次启动、重复启动都不复制 |

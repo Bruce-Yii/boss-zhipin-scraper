@@ -171,5 +171,117 @@ class DbStoreTests(unittest.TestCase):
         self.assertIn("数据库不存在", out_missing.getvalue())
 
 
+class CrossRunDeltaTests(unittest.TestCase):
+    """跨 run 对账（#175）：城市口径记录、COALESCE 保口径、baseline/delta。"""
+
+    def setUp(self):
+        self.db = load_db_store()
+        self.tmp = tempfile.TemporaryDirectory(prefix="dbstore-delta-")
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = self.db.open_store(os.path.join(self.tmp.name, "boss.db"))
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _job(self, job_id):
+        return {"job_id": job_id, "title": "岗位", "company_name": "公司",
+                "job_link": f"https://x/{job_id}.html"}
+
+    def test_upsert_records_city_and_conflict_preserves_scope(self):
+        ins, upd = self.db.upsert_jobs(self.conn, [self._job("j1")], city="杭州")
+        self.assertEqual((ins, upd), (1, 0))
+        # 再次入库不带口径 → COALESCE 保住已有 city，不洗成 NULL
+        self.db.upsert_jobs(self.conn, [self._job("j1")])
+        row = self.conn.execute(
+            "SELECT city, keyword FROM jobs WHERE job_id='j1'").fetchone()
+        self.assertEqual(row["city"], "杭州")
+        self.assertIsNone(row["keyword"])
+
+    def test_load_city_job_ids_scopes_by_city(self):
+        self.db.upsert_jobs(self.conn, [self._job("a"), self._job("b")],
+                            city="杭州")
+        self.db.upsert_jobs(self.conn, [self._job("c")], city="上海")
+        self.db.upsert_jobs(self.conn, [self._job("legacy")])  # 无口径旧行
+        self.assertEqual(self.db.load_city_job_ids(self.conn, "杭州"), {"a", "b"})
+        self.assertEqual(self.db.load_city_job_ids(self.conn, ""), set())
+
+    def test_delta_baseline_then_added_removed_kept(self):
+        first = self.db.cross_run_delta(self.conn, "杭州", ["a", "b"])
+        self.assertTrue(first["baseline"])
+        self.assertEqual(first["added"], ["a", "b"])
+        self.db.upsert_jobs(self.conn, [self._job("a"), self._job("b")],
+                            city="杭州")
+        second = self.db.cross_run_delta(self.conn, "杭州", ["b", "c"])
+        self.assertFalse(second["baseline"])
+        self.assertEqual(second["added"], ["c"])
+        self.assertEqual(second["removed"], ["a"])
+        self.assertEqual(second["kept_count"], 1)
+
+    def test_delta_without_city_returns_none(self):
+        self.assertIsNone(self.db.cross_run_delta(self.conn, "", ["a"]))
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    """v1 → v2 迁移：补列、版本前进、旧数据不动、幂等。"""
+
+    def setUp(self):
+        self.db = load_db_store()
+
+    def _make_v1_db(self, path):
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            "CREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT NOT NULL,"
+            " finished_at TEXT, mode TEXT, keyword TEXT, city TEXT,"
+            " job_count INTEGER NOT NULL DEFAULT 0,"
+            " detail_count INTEGER NOT NULL DEFAULT 0);"
+            "CREATE TABLE jobs (job_id TEXT PRIMARY KEY, payload TEXT NOT NULL,"
+            " first_seen_at TEXT NOT NULL, updated_at TEXT NOT NULL, run_id TEXT);"
+            "CREATE TABLE details (job_id TEXT PRIMARY KEY, jd TEXT,"
+            " payload TEXT NOT NULL, first_seen_at TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL, run_id TEXT);"
+            "INSERT INTO schema_meta VALUES ('schema_version', '1');"
+            "INSERT INTO jobs (job_id, payload, first_seen_at, updated_at)"
+            " VALUES ('old-row', '{}', 't1', 't1');")
+        conn.commit()
+        conn.close()
+
+    def test_v1_database_migrates_and_keeps_rows(self):
+        with tempfile.TemporaryDirectory(prefix="dbstore-mig-") as tmp:
+            path = os.path.join(tmp, "boss.db")
+            self._make_v1_db(path)
+            conn = self.db.open_store(path)
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+                self.assertIn("keyword", cols)
+                self.assertIn("city", cols)
+                row = conn.execute(
+                    "SELECT job_id, city FROM jobs").fetchone()
+                self.assertEqual(row["job_id"], "old-row")
+                self.assertIsNone(row["city"])
+                version = conn.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()[0]
+                self.assertEqual(version, str(self.db.SCHEMA_VERSION))
+            finally:
+                conn.close()
+            # 迁移后的库再次打开：幂等，不再改数据
+            conn = self.db.open_store(path)
+            try:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+            finally:
+                conn.close()
+
+    def test_fresh_store_starts_at_current_version_with_scope_columns(self):
+        with tempfile.TemporaryDirectory(prefix="dbstore-fresh-") as tmp:
+            conn = self.db.open_store(os.path.join(tmp, "boss.db"))
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+                self.assertIn("city", cols)
+            finally:
+                conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

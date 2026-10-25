@@ -381,7 +381,7 @@ class DetailChannelTests(unittest.TestCase):
                 "output_path": output, "security_map": {"j0": "sid"},
             }
             argv = ["boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
-                    "--pages", "1", "--output", output]
+                    "--pages", "1", "--output", output, "--no-db"]
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(module, "require_runtime_dependencies", return_value=True), \
                     mock.patch.object(module, "cleanup_stale_tmp_files"), \

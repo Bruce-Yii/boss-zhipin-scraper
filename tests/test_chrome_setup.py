@@ -2185,6 +2185,7 @@ class ChromeSetupTests(unittest.TestCase):
         UNAUTH = module.LoginProbeResult(module.LoginProbeStatus.UNAUTHENTICATED)
         with mock.patch.object(sys, "argv", [
                 "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
+                "--no-db",
         ]), \
                 mock.patch.object(module, "require_runtime_dependencies",
                                   return_value=True), \
@@ -2218,6 +2219,7 @@ class ChromeSetupTests(unittest.TestCase):
                 result = module.LoginProbeResult(status)
                 with mock.patch.object(sys, "argv", [
                         "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
+                        "--no-db",
                 ]), \
                         mock.patch.object(module, "require_runtime_dependencies",
                                           return_value=True), \
@@ -6055,7 +6057,7 @@ class RunLifecycleTests(unittest.TestCase):
         return (
             mock.patch.object(sys, "argv", [
                 "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
-                "--pages", "1", "--output", output_path,
+                "--pages", "1", "--output", output_path, "--no-db",
             ]),
             mock.patch.object(module, "require_runtime_dependencies", return_value=True),
             mock.patch.object(module, "cleanup_stale_tmp_files"),
@@ -6150,6 +6152,7 @@ class RunLifecycleTests(unittest.TestCase):
                 with mock.patch.object(sys, "argv", [
                         "boss_cdp_raw.py", "--keyword", "AI", "--city", "上海",
                         "--pages", "1", "--output", output, "--no-detail",
+                        "--no-db",
                 ]):
                     module.run_cli()
         write_sidecar.assert_not_called()
