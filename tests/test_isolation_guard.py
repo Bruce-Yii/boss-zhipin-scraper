@@ -4,11 +4,14 @@
 - 2026-08-12：未 mock ``flush_jobs`` 的列表测试向真实 job-result 写入 47 个假文件。
 - 2026-09-23：未 mock ``send_alert`` 的登录失败测试写真实 risk_events.jsonl。
 - 2026-09-24 接管审计：catch-all 测试可能关闭真实 CDP tab；``main()`` 测试可能删除真实 sidecar/tmp。
+- 2026-10-25：\`--db\` 默认启用后，4 个 CLI 测试把夹具数据写进真实 boss.db，
+  守卫的中段快照完全没覆盖（污染发生在守卫测试之前 + 之后的写入无人复核）。
 
 本守卫只在外层运行一次。子进程设置 ``BOSS_ISOLATION_GUARD_CHILD=1`` 跳过本类，
 再用临时 HOME/USERPROFILE 跑完整 discovery，避免递归和真实用户状态污染。
 """
 
+import atexit
 import hashlib
 import os
 import pathlib
@@ -20,6 +23,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 REAL_STATE_ROOT = pathlib.Path.home() / ".boss-zhipin-scraper"
+REAL_DB_PATH = REAL_STATE_ROOT / "boss.db"
 _IS_CHILD = os.environ.get("BOSS_ISOLATION_GUARD_CHILD") == "1"
 # 真实 Chrome 的 CDP 端口（仅用于「Chrome 是否在跑」的存活探测，不发 CDP 命令）
 _REAL_CDP_PORT = 45222
@@ -31,6 +35,47 @@ def _file_digest(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _real_db_digest():
+    """真实 boss.db 的内容摘要；不存在返回 None。"""
+    if not REAL_DB_PATH.exists():
+        return None
+    return _file_digest(REAL_DB_PATH)
+
+
+# discovery 先**收集**（导入）全部测试模块再执行 → 导入时刻先于任何测试体，
+# 在这里拍 boss.db 快照，才能覆盖"守卫测试之前"的外层测试污染（#177 事故）。
+_DB_DIGEST_AT_IMPORT = None if _IS_CHILD else _real_db_digest()
+
+
+def _scrape_run_lock_held():
+    """真实 run 锁是否被持有（并发真实抓取 → boss.db 变化属正常，跳过核对）。"""
+    lock = REAL_STATE_ROOT / "scrape.lock"
+    try:
+        return lock.exists()
+    except OSError:
+        return False
+
+
+def _verify_real_db_at_exit():
+    """进程退出兜底：boss.db 相对导入时刻变了 → stderr 大声告警。
+
+    不改退出码：并发真实抓取也会改库（守卫宁可漏报也不误杀套件）；
+    硬失败由 test_full_suite 里的核对承担（持锁时跳过）。
+    """
+    if _IS_CHILD or _DB_DIGEST_AT_IMPORT is None:
+        return
+    now = _real_db_digest()
+    if now != _DB_DIGEST_AT_IMPORT:
+        print("\n❌ 隔离守卫：真实 boss.db 在本次测试进程期间被写入——"
+              "检查未加 --no-db 的 CLI 测试（详见 tests/test_isolation_guard.py）",
+              file=sys.stderr)
+        sys.stderr.flush()
+
+
+if not _IS_CHILD:
+    atexit.register(_verify_real_db_at_exit)
 
 
 def _chrome_profile_in_use(port=_REAL_CDP_PORT):
@@ -144,6 +189,14 @@ class TestIsolationGuardTests(unittest.TestCase):
             after.pop("chrome_profile", None)
         self.assertEqual(after, before,
                          "全套单测不得新增、删除或修改真实 scraper 状态")
+        # boss.db 专项（#177 事故）：核对**导入时刻 → 守卫测试运行时**的窗口
+        # （中段快照的 before 里包含之前的污染，上面那条看不见）。
+        # 持真实 run 锁 = 并发真实抓取在写库 → 跳过，避免误报。
+        if _DB_DIGEST_AT_IMPORT is not None and not _scrape_run_lock_held():
+            self.assertEqual(
+                _real_db_digest(), _DB_DIGEST_AT_IMPORT,
+                "真实 boss.db 在本套件前段被测试写入——"
+                "检查未加 --no-db 的 CLI 测试（main()/run_cli() 都要查）")
 
 
 if __name__ == "__main__":
