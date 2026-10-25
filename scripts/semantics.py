@@ -413,7 +413,8 @@ def drop_junk_jobs(jobs):
 
     1. 标题含 FDE → 直接保留（用户明示例外）；
     2. 销售：标题命中销售词（强判定）→ 删；
-    3. 技术/设计/杂：标题命中技术词 → 删（产品经理/产品运营结尾不算）；
+    3. 技术/设计/杂：标题命中技术词 → 删（产品经理/产品运营结尾不算；
+       标题含「解决方案」且有 AI 关键词的也不算，issue #181）；
     4. 标题没有非技术岗名词汇（产品/运营/增长/策略/内容/数据/助理/专员/
        项目/营销/解决方案/pm）且标题不含 AIGC（issue #155 用户口径：aigc 没问题——
        AIGC 本身就是岗位领域明示，放行到 JD 层再判）→ 删（噪声：连招什么岗
@@ -448,6 +449,11 @@ def drop_junk_jobs(jobs):
             core = re.split(r"[（(]", title)[0].strip()
             if core.endswith(_PRODUCT_CORE_SUFFIX):
                 pass  # 产品经理挂技术方向（如算法/测试产品经理）→ 不是技术岗，转 AI 证据判定
+            elif "解决方案" in low and _ai_evidence_level(title, "", ""):
+                # 用户 2026-10-25 口径（issue #181）：AI 解决方案工程师/架构师类，
+                # 标题带 AI 关键词即放行（转 AI 证据判定）；无 AI 的解决方案
+                # 工程师仍按技术岗删。
+                pass
             else:
                 reason = "技术/设计岗（标题）"
                 dropped["tech"] += 1
