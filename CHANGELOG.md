@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 岗名词表补「解决方案」（issue #179）：AI解决方案实习生是用户点名的目标岗位，此前无 JD 时被当「标题无岗名」误删；无 AI 证据的解决方案岗仍按跨行业噪声删，本质标准不放宽。
 - 跨 run 对账（issue #175）：`--db` 默认启用（`--no-db` 关闭），每次列表入库前对**同城市**历史做快照，列表 meta 记 `cross_run`——added（今天首次见到）/ removed（历史见过、本次没搜到，只是下架候选信号）/ kept_count（仍在），首次运行记 baseline。「昨天挖空、今天新增哪些」从此机器可答；schema v1→v2（jobs 表补 keyword/city，旧库自动迁移、旧数据不动）；默认库打不开只告警不挡抓取，显式 `--db` 打不开仍硬失败。
 - 摘要守恒对账（issue #172）：`build_summary` 追加 `input_jobs`/`filtered_out`（精确并集，原因重叠不重复扣减），`format_summary` 输出「对账: 输入 N 条 → 进入统计 M 条（剔除 K 条）」——摘要丢记录从"散落的原因行"变成有总数守恒的结论；`filter_summary_inputs` 契约签名未动。
 - CSV 进验收范围（issue #171）：`check_csv_companion` 对同名随附 CSV 做行数/job_id 对账（多行/缺行/重复/空 id 均 error）、必需列齐全（列表档 6 列、详情档 4 列）、utf-8 BOM 可解析；接进 `audit_pipeline self-check`，error 拉低产物结论。CSV 缺失不算缺陷（可选产物）。

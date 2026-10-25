@@ -349,6 +349,22 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped["noise"], 0)
 
+    def test_jiejuefangan_role_word_kept_without_jd(self):
+        """解决方案是用户点名认可的非技术岗名（issue #179）：
+        AI解决方案实习生无 JD 时不再判噪声。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "AI解决方案实习生",
+                                     "company_name": "X"}])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(dropped["noise"], 0)
+
+    def test_jiejuefangan_without_ai_still_dropped(self):
+        """解决方案只是岗名词：无 AI 证据的解决方案岗仍按跨行业噪声删。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "解决方案实习生",
+                                     "company_name": "X",
+                                     "jd": "负责客户解决方案落地与交付协调"}])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["noise"], 1)
+
     def test_role_gate_still_guards_non_ai_and_bare_ai_titles(self):
         """岗名门只给 AIGC 放行：无岗名又无 AIGC 的标题（含裸 AI 前缀）仍判噪声。"""
         kept, dropped = self._drop([{"job_id": "a", "title": "神秘高薪岗位",
