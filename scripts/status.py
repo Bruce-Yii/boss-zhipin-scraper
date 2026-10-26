@@ -12,13 +12,49 @@ log = logging.getLogger("boss_cdp")
 
 def _core():
     import sys as _sys
-    candidates = [m for m in _sys.modules.values()
-                 if getattr(m, "__file__", None)
-                 and str(m.__file__).endswith("boss_cdp_raw.py")]
-    if candidates:
-        return candidates[-1]
+    # 1) 调用栈优先。
+    try:
+        _frame = _sys._getframe(1)
+    except ValueError:
+        _frame = None
+    _depth = 0
+    while _frame is not None and _depth < 64:
+        _depth += 1
+        try:
+            _g = _frame.f_globals
+            _fpath = _g.get("__file__", "") if isinstance(_g, dict) else ""
+        except Exception:
+            _fpath = ""
+        if _fpath and str(_fpath).endswith("boss_cdp_raw.py"):
+            for _m in list(_sys.modules.values()):
+                try:
+                    if getattr(_m, "__dict__", None) is _g:
+                        return _m
+                except Exception:
+                    continue
+            break
+        try:
+            _frame = _frame.f_back
+        except Exception:
+            break
+    _candidates = [m for m in _sys.modules.values()
+                   if getattr(m, "__file__", None)
+                   and str(m.__file__).endswith("boss_cdp_raw.py")]
+    if _candidates:
+    # 2) 直接调用取最近 exec 副本。
+        _best = _candidates[-1]
+        try:
+            _best_seq = getattr(_best, "_BOSS_EXEC_SEQ", -1)
+            for _m in _candidates[:-1]:
+                _seq = getattr(_m, "_BOSS_EXEC_SEQ", -1)
+                if _seq is not None and _best_seq is not None and _seq > _best_seq:
+                    _best, _best_seq = _m, _seq
+        except Exception:
+            pass
+        return _best
     try:
         from . import boss_cdp_raw as _m
+    # 3) 兜底按路径加载。
         return _m
     except Exception:
         if "boss_cdp_raw" in _sys.modules:
@@ -38,11 +74,7 @@ def run_status(cdp_port=_core().DEFAULT_CDP_PORT, result_dir=_core().DEFAULT_RES
 
     # ── 运行态 ──
     print("\n[运行态]")
-    try:
-        # 局部导入：模块级 requests 是懒加载（未初始化时为 None），此处需真实可用性
-        import requests as _requests
-    except ImportError:
-        _requests = None
+    _core().require_runtime_dependencies("requests")
     if _core().requests is None:
         print("  CDP 端口        : ⚠️ 缺少 requests，无法探测")
     else:
@@ -78,10 +110,10 @@ def run_status(cdp_port=_core().DEFAULT_CDP_PORT, result_dir=_core().DEFAULT_RES
         print("  熔断冷却        : 无")
     # 详情页日预算（跨 run 累计的详情页请求次数）
     try:
-        used_today = _daily_budget.read_state()["detail"]
-        if DAILY_DETAIL_BUDGET:
-            print(f"  详情页日预算    : 今日已用 {used_today}/{DAILY_DETAIL_BUDGET}"
-                  f"（剩余 {max(DAILY_DETAIL_BUDGET - used_today, 0)} 次请求）")
+        used_today = _core()._daily_budget.read_state()["detail"]
+        if _core().DAILY_DETAIL_BUDGET:
+            print(f"  详情页日预算    : 今日已用 {used_today}/{_core().DAILY_DETAIL_BUDGET}"
+                  f"（剩余 {max(_core().DAILY_DETAIL_BUDGET - used_today, 0)} 次请求）")
         else:
             print(f"  详情页日预算    : 今日已用 {used_today}（未设上限）")
     except Exception:
@@ -136,12 +168,14 @@ def run_status(cdp_port=_core().DEFAULT_CDP_PORT, result_dir=_core().DEFAULT_RES
 
 def probe_cdp_port(port, timeout=2):
     """探测某端口是否有 CDP 服务（/json/version 可达且含 webSocketDebuggerUrl）。"""
-    if _core().requests is None:
+    try:
+        import requests as _req_probe
+    except ImportError:
         return False
     try:
-        resp = _core().requests.get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
+        resp = _req_probe.get(f"http://127.0.0.1:{port}/json/version", timeout=timeout)
         return bool(resp.json().get("webSocketDebuggerUrl"))
-    except (_core().requests.RequestException, ValueError, KeyError):
+    except (_req_probe.RequestException, ValueError, KeyError):
         return False
 
 
@@ -168,11 +202,11 @@ def run_check(cdp_port=_core().DEFAULT_CDP_PORT):
 
     # 检查 1: Python 依赖
     print("[1/3] Python 依赖...")
-    deps_ok = _core().require_runtime_dependencies("_core().websocket", "requests")
+    deps_ok = _core().require_runtime_dependencies("websocket", "requests")
     if _core().requests is not None:
         print("  ✅ requests 可导入")
     if _core().websocket is not None:
-        print("  ✅ _core().websocket 可导入")
+        print("  ✅ websocket-client 可导入")
     if deps_ok:
         print("  ✅ 依赖完整")
     else:
