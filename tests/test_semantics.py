@@ -474,6 +474,25 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(dropped["items"][0]["job_id"], "a")
         self.assertIn("销售", dropped["items"][0]["reason"])
 
+    def test_nonai_ops_title_dropped_at_list_stage(self):
+        """2026-10-27 口径：非 AI 的运营/电商/客服类标题列表阶段直接毙。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "新媒体运营实习生", "company_name": "X"},
+            {"job_id": "b", "title": "运营专员", "company_name": "Y"},
+            {"job_id": "c", "title": "电商运营助理", "company_name": "Z"},
+        ])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["noise"], 3)
+
+    def test_ai_or_product_ops_title_not_dropped_by_new_rule(self):
+        """标题带 AI/产品的运营类走正常判定，不被新规则误杀。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "AI新媒体运营", "company_name": "X"},
+            {"job_id": "b", "title": "产品运营实习生", "company_name": "Y"},
+        ])
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(dropped["noise"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()
