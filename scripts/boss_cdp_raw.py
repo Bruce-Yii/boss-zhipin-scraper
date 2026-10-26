@@ -2677,6 +2677,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
     serial_ok = 0
     serial_done = 0
     serial_reasons = {}
+    serial_failures = []
     start_time = time.time()
 
     # 详情 API 通道（串行）：停靠 zhipin 域 tab，按 DETAIL_API_TAB_BUDGET 主动
@@ -2734,6 +2735,14 @@ def scrape_details(list_data, max_details=None, output_path=None,
         title = job.get("title", "")
         company = job.get("boss_name", "")
         job_id = job.get("job_id", "")
+        def _note_failure(_reason, _message=""):
+            serial_failures.append({
+                "job_id": str(job_id or ""),
+                "title": str(title or ""),
+                "company": str(company or ""),
+                "reason": str(_reason or "unknown"),
+                "message": str(_message or "")[:500],
+            })
         if not link:
             continue
 
@@ -2883,6 +2892,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             consecutive_cdp_errors += 1
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            _note_failure(reason, result.get("message", ""))
             print(f"  ⚠️ CDP 会话建立失败（连续 {consecutive_cdp_errors} 次）: {result['message']}")
             if job_id:
                 pending[job_id] = pending.get(job_id, 0) + 1
@@ -2907,6 +2917,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             # **继续下一个岗位**（不是停手）
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            if reason == "known_bad_page":
+                _note_failure(reason, result.get("message", ""))
             continue
         elif reason == "stopped":
             break
@@ -2916,6 +2928,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             # 必须打印——可观测性原则：风控形态不可见就无法区分频次限制与真验证码
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            _note_failure(reason, result.get("message", ""))
             print(f"  ⚠️ {result['message']}")
             cooldown = result.get("cooldown_seconds") or 0
             if cooldown:
@@ -2931,6 +2944,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
         else:
             serial_done += 1
             serial_reasons[reason] = serial_reasons.get(reason, 0) + 1
+            _note_failure(reason, result.get("message", ""))
             if reason == "invalid_detail":
                 # 解析类失败（页面结构变了等）：重试纯浪费且掩盖结构漂移信号，不进 pending
                 print(f"  ⏭️ 跳过无效详情页（解析类失败不重试）: {result['message']}")
@@ -2973,6 +2987,14 @@ def scrape_details(list_data, max_details=None, output_path=None,
     if results:
         _atomic_write_export_json(output_path, results)
     save_pending_ids(output_path, pending)
+
+    if serial_failures:
+        try:
+            failures_path = output_path + ".failures.json"
+            _atomic_write_export_json(failures_path, serial_failures)
+            print(f"  失败明细: {failures_path} {len(serial_failures)}条")
+        except OSError:
+            pass
     if serial_done:
         print(run_summary(time.time() - start_time,
                           serial_done, serial_ok, serial_reasons))
@@ -3267,6 +3289,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         todo.append(job)
 
     results = list(existing_results) if existing_results is not None else []
+    failures = []
     stop_event = threading.Event()
     consecutive_cdp_errors = 0
     start_time = time.time()
@@ -3278,6 +3301,11 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             if results:
                 _atomic_write_export_json(output_path, results)
             save_pending_ids(output_path, pending)
+            if failures:
+                try:
+                    _atomic_write_export_json(output_path + ".failures.json", failures)
+                except OSError:
+                    pass
 
     def handle_result(job, result):
         # 仅主线程（as_completed 循环）调用，results/pending 无并发访问，无需加锁
@@ -3294,7 +3322,14 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         reason = result["reason"]
         if reason in ("invalid_detail", "stopped", "skipped_today",
                       "known_bad_page"):
-            # 停止信号/当天已抓过，都不是岗位失败：不应污染 pending 或触发失败降速。
+            if reason in ("invalid_detail", "known_bad_page"):
+                failures.append({
+                    "job_id": str(job_id or ""),
+                    "title": str(job.get("title", "") or ""),
+                    "company": str(job.get("boss_name", "") or ""),
+                    "reason": str(reason or "unknown"),
+                    "message": str(result.get("message", "") or "")[:500],
+                })
             return
         limiter.record_failure()
         if reason == "login_required":
@@ -3321,6 +3356,13 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             pending[job_id] = pending.get(job_id, 0) + 1
             if output_path:
                 save_pending_ids(output_path, pending)
+            failures.append({
+                "job_id": str(job_id or ""),
+                "title": str(job.get("title", "") or ""),
+                "company": str(job.get("boss_name", "") or ""),
+                "reason": str(reason or "unknown"),
+                "message": str(result.get("message", "") or "")[:500],
+            })
 
     # 详情 API 通道并发：预建共享 tab 池（每 worker 一个停靠 tab，只导航一次）。
     # 修复点（2026-09-22 审计）：此前并发模式每岗自建 tab 且用岗位标题导航

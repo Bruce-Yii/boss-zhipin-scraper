@@ -120,11 +120,18 @@ class CDPSession:
             core = _core()
             while not self._dead:
                 try:
-                    core.requests.get(
+                    requests_mod = core.requests
+                    if requests_mod is None:
+                        return
+                    requests_mod.get(
                         f"http://127.0.0.1:{self.cdp_port}/json/version",
                         timeout=5,
                     )
-                except core.requests.RequestException:
+                except OSError:
+                    # requests.RequestException 继承 IOError(=OSError)；网络层
+                    # 失败即判死。用 OSError 而不用 requests_mod.RequestException
+                    # ——后者在 requests 未初始化时是 None.属性访问，直接崩线程
+                    # （2026-10-27 实测 traceback）。
                     self._dead = True
                     try:
                         self.ws.close()
