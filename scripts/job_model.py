@@ -935,7 +935,7 @@ class JobRecord:
         detail = detail or {}
         merged = dict(self.data)
         for key, value in detail.items():
-            if value in (None, "", [], {}):
+            if value is None or value == "" or value == [] or value == {}:
                 continue
             merged[key] = value
         record = JobRecord(merged)

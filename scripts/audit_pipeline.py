@@ -27,6 +27,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
@@ -170,7 +171,7 @@ def self_check(paths=None, repo_root=None, write_into=None):
         "counterexample_suite_ok": suite_ok,
         "counterexample_suite_output": suite_tail,
         "products": results,
-        "generated_at": None,
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     if write_into and os.path.exists(write_into):
         with open(write_into, encoding="utf-8") as handle:
@@ -241,7 +242,11 @@ def main(argv=None):
         return 0
     if command == "self-check":
         paths = [a for a in argv[1:] if not a.startswith("--")]
-        ok, report = self_check(paths)
+        write_into = None
+        for i, a in enumerate(argv[1:]):
+            if a == "--write-into" and i + 1 < len(argv) - 1:
+                write_into = argv[i + 2]
+        ok, report = self_check(paths, write_into=write_into)
         print("=== 验收流水线自检 ===")
         print(f"需求条数：{report['requirements']}")
         print(f"反例套件：{'通过' if report['counterexample_suite_ok'] else '未通过/缺失'}")

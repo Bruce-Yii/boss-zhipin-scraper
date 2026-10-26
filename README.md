@@ -34,6 +34,7 @@ python3 scripts/boss_cdp_raw.py --setup-chrome
 
 # 3. 抓取 + 分析
 python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --analysis
+python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --quick  # 一键：列表+详情+摘要
 
 # 支持全国城市（含三四五线），例如：
 python3 scripts/boss_cdp_raw.py --keyword "前端" --city 赣州 --pages 3
@@ -57,7 +58,7 @@ python3 scripts/job_summary.py
 - 增量写入（异常退出不丢数据）
 - 一键环境检查 + 持久隔离 Chrome CDP profile
 - 多维筛选（规模、融资、薪资、经验、学历、行业）
-- macOS + Linux 支持（Windows 代码分支已预留，未经实测，不保证可用）
+- macOS + Linux + Windows 支持（开发与测试均在 Windows 环境进行，但部分流程未经完整验证）
 
 <details>
 <summary>🔍 为什么不选 Selenium / Playwright 类爬虫？</summary>

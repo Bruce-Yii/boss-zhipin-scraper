@@ -599,13 +599,6 @@ def classify_extract_failure(message, page_text=""):
     if page_text and "职位描述" not in page_text:
         return "no_section"
     return "unknown"
-    for name, markers in _EXTRACT_FAILURE_PATTERNS:
-        for marker in markers:
-            if marker and marker in text:
-                return name
-    if "too short" in text:
-        return "too_short"
-    return "unknown"
 
 
 active_state = _model.active_state
