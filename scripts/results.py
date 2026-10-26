@@ -101,7 +101,7 @@ def run_list_results(result_dir=_core().DEFAULT_RESULT_DIR):
         return 0
     print(f"\n=== 抓取结果文件（{len(entries)} 个）===")
     for e in entries:
-        modified = datetime.fromtimestamp(e["modified"]).strftime("%Y-%m-%d %H:%M")
+        modified = _core().datetime.fromtimestamp(e["modified"]).strftime("%Y-%m-%d %H:%M")
         print(f"  [{e['kind']:>7}] {modified}  {e['size']:>9} B  {_core().os.path.basename(e['path'])}")
     print()
     return 0
