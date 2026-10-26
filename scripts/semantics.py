@@ -464,6 +464,10 @@ def drop_junk_jobs(jobs):
                 dropped["tech"] += 1
         if reason:
             pass
+        elif "新媒体" in low:
+            # 新媒体标题无例外：即使带 AI/产品也与目标无关（2026-10-27 口径）。
+            reason = "新媒体岗（标题）"
+            dropped["noise"] += 1
         elif (any(w in low for w in _NONAI_OPS_TITLE_TERMS)
                 and "产品" not in low
                 and not _ai_evidence_level(title, "", [])):
