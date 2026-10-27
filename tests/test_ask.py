@@ -367,13 +367,30 @@ class AskWhyTests(AskTestBase):
         self.assertTrue(payload["ok"])
         data = payload["data"]
         self.assertEqual(data["decision"], "kept")
-        self.assertEqual(data["decision_label"], "保留")
+        self.assertEqual(data["decision_label"], "保留（最新交付物）")
         self.assertEqual(data["kept_in"][0]["scope_key"], "杭州|intern|测试")
         self.assertEqual(data["job"]["title"], "AI产品经理")
         self.assertIn("AI", "；".join(data["evidence"]))
         self.assertEqual(data["ruleset_version"], "2026-10-28")
         self.assertEqual(data["ruleset_source"], "交付物盖章")
         self.assertIn("保留", payload["human"])
+
+    def test_why_uses_latest_deliverable_when_older_had_it(self):
+        """旧交付物里保留、最新口径已删：结论必须是"删除"（2026-10-28 修）。"""
+        self.deliverable("boss_jobs_old.json", [_job("x1")],
+                         "2026-10-26T10:00:00+08:00",
+                         scope_key="杭州|intern|旧")
+        self.deliverable("boss_jobs_new.json", [], "2026-10-28T10:00:00+08:00",
+                         scope_key="杭州|intern|新",
+                         dropped_junk=[{"job_id": "x1", "title": "AI新媒体运营",
+                                        "company": "X", "reason": "新媒体岗（标题）"}])
+
+        payload = self.ask.ask_why("x1")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["data"]["decision"], "dropped")
+        self.assertIn("删除", payload["human"])
+        self.assertIn("最新交付物", payload["human"])
 
     def test_why_dropped_returns_rule_reason(self):
         self.deliverable(

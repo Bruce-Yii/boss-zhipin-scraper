@@ -1058,6 +1058,9 @@ def ask_why(job_id=None, result_dir=None, db_path=None):
 
     kept_in, dropped_in, no_jd_in = [], [], []
     deliverable_payloads = []
+    latest_created = ""
+    latest_meta = None
+    latest_kept = latest_dropped = latest_no_jd = None
     if index is not None:
         for entry in _deliverable_entries(index):
             loaded = _load_deliverable(result_dir, entry)
@@ -1075,17 +1078,28 @@ def ask_why(job_id=None, result_dir=None, db_path=None):
                 "with_jd": _entry_counts(entry)["with_jd"],
                 "ruleset_version": loaded["ruleset_version"],
             }
+            is_latest = meta["created_at"] >= latest_created
+            if is_latest:
+                latest_created = meta["created_at"]
+                latest_meta = meta
+                latest_kept = latest_dropped = latest_no_jd = None
             found_job = loaded["jobs"].get(job_id)
             if found_job is not None:
                 kept_in.append(dict(meta, evidence=_evidence_of(found_job),
                                     job=_job_summary(found_job)))
+                if is_latest:
+                    latest_kept = found_job
             dropped = loaded["dropped_junk"].get(job_id)
             if dropped is not None:
                 dropped_in.append(dict(meta, reason=dropped.get("reason") or "",
                                        title=dropped.get("title") or "",
                                        company=dropped.get("company") or ""))
+                if is_latest:
+                    latest_dropped = dropped
             if job_id in loaded["dropped_no_jd"]:
                 no_jd_in.append(dict(meta, reason="无 JD（口径一在详情阶段剔除）"))
+                if is_latest:
+                    latest_no_jd = True
 
     excluded_in = []
     for profile in _load_profiles(errors):
@@ -1104,30 +1118,44 @@ def ask_why(job_id=None, result_dir=None, db_path=None):
     db_info = _db_lookup_job(db_path, job_id, errors)
 
     ruleset_version, ruleset_source, ruleset_stamped = _ruleset_info(deliverable_payloads)
-    if kept_in:
+    # 结论以**最新构建的交付物**为准：历史交付物里保留、最新口径已删的岗，
+    # 对用户来说就是"没上榜"，不能因为旧文件里有就说"保留"（2026-10-28 修）。
+    if latest_kept is not None:
         decision = "kept"
-    elif dropped_in:
+    elif latest_dropped is not None:
         decision = "dropped"
-    elif no_jd_in:
+    elif latest_no_jd:
         decision = "no_jd"
     elif excluded_in:
         decision = "excluded"
+    elif kept_in:
+        decision = "history_only"
+    elif dropped_in:
+        decision = "dropped_history"
+    elif no_jd_in:
+        decision = "no_jd"
     elif db_info.get("found"):
         decision = "db_only"
     else:
         decision = "unknown"
-    labels = {"kept": "保留", "dropped": "删除（规则剔除）", "no_jd": "删除（无 JD）",
-              "excluded": "人工剔除名单", "db_only": "找到了库记录，但不在归属交付物里",
+    labels = {"kept": "保留（最新交付物）", "dropped": "删除（最新交付物里规则剔除）",
+              "no_jd": "删除（无 JD）", "excluded": "人工剔除名单",
+              "db_only": "找到了库记录，但不在归属交付物里",
+              "history_only": "不在最新交付物（只在历史交付物出现过）",
+              "dropped_history": "不在最新交付物（历史交付物里被剔除过）",
               "unknown": "未找到"}
     job_summary = {}
-    if kept_in:
+    if latest_kept is not None:
+        job_summary = _job_summary(latest_kept)
+    elif kept_in:
         job_summary = kept_in[0].get("job") or {}
     elif db_info.get("job"):
         job_summary = _job_summary(db_info["job"])
     elif dropped_in:
         job_summary = {"job_id": job_id, "title": dropped_in[0].get("title") or "",
                        "company": dropped_in[0].get("company") or ""}
-    evidence = kept_in[0].get("evidence") if kept_in else _evidence_of(db_info.get("job"))
+    evidence = (kept_in[0].get("evidence") if kept_in
+                else _evidence_of(db_info.get("job")))
     found = decision != "unknown"
     if not found:
         _note(errors, f"没有找到 job_id {job_id}：交付物/剔除清单/人工名单/原材料库"
@@ -1146,6 +1174,7 @@ def ask_why(job_id=None, result_dir=None, db_path=None):
         "ruleset_version": ruleset_version,
         "ruleset_source": ruleset_source,
         "ruleset_stamped": ruleset_stamped,
+        "current": latest_meta,
         "evidence": evidence,
         "searched": [
             f"交付物 {len(deliverable_payloads)} 份（含 archive）",
