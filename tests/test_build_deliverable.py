@@ -363,6 +363,14 @@ class BuildFromArtifactsTests(unittest.TestCase):
         with open(self.target, encoding="utf-8") as handle:
             ids = sorted(j["job_id"] for j in json.load(handle)["jobs"])
         self.assertEqual(ids, ["a", "d"])
+        # 旧版本必须归档到 archive/（ask diff 的"上一版"来源）
+        archive_dir = os.path.join(self.result_dir, "archive")
+        archived = [name for name in os.listdir(archive_dir)
+                    if name.startswith("out_prev_") and name.endswith(".json")]
+        self.assertEqual(len(archived), 1)
+        with open(os.path.join(archive_dir, archived[0]), encoding="utf-8") as handle:
+            self.assertEqual([j["job_id"] for j in json.load(handle)["jobs"]],
+                             ["a"])
 
     def test_exclude_file_formats(self):
         for payload in (["x", "y"], {"job_ids": ["x"]}, "x,y"):

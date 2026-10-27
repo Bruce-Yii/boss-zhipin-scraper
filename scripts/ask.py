@@ -338,7 +338,8 @@ def _db_stats(db_path, errors):
     """原材料库只读统计（表/列缺失都降级为 0 或 None，不抛异常）。"""
     stats = {"path": db_path, "ok": False, "schema_version": None, "jobs": 0,
              "details": 0, "details_with_jd": 0, "runs": 0, "last_job_update": None,
-             "error": ""}
+             "job_versions": 0, "job_flags": 0, "duplicate_groups": 0,
+             "states": {}, "error": ""}
     if not os.path.exists(db_path):
         stats["error"] = "数据库不存在"
         _note(errors, f"原材料库不存在：{db_path}（数字来自文件与台账）")
@@ -358,8 +359,23 @@ def _db_stats(db_path, errors):
             if "updated_at" in jobs_cols:
                 row = conn.execute("SELECT MAX(updated_at) FROM jobs").fetchone()
                 stats["last_job_update"] = row[0] if row is not None else None
+            if "state" in jobs_cols:
+                stats["states"] = {
+                    str(row[0] or ""): _safe_int(row[1])
+                    for row in conn.execute(
+                        "SELECT state, COUNT(*) FROM jobs GROUP BY state")}
+            if "canonical_id" in jobs_cols:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM (SELECT canonical_id FROM jobs "
+                    "WHERE canonical_id IS NOT NULL AND canonical_id != '' "
+                    "GROUP BY canonical_id HAVING COUNT(*) > 1)").fetchone()
+                stats["duplicate_groups"] = _safe_int(row[0]) if row is not None else 0
         else:
             _note(errors, "原材料库是旧 schema：没有 jobs 表")
+        if "job_versions" in tables:
+            stats["job_versions"] = _count(conn, "job_versions")
+        if "job_flags" in tables:
+            stats["job_flags"] = _count(conn, "job_flags")
         if "details" in tables:
             stats["details"] = _count(conn, "details")
             detail_cols = _columns(conn, "details")
@@ -929,6 +945,11 @@ def _format_status(data):
                  f"｜jobs {db.get('jobs', 0)}｜details {db.get('details', 0)}"
                  f"（含 JD {db.get('details_with_jd', 0)}）｜runs {db.get('runs', 0)}"
                  f"｜{schema_text}")
+    if db.get("ok"):
+        lines.append(f"**资产**：JD 版本 {db.get('job_versions', 0)}"
+                     f"｜标记 {db.get('job_flags', 0)}"
+                     f"｜重复组 {db.get('duplicate_groups', 0)}"
+                     f"｜状态 {db.get('states') or '未标'}")
     questions = data.get("open_questions") or []
     if questions:
         lines.append("**待拍板**：")

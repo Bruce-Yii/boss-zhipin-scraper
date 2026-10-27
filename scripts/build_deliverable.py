@@ -33,6 +33,7 @@ import csv
 import json
 import os
 import pathlib
+import shutil
 import sqlite3
 import sys
 from datetime import UTC, datetime
@@ -68,6 +69,33 @@ def _load_payload(path):
             return json.load(handle)
     except (OSError, ValueError, UnicodeDecodeError):
         return None
+
+
+def _job_ids(payload):
+    """交付物 payload → job_id 集合（用于判断重建前后有没有变化）。"""
+    if not isinstance(payload, dict):
+        return set()
+    return {str(job.get("job_id")) for job in payload.get("jobs") or []
+            if isinstance(job, dict) and job.get("job_id")}
+
+
+def _archive_previous_deliverable(target, result_dir):
+    """把旧交付物复制到 archive/ 作为上一版（ask diff 用）；失败返回空串。"""
+    try:
+        archive_dir = os.path.join(result_dir, "archive")
+        os.makedirs(archive_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = os.path.splitext(os.path.basename(target))[0]
+        dest = os.path.join(archive_dir, f"{stem}_prev_{stamp}.json")
+        suffix = 1
+        while os.path.exists(dest):
+            dest = os.path.join(archive_dir, f"{stem}_prev_{stamp}_{suffix}.json")
+            suffix += 1
+        shutil.copy2(target, dest)
+        return dest
+    except OSError as exc:
+        print(f"⚠️  上一版归档失败（不影响本次产出）：{exc}")
+        return ""
 
 
 def load_exclude_ids(path):
@@ -514,7 +542,18 @@ def build(args):
                                        artifacts_stats, len(excluded))
     # 口径可回溯：每条交付物记录规则版本，--why/审计据此解释"为什么留/删"。
     extra["ruleset_version"] = semantics.RULESET_VERSION
-    res = ec._merge_jd_into_export(target, list(details.values()), base=base,
+    # P1：原地重建时先写到临时文件，内容有变化就把旧版本归档到 archive/，
+    # 这样 Agent 在对话里问"跟昨天/上一版比呢"时 ask diff 才有上一版可对比。
+    build_target = target
+    previous_payload = None
+    if prefer_base and os.path.exists(target):
+        build_target = target + ".buildtmp"
+        try:
+            with open(target, encoding="utf-8") as handle:
+                previous_payload = json.load(handle)
+        except (OSError, json.JSONDecodeError, ValueError):
+            previous_payload = None
+    res = ec._merge_jd_into_export(build_target, list(details.values()), base=base,
                                    keep_junk=args.keep_junk,
                                    extra_meta=extra or None,
                                    prefer_base=prefer_base)
@@ -526,6 +565,19 @@ def build(args):
     if kept == 0:
         print(" kept=0，未产出交付物")
         return 0, 1
+    if build_target != target:
+        try:
+            with open(build_target, encoding="utf-8") as handle:
+                new_payload = json.load(handle)
+        except (OSError, json.JSONDecodeError, ValueError):
+            new_payload = None
+        old_ids = _job_ids(previous_payload)
+        new_ids = _job_ids(new_payload)
+        if old_ids and old_ids != new_ids:
+            archived = _archive_previous_deliverable(target, args.result_dir)
+            if archived:
+                print(f"上一版已归档: {archived}")
+        os.replace(build_target, target)
 
     with open(target, encoding="utf-8") as handle:
         final = json.load(handle)
