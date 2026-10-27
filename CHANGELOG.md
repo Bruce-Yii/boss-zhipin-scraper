@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 运营标题不再一刀切（issue #199）：`drop_junk_jobs` 的「非AI运营岗」判定先查 JD/技能的 AI 证据——标题是运营/电商/客服但 JD 明确是 AI 岗（AI 语音平台用户运营、AI 产品客户成功、AI 营销 GEO 等）不再被删，实测救回 33 条；无 AI 的运营仍删，新媒体维持全删。重出交付物 245 → **278 条**。FDE 17/17、AIGC 28/28、Agent 8/8 标题全部保留（复核非规则误删）。
 - 交付物原地重建修漏（issue #197）：`build_deliverable` 原地重建（target 已存在）时，`_merge_jd_into_export` 会优先读旧 target 当候选全集，本次候选池被忽略 → 旧交付物里没有的新岗位永远进不来（每日重建卡在 242 的真因）。新增 `prefer_base` 开关，`--from-db`/`--from-artifacts` 重建以本次候选为全量，同时带入旧 target 的累计 dropped/target_roots；修复后重出 **245 条**（242 + FDE工程师 + AIGC运营日常实习生 + AIGC实习生新帖），规则复核三条均保留、不是误删。+1 回归测试。
 - code 37 自愈（issue #195，机理同 boss-agent-cli PR #453）：`__zp_stoken__` 被标记后所有自动化请求返回 code 37；新增 `--warm-stoken [秒]`（真实打开搜索页等待安全 JS，默认 75s）与 `scripts/warm_stoken.py`；登录探测命中 37 时**自动热刷新并重探一次**（`--setup-chrome` 等待登录同样生效），仍失败才停——不循环、不硬怼；热刷新后紧接着跑抓取可恢复（2026-10-27 实测：11 词×3 页全过）。顺带修 `run_state.update()` 在父子进程竞争下可能把运行中误标成 `running=false`（更新语义强制回填 true）。
 - 全量口径重建 + 人工剔除 + 多模板日常作业（issue #193）：

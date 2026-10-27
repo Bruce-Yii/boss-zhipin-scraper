@@ -470,9 +470,13 @@ def drop_junk_jobs(jobs):
             dropped["noise"] += 1
         elif (any(w in low for w in _NONAI_OPS_TITLE_TERMS)
                 and "产品" not in low
-                and not _ai_evidence_level(title, "", [])):
+                and not _ai_evidence_level(title, str(job.get("jd") or ""),
+                                           job.get("skill_tags") or job.get("skills") or [])):
             # 非 AI 运营/电商/客服类标题：与 AI 非技术岗无关，列表阶段直接毙
             # （标题带 AI/产品的走正常判定；FDE 例外在前）。
+            # 2026-10-28 修：有 JD 时必须先看 JD 的 AI 证据——此前只查标题，
+            # 把「海外用户运营（AI 语音平台）」「客户成功运营（AI 产品）」这类
+            # JD 明确是 AI 岗的运营误删了（实测 36 条）。
             reason = "非AI运营岗（标题）"
             dropped["noise"] += 1
         elif not any(w in low for w in _ROLE_WORDS) and "aigc" not in low:
