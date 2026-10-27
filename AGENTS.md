@@ -25,22 +25,23 @@
 
 **code 37「环境异常」= `__zp_stoken__` 被标记**（boss-agent-cli PR #453）：真实打开搜索页等安全 JS 重跑可换令牌。用 `--warm-stoken [秒]`（默认 75）；登录探测命中 37 会自动热刷新+重探一次；热刷新后**紧接着**跑抓取，中间不要插 `--check`/重复探测；仍 37 改 `--list-mode passive` 或等冷却。
 
-## Agent 原生交互（用户只在对话里问，不敲命令）
+## Agent 原生交互（工具给事实，你给判断）
 
-用户**始终在 Agent 会话里使用本工具**：想了解什么直接在对话里问（"今天怎么样""这条为什么没上榜""跟昨天比呢""有哪些模板"），由 agent 调内部只读 API 回答、再用 `human` 一屏 markdown 转述。**不要把 CLI 参数当成交付给用户的用法说明，也不要做 xlsx/固定报告文件/Web 界面**——人类可读输出只是给 agent 的参考。
+用户**始终在 Agent 会话里使用本工具**。`ask` 只是机械层的数据接口——**`human` 是数据预览，不是答案，禁止原样转述**。回答由你组织：
 
-调用面（agent 内部）：
+- 先结论后证据；按问题决定形式与长度，不要固定模板；
+- 所有数字来自 `data`/DB/交付物，不估不编；拿不到就说；
+- 主动指出异常/变化/重复/值得追问的点，并给下一步；
+- 口径/模板有歧义先问一句，默认沿用当前 scope；
+- 被质疑时重查 `why`/`diff`/DB/批次再回答，不复读上次结论；说人话，不暴露 CLI/实现。
 
 ```python
 from scripts import ask
 payload = ask.run_ask("status", {}, result_dir=None)   # status/today/why/diff/templates/batches
-print(ask.format_answer(payload, as_json=False))       # human 一屏；True → 纯 JSON
 ```
 
-- 统一信封 `{"ok","command","data","human","errors"}`：`ok=False` 表示这条问题无法回答（未知命令/查无此岗/核心来源缺失），缺失文件/旧 DB schema 只进 `errors` 降级，**任何情况都不抛异常**；
-- `ask status` 给单屏状态（运行/预算/锁/冷却/CDP + 今日 + 最新交付物较上版 + 异常 + 待拍板）；`ask today` 今日简报；`ask why <job_id>` 解释保留/删除分支（交付物留痕 / dropped_junk / 人工剔除名单 / 规则版本 / DB 来源批次，拿不到就列出查过的来源，**不编造**）；`ask diff [scope_key]` 逐条 +新增/−消失/保持及原因；`ask templates` 模板与上次运行；`ask batches` 批次健康度（`batch_health.jsonl`，可能尚未生成）；
-- 只读：不抓取、不发 BOSS 请求、不写产物/清单/DB；默认仅探测本机 CDP 端口，登录态仍由 `--check` 负责；
-- `--ask` 只是 CLI 编排层对 agent 的内部转发入口，不是给用户看的新命令面。
+- 信封 `{"ok","command","data","human","errors"}`：`ok=False` 表示答不了；缺文件/旧库只降级，不抛异常；
+- 只读：不抓取、不发 BOSS 请求、不写产物/DB；`--ask` 只是内部转发，不是用户命令面。
 
 ## 执行与汇报约定
 
