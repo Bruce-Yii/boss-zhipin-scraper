@@ -54,6 +54,23 @@ target-version = "py312"
 select = ["E", "F", "I", "B", "UP"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+# 主文件末尾的 re-export 兼容层用 globals() 动态注入子模块符号，静态分析看不到。
+# 运行时 97 个 F821 名字已逐个 hasattr 验证存在；删掉这层会破坏
+# scripts.boss_cdp_raw.X 的历史导入面。
+"scripts/boss_cdp_raw.py" = ["F821"]
+# 拆分后的子模块在默认参数里调用 _core() 读取主文件常量，这是测试 patch
+# 常量后仍能生效的既有约定（见 docs/handoff.md「关键约束」）。
+"scripts/analysis.py" = ["B008"]
+"scripts/cdp_session.py" = ["B008"]
+"scripts/chrome_setup.py" = ["B008"]
+"scripts/merge_io.py" = ["B008"]
+"scripts/results.py" = ["B008"]
+"scripts/risk.py" = ["B008"]
+"scripts/run_lock.py" = ["B008"]
+"scripts/status.py" = ["B008"]
+"scripts/tab_cleanup.py" = ["B008"]
+
 [tool.coverage.run]
 source = ["scripts"]
 

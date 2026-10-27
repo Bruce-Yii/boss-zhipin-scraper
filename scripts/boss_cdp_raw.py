@@ -22,34 +22,27 @@ BOSS直聘职位抓取 + 分析 — 纯 CDP raw protocol
 __version__ = "2.23.0"
 
 import argparse
-import base64
-import csv
-import glob
 import inspect
 import json
 import logging
-log = logging.getLogger("boss_cdp")
-import math
 import ntpath
 import os
 import platform
 import queue
 import random
 import re
-import shutil
-import signal
+import shutil  # noqa: F401 - 子模块经 _core().shutil 使用，且测试 patch module.shutil
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import urlencode
+
+log = logging.getLogger("boss_cdp")
 
 websocket = None
 requests = None
@@ -2736,11 +2729,12 @@ def scrape_details(list_data, max_details=None, output_path=None,
         title = job.get("title", "")
         company = job.get("boss_name", "")
         job_id = job.get("job_id", "")
-        def _note_failure(_reason, _message=""):
+        def _note_failure(_reason, _message="", _job_id=job_id, _title=title,
+                          _company=company):
             serial_failures.append({
-                "job_id": str(job_id or ""),
-                "title": str(title or ""),
-                "company": str(company or ""),
+                "job_id": str(_job_id or ""),
+                "title": str(_title or ""),
+                "company": str(_company or ""),
                 "reason": str(_reason or "unknown"),
                 "message": str(_message or "")[:500],
             })
@@ -4637,7 +4631,8 @@ def _run_cli_impl(p, args):
 try:
     from . import boss_codes as _boss_codes_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import boss_codes as _boss_codes_mod
 for _n in ['BOSS_CODE_TABLE','RETRYABLE_CATEGORIES','RATE_LIMIT_BACKOFF_BASE_SECONDS','RATE_LIMIT_BACKOFF_MAX_SECONDS','RATE_LIMIT_MAX_RETRIES','rate_limit_backoff','classify_boss_code','DEFAULT_LOGIN_TIMEOUT']:
@@ -4646,7 +4641,8 @@ for _n in ['BOSS_CODE_TABLE','RETRYABLE_CATEGORIES','RATE_LIMIT_BACKOFF_BASE_SEC
 try:
     from . import sidecar as _sidecar_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import sidecar as _sidecar_mod
 SECURITY_SIDECAR_DIR = _sidecar_mod.SECURITY_SIDECAR_DIR
@@ -4657,7 +4653,8 @@ for _n in ['security_sidecar_path','write_security_sidecar','load_security_sidec
 try:
     from . import city as _city_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import city as _city_mod
 CITY_DATA_FILENAME = _city_mod.CITY_DATA_FILENAME
@@ -4667,7 +4664,8 @@ for _n in ['CityAPIResponseError','CityResolutionError','_city_data_path','load_
 try:
     from . import login_probe as _login_probe_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import login_probe as _login_probe_mod
 for _n in ['LoginProbeStatus','LoginProbeResult','classify_login_probe_response','is_logged_in_search_response','build_login_probe_url','probe_login_state','describe_login_probe_result','check_login_state','_probe_login_state_uncached']:
@@ -4676,7 +4674,8 @@ for _n in ['LoginProbeStatus','LoginProbeResult','classify_login_probe_response'
 try:
     from . import risk as _risk_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import risk as _risk_mod
 for _n in ['probe_risk_page','_restore_minutes_from_now','_classify_blocked','_risk_cooldown_seconds','classify_risk_page','wait_for_risk_clear']:
@@ -4685,17 +4684,19 @@ for _n in ['probe_risk_page','_restore_minutes_from_now','_classify_blocked','_r
 try:
     from . import activity as _activity_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import activity as _activity_mod
 for _n in ['map_list_boss_active_status','resolve_boss_active_status','is_inactive_activity','inactive_job_ids','filter_inactive_in_export']:
     globals()[_n] = getattr(_activity_mod, _n)
-globals()['_ZOMBIE_ACTIVITY_RE'] = getattr(_activity_mod, '_ZOMBIE_ACTIVITY_RE')
+globals()['_ZOMBIE_ACTIVITY_RE'] = _activity_mod._ZOMBIE_ACTIVITY_RE
 
 try:
     from . import chrome_setup as _chrome_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import chrome_setup as _chrome_mod
 for _n in ['prepare_cdp_profile','is_cdp_ready','is_chrome_command','normalize_profile_path','extract_user_data_dir','iter_chrome_process_commands','chrome_pids_for_user_data_dir','chrome_user_data_dirs_for_cdp_port','cdp_port_uses_profile','terminate_process','stop_cdp_chrome','wait_for_cdp','launch_chrome','run_setup_chrome','run_stop_chrome']:
@@ -4704,7 +4705,8 @@ for _n in ['prepare_cdp_profile','is_cdp_ready','is_chrome_command','normalize_p
 try:
     from . import status as _status_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import status as _status_mod
 for _n in ['run_status','run_check','probe_cdp_port','detect_cdp_port']:
@@ -4713,7 +4715,8 @@ for _n in ['run_status','run_check','probe_cdp_port','detect_cdp_port']:
 try:
     from . import verify as _verify_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import verify as _verify_mod
 for _n in ['verify_results','run_verify']:
@@ -4722,15 +4725,17 @@ for _n in ['verify_results','run_verify']:
 try:
     from . import network_capture as _net_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import network_capture as _net_mod
-globals()['NetworkJoblistCapture'] = getattr(_net_mod, 'NetworkJoblistCapture')
+globals()['NetworkJoblistCapture'] = _net_mod.NetworkJoblistCapture
 
 try:
     from . import list_helpers as _lh_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import list_helpers as _lh_mod
 for _n in ['split_keywords','merge_list_data','page_fingerprint']:
@@ -4739,27 +4744,30 @@ for _n in ['split_keywords','merge_list_data','page_fingerprint']:
 try:
     from . import progress as _progress_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import progress as _progress_mod
 for _n in ['progress_step','resume_hint','_format_elapsed','run_summary','progress_line','_dom_stage','_dom_stage_reset','print_dom_stage_timings']:
     globals()[_n] = getattr(_progress_mod, _n)
-globals()['_DOM_STAGE_LOCK'] = getattr(_progress_mod, '_DOM_STAGE_LOCK')
-globals()['_DOM_STAGE_SECONDS'] = getattr(_progress_mod, '_DOM_STAGE_SECONDS')
+globals()['_DOM_STAGE_LOCK'] = _progress_mod._DOM_STAGE_LOCK
+globals()['_DOM_STAGE_SECONDS'] = _progress_mod._DOM_STAGE_SECONDS
 
 try:
     from . import results as _results_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import results as _results_mod
-for _n in ['_classify_result_file','list_results','archive_results','run_list_results','run_archive','latest_results_file','_latest_details_path','default_output_path']:
+for _n in ['_is_detail_sidecar','_classify_result_file','list_results','archive_results','run_list_results','run_archive','latest_results_file','_latest_details_path','default_output_path']:
     globals()[_n] = getattr(_results_mod, _n)
 
 try:
     from . import filters as _filters_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import filters as _filters_mod
 for _n in ['prefilter_detail_queue','apply_run_filters','_filter_options']:
@@ -4768,7 +4776,8 @@ for _n in ['prefilter_detail_queue','apply_run_filters','_filter_options']:
 try:
     from . import cdp_session as _cdp_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import cdp_session as _cdp_mod
 BACKGROUND_VISIBILITY_SCRIPT = _cdp_mod.BACKGROUND_VISIBILITY_SCRIPT
@@ -4780,7 +4789,8 @@ for _n in ['TargetCrashedError','CDPSession','page_background_default','record_o
 try:
     from . import run_lock as _run_lock_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import run_lock as _run_lock_mod
 for _n in ['_pid_is_running','_read_scrape_lock','_write_scrape_lock','_scrape_lock_guard_path','_with_scrape_lock_guard','_cdp_cooldown_path','_restart_scraper_chrome','_batch_cooldown_if_needed','_atomic_replace_with_retry','mark_cdp_cooldown','check_cdp_recovery','check_cdp_cooldown','acquire_scrape_lock','set_scrape_lock_risk','is_scrape_lock_risk','release_scrape_lock','clear_scrape_lock_risk']:
@@ -4789,7 +4799,8 @@ for _n in ['_pid_is_running','_read_scrape_lock','_write_scrape_lock','_scrape_l
 try:
     from . import detail_parse as _detail_parse_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import detail_parse as _detail_parse_mod
 DETAIL_LOGIN_MARKER = _detail_parse_mod.DETAIL_LOGIN_MARKER
@@ -4800,17 +4811,18 @@ MIN_DETAIL_TEXT_LENGTH = _detail_parse_mod.MIN_DETAIL_TEXT_LENGTH
 DETAIL_API_PATH = _detail_parse_mod.DETAIL_API_PATH
 for _n in ['map_api_job','map_api_jobs','DetailExtractionError','DetailLoginRequiredError','DetailRiskError','_normalize_detail_whitespace','_semantic_junk_hit','_is_jd_page_module_line','_is_jd_noise_line','strip_jd_noise','_detail_encrypt_job_id','build_detail_api_url','_parse_detail_api_value','_looks_like_navigation_page','_is_boss_activity_line','_recruiter_footer_info','_is_recruiter_activity_line','_is_recruiter_company_line','_blank_line_before','_recruiter_card_tail','_recruiter_footer_start','_cut_leading_description_marker','_is_skill_tag_line','_strip_leading_skill_tags','extract_detail_fields','extract_job_description','build_detail_record']:
     globals()[_n] = getattr(_detail_parse_mod, _n)
-globals()['_JD_NOISE_TOKENS'] = getattr(_detail_parse_mod, '_JD_NOISE_TOKENS')
-globals()['_JD_PAGE_MODULE_MAX_CHARS'] = getattr(_detail_parse_mod, '_JD_PAGE_MODULE_MAX_CHARS')
-globals()['_HR_ACTIVE_RE'] = getattr(_detail_parse_mod, '_HR_ACTIVE_RE')
-globals()['_RECRUITER_NAME_RE'] = getattr(_detail_parse_mod, '_RECRUITER_NAME_RE')
-globals()['_RECRUITER_POSITION_RE'] = getattr(_detail_parse_mod, '_RECRUITER_POSITION_RE')
-globals()['_RECRUITER_ACTIVITY_WORDS'] = getattr(_detail_parse_mod, '_RECRUITER_ACTIVITY_WORDS')
+globals()['_JD_NOISE_TOKENS'] = _detail_parse_mod._JD_NOISE_TOKENS
+globals()['_JD_PAGE_MODULE_MAX_CHARS'] = _detail_parse_mod._JD_PAGE_MODULE_MAX_CHARS
+globals()['_HR_ACTIVE_RE'] = _detail_parse_mod._HR_ACTIVE_RE
+globals()['_RECRUITER_NAME_RE'] = _detail_parse_mod._RECRUITER_NAME_RE
+globals()['_RECRUITER_POSITION_RE'] = _detail_parse_mod._RECRUITER_POSITION_RE
+globals()['_RECRUITER_ACTIVITY_WORDS'] = _detail_parse_mod._RECRUITER_ACTIVITY_WORDS
 
 try:
     from . import merge_io as _merge_io_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import merge_io as _merge_io_mod
 CSV_COLUMNS = _merge_io_mod.CSV_COLUMNS
@@ -4818,13 +4830,14 @@ DETAIL_CSV_COLUMNS = _merge_io_mod.DETAIL_CSV_COLUMNS
 RAW_DIR_NAME = _merge_io_mod.RAW_DIR_NAME
 for _n in ['save_raw_responses','save_raw_details','run_fidelity_check','run_detail_fidelity_check','write_csv','write_detail_csv','find_latest_detail_file','detail_candidate_paths','load_existing_details']:
     globals()[_n] = getattr(_merge_io_mod, _n)
-globals()['_DETAIL_CSV_LEADING_COLUMNS'] = getattr(_merge_io_mod, '_DETAIL_CSV_LEADING_COLUMNS')
-globals()['_DETAIL_CSV_VALUE_SOURCE'] = getattr(_merge_io_mod, '_DETAIL_CSV_VALUE_SOURCE')
+globals()['_DETAIL_CSV_LEADING_COLUMNS'] = _merge_io_mod._DETAIL_CSV_LEADING_COLUMNS
+globals()['_DETAIL_CSV_VALUE_SOURCE'] = _merge_io_mod._DETAIL_CSV_VALUE_SOURCE
 
 try:
     from . import alert_notify as _alert_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import alert_notify as _alert_mod
 for _n in ['load_alert_config','send_alert']:
@@ -4833,7 +4846,8 @@ for _n in ['load_alert_config','send_alert']:
 try:
     from . import pending_ids as _pending_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import pending_ids as _pending_mod
 for _n in ['load_existing_detail_ids','pending_path_for','load_pending_ids','save_pending_ids']:
@@ -4842,7 +4856,8 @@ for _n in ['load_existing_detail_ids','pending_path_for','load_pending_ids','sav
 try:
     from . import detail_support as _detail_support_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import detail_support as _detail_support_mod
 for _n in ['_wait_for_detail_ready','_dismiss_dialogs','debug_screenshot_dir','capture_debug_screenshot']:
@@ -4851,7 +4866,8 @@ for _n in ['_wait_for_detail_ready','_dismiss_dialogs','debug_screenshot_dir','c
 try:
     from . import tab_cleanup as _tab_cleanup_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import tab_cleanup as _tab_cleanup_mod
 for _n in ['close_orphan_dock_tabs','close_orphan_detail_tabs','eval_detail_with_retry','_detail_path_for_list','_list_has_detail_risk']:
@@ -4860,17 +4876,19 @@ for _n in ['close_orphan_dock_tabs','close_orphan_detail_tabs','eval_detail_with
 try:
     from . import channel_stats as _channel_stats_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import channel_stats as _channel_stats_mod
 for _n in ['_note_detail_risk_blocked','_record_detail_channel','_classify_detail_channels','_detail_channel_metadata','_check_supply_vs_budget','_print_empty_details_notice']:
     globals()[_n] = getattr(_channel_stats_mod, _n)
-globals()['_DETAIL_CHANNELS'] = getattr(_channel_stats_mod, '_DETAIL_CHANNELS')
+globals()['_DETAIL_CHANNELS'] = _channel_stats_mod._DETAIL_CHANNELS
 
 try:
     from . import analysis as _analysis_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import analysis as _analysis_mod
 for _n in ['extract_tech_terms_from_jds','analyze','has_usable_smoke_jobs','run_smoke_test','_git_short_sha']:
@@ -4879,7 +4897,8 @@ for _n in ['extract_tech_terms_from_jds','analyze','has_usable_smoke_jobs','run_
 try:
     from . import list_fetch as _list_fetch_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import list_fetch as _list_fetch_mod
 for _n in ['_fetch_pages_parallel','_fetch_pages_passive']:
@@ -4888,7 +4907,8 @@ for _n in ['_fetch_pages_parallel','_fetch_pages_passive']:
 try:
     from . import batch_config as _batch_config_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import batch_config as _batch_config_mod
 for _n in ['load_batch_config']:
@@ -4899,7 +4919,8 @@ for _n in ['load_batch_config']:
 try:
     from . import run_report as _run_report_mod
 except Exception:
-    import os as _os, sys as _sys
+    import os as _os
+    import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import run_report as _run_report_mod
 for _n in [

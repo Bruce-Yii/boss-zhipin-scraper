@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 """登录态探测（从 boss_cdp_raw.py 增量拆分）。"""
 
 import json
-import time
 import logging
 from dataclasses import dataclass
 from enum import Enum

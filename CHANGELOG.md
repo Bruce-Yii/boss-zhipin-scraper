@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 详情 sidecar 不再冒充详情文件：`--verify` / `--status` / `--list-results` 忽略 `.failures.json`（此前 `--verify` 会把失败明细当最新详情，报 0% 覆盖率）；`--archive` 让 failures 跟着详情本体走，不在根目录留孤儿。补 2 条回归测试。拆分重构引入的 426 条 ruff 报错一并归零（F821 动态 re-export 误报，用 per-file ignore 说明；B008 保留 `_core()` 默认值约定）；全量 837 tests OK。
 - 继续拆分 boss_cdp_raw.py：新增 scripts/city.py（城市码表/resolve_city/fetch_boss_json）、scripts/login_probe.py（登录态探测）、scripts/risk.py（风控页面探测与分类）、scripts/activity.py（岗位活跃度判定与导出过滤）、scripts/chrome_setup.py（Chrome CDP 环境准备与进程管理），函数真正移动、re-export 保持 scripts.boss_cdp_raw.X 导入面；tests 全绿 + 隔离守卫通过。
 - AI 解决方案工程师类豁免技术门（issue #181）：用户口径「解决方案工程师只要有 ai 关键词就可以」——标题含「解决方案」且有 AI 证据的不再按技术岗删；无 AI 的解决方案工程师仍删。
 - 岗名词表补「解决方案」（issue #179）：AI解决方案实习生是用户点名的目标岗位，此前无 JD 时被当「标题无岗名」误删；无 AI 证据的解决方案岗仍按跨行业噪声删，本质标准不放宽。

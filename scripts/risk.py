@@ -1,11 +1,8 @@
-# -*- coding: utf-8 -*-
 """风控页面探测与分类（从 boss_cdp_raw.py 增量拆分）。"""
 
-import json
-import re
-import time
-import random
 import logging
+import random
+import re
 
 log = logging.getLogger("boss_cdp")
 

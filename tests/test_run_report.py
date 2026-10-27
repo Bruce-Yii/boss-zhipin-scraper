@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """run_report 战报测试：纯本地产物，无 Chrome/网络。"""
 
 import importlib.util

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """待重试详情清单（pending）与跨运行去重（从 boss_cdp_raw.py 增量拆分）。
 
 pending 文件：`{详情输出}.pending.json`，[{job_id, attempts}]；

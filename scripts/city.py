@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """城市码表解析（从 boss_cdp_raw.py 增量拆分）。"""
 
-import os
 import json
-import re
 import logging
+import os
+import re
 
 log = logging.getLogger("boss_cdp")
 

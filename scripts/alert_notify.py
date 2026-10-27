@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """告警推送（从 boss_cdp_raw.py 增量拆分）。
 
 规格侧 Worker /webhook/alert，Bearer token；配置放项目根 .env

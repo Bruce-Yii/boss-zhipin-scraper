@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """列表多页抓取 workers（从 boss_cdp_raw.py 增量拆分）。
 
 含：并发 XHR 抓取（_fetch_pages_parallel）、被动 Network 旁听抓取

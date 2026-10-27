@@ -1,8 +1,5 @@
-# -*- coding: utf-8 -*-
 """结果校验命令（从 boss_cdp_raw.py 增量拆分）。"""
 
-import os
-import json
 import logging
 
 log = logging.getLogger("boss_cdp")

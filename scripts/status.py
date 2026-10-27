@@ -1,12 +1,7 @@
-# -*- coding: utf-8 -*-
 """状态与诊断命令（从 boss_cdp_raw.py 增量拆分）。"""
 
-import os
-import sys
-import json
-import time
-import logging
 import glob
+import logging
 
 log = logging.getLogger("boss_cdp")
 
@@ -125,7 +120,7 @@ def run_status(cdp_port=_core().DEFAULT_CDP_PORT, result_dir=_core().DEFAULT_RES
     jobs = sorted(glob.glob(_core().os.path.join(result_dir, "boss_jobs_*.json")))
     details = sorted(
         path for path in glob.glob(_core().os.path.join(result_dir, "boss_details_*.json"))
-        if not path.endswith(".pending.json")
+        if not _core()._is_detail_sidecar(_core().os.path.basename(path))
     )
     pending = sorted(glob.glob(_core().os.path.join(result_dir, "*.pending.json")))
     archive = glob.glob(_core().os.path.join(result_dir, "archive", "*.json"))

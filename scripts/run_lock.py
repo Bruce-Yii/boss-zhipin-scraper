@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """run 级锁与熔断冷却（从 boss_cdp_raw.py 增量拆分）。
 
 含：pid 存活检查、锁文件读写（原子写 + guard 互斥防 RMW 竞态）、

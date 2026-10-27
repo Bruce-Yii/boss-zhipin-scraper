@@ -670,6 +670,31 @@ class ChromeSetupTests(unittest.TestCase):
             self.assertIsNone(module._latest_details_path(str(list_path)),
                               "pending 文件不应被当作详情文件")
 
+    def test_verify_latest_details_ignores_failures_sidecar(self):
+        """failures sidecar 比详情新时，也不能被 --verify 当成详情本体。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            os.makedirs(paths["cdp_profile"], exist_ok=True)
+            list_path = paths["cdp_profile"] / "boss_jobs_x.json"
+            detail_path = paths["cdp_profile"] / "boss_details_x.json"
+            failures_path = paths["cdp_profile"] / "boss_details_x.json.failures.json"
+            with open(list_path, "w", encoding="utf-8") as f:
+                json.dump({"jobs": [{"job_id": "a", "title": "A"}]}, f)
+            with open(detail_path, "w", encoding="utf-8") as f:
+                json.dump([{"job_id": "a", "title": "A",
+                            "jd": "x" * module.MIN_DETAIL_TEXT_LENGTH}], f)
+            with open(failures_path, "w", encoding="utf-8") as f:
+                json.dump([{"job_id": "b", "reason": "invalid_detail"}], f)
+            os.utime(detail_path, (1000, 1000))
+            os.utime(failures_path, (2000, 2000))
+            self.assertEqual(module._latest_details_path(str(list_path)),
+                             str(detail_path))
+            self.assertEqual(
+                module._classify_result_file(failures_path.name), "other")
+            report = module.verify_results(str(list_path))
+            self.assertTrue(report["ok"], f"应忽略 failures sidecar: {report['issues']}")
+            self.assertEqual(report["coverage"], 1.0)
+
     # ----- 列表抓取（max_jobs 条数上限）-----
 
     def test_scrape_list_marks_exhausted_on_short_page(self):
@@ -959,6 +984,26 @@ class ChromeSetupTests(unittest.TestCase):
                              "其余 jobs 移入 archive")
             self.assertTrue((root / "boss_details_0.json.pending.json").exists(),
                             "pending 是活动文件，不归档")
+
+    def test_archive_moves_failures_sidecar_with_detail(self):
+        """failures sidecar 跟着详情本体归档，不留在根目录变成孤儿。"""
+        module = load_module()
+        with tempfile_profile() as paths:
+            self._make_result_files(paths, jobs=0, details=2, pending=0, csv=0)
+            root = paths["cdp_profile"]
+            old_detail = root / "boss_details_0.json"
+            new_detail = root / "boss_details_1.json"
+            sidecar = root / "boss_details_0.json.failures.json"
+            sidecar.write_text(json.dumps([{"job_id": "a", "reason": "x"}]),
+                               encoding="utf-8")
+            os.utime(old_detail, (1000, 1000))
+            os.utime(sidecar, (1000, 1000))
+            os.utime(new_detail, (2000, 2000))
+            module.archive_results(str(root), keep_latest=1)
+            archive = root / "archive"
+            self.assertFalse(sidecar.exists(), "归档后根目录不应留下 failures 孤儿")
+            self.assertTrue((archive / "boss_details_0.json").exists())
+            self.assertTrue((archive / "boss_details_0.json.failures.json").exists())
 
     def test_archive_results_noop_when_nothing_to_archive(self):
         module = load_module()

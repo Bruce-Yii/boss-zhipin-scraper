@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """CDP 会话层（从 boss_cdp_raw.py 增量拆分）。
 
 含：TargetCrashedError、CDPSession（WebSocket 连 CDP、心跳探活、事件缓冲）、

@@ -1,9 +1,8 @@
-# -*- coding: utf-8 -*-
 """进度/耗时辅助函数（从 boss_cdp_raw.py 增量拆分）。"""
 
+import logging
 import math
 import threading
-import logging
 
 log = logging.getLogger("boss_cdp")
 

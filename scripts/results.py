@@ -1,9 +1,5 @@
-# -*- coding: utf-8 -*-
 """结果文件管理命令（从 boss_cdp_raw.py 增量拆分）。"""
 
-import os
-import glob
-import shutil
 import logging
 
 log = logging.getLogger("boss_cdp")
@@ -23,10 +19,19 @@ def _core():
             return _sys.modules["boss_cdp_raw"]
         import boss_cdp_raw as _m
         return _m
+
+
+def _is_detail_sidecar(name):
+    """详情文件的 sidecar（pending/failures）不是详情本体。"""
+    return name.endswith((".pending.json", ".failures.json"))
+
+
 def _classify_result_file(name):
     """按文件名分类结果目录条目：jobs / details / pending / other。"""
     if name.endswith(".pending.json"):
         return "pending"
+    if name.endswith(".failures.json"):
+        return "other"
     if name.startswith("boss_jobs_"):
         return "jobs"
     if name.startswith("boss_details_"):
@@ -88,6 +93,11 @@ def archive_results(result_dir=_core().DEFAULT_RESULT_DIR, keep_latest=1, archiv
             _core().os.makedirs(archive_dir, exist_ok=True)
             dst = _core().os.path.join(archive_dir, _core().os.path.basename(entry["path"]))
             _core().shutil.move(entry["path"], dst)
+            # failures sidecar 跟着详情本体走，避免归档后根目录留下孤儿。
+            sidecar = entry["path"] + ".failures.json"
+            if _core().os.path.exists(sidecar):
+                _core().shutil.move(
+                    sidecar, _core().os.path.join(archive_dir, _core().os.path.basename(sidecar)))
             moved += 1
             print(f"  📦 归档 {_core().os.path.basename(entry['path'])}")
     return moved
@@ -126,7 +136,8 @@ def latest_results_file(kind):
     candidates = []
     try:
         for name in _core().os.listdir(_core().DEFAULT_RESULT_DIR):
-            if name.startswith(prefix) and name.endswith(".json"):
+            if (name.startswith(prefix) and name.endswith(".json")
+                    and not (kind == "details" and _is_detail_sidecar(name))):
                 path = _core().os.path.join(_core().DEFAULT_RESULT_DIR, name)
                 candidates.append((_core().os.path.getmtime(path), path))
     except OSError:
@@ -146,8 +157,8 @@ def _latest_details_path(list_path):
     candidates = []
     try:
         for name in _core().os.listdir(base):
-            if name.startswith("boss_details_") and name.endswith(".json") \
-                    and not name.endswith(".pending.json"):
+            if (name.startswith("boss_details_") and name.endswith(".json")
+                    and not _is_detail_sidecar(name)):
                 path = _core().os.path.join(base, name)
                 candidates.append((_core().os.path.getmtime(path), path))
 

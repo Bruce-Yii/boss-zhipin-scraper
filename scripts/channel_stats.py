@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """详情通道统计与供给×额度协调（从 boss_cdp_raw.py 增量拆分）。
 
 含：验证码全停记账（EXPORT_FAIL + 列表 warnings + 告警）、

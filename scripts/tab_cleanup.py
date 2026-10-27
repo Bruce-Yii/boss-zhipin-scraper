@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """残留 tab 清扫与详情提取重试（从 boss_cdp_raw.py 增量拆分）。
 
 含：停靠搜索页 tab 清扫、详情页 tab 清扫、详情 JS 提取重试、

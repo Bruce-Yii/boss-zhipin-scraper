@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """--batch 任务配置解析（从 boss_cdp_raw.py 增量拆分）。
 
 纯函数：JSON 数组 → (tasks, errors)，非法任务跳过不中断。

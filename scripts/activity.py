@@ -1,9 +1,8 @@
-# -*- coding: utf-8 -*-
 """岗位活跃度判定与导出过滤（从 boss_cdp_raw.py 增量拆分）。"""
 
+import logging
 import os
 import re
-import logging
 
 log = logging.getLogger("boss_cdp")
 

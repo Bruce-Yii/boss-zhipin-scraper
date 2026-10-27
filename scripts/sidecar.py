@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 """Security sidecar (restricted securityId storage) extracted from boss_cdp_raw.py."""
 
-import os
 import json
-import time
 import logging
+import os
+import time
 
 log = logging.getLogger("boss_cdp")
 

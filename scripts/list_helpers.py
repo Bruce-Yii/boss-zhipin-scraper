@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """列表阶段纯辅助函数（从 boss_cdp_raw.py 增量拆分）。"""
 
 import logging

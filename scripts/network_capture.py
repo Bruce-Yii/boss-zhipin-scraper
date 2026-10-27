@@ -1,9 +1,6 @@
-# -*- coding: utf-8 -*-
 """被动捕获页面自身发出的 joblist API 响应（从 boss_cdp_raw.py 增量拆分）。"""
 
 import base64
-import json
-import time
 import logging
 
 log = logging.getLogger("boss_cdp")

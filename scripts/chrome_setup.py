@@ -1,16 +1,15 @@
-# -*- coding: utf-8 -*-
 """Chrome CDP 环境准备与进程管理（从 boss_cdp_raw.py 增量拆分）。"""
 
-import os
 import json
-import time
-import signal
-import shutil
-import platform
-import ntpath
-import subprocess
 import logging
+import ntpath
+import os
+import platform
 import re
+import shutil
+import signal
+import subprocess
+import time
 
 log = logging.getLogger("boss_cdp")
 

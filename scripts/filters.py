@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """列表/详情过滤入口（从 boss_cdp_raw.py 增量拆分）。"""
 
 import logging

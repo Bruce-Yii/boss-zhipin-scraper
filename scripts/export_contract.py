@@ -27,7 +27,7 @@ import logging
 import os
 import re
 import time
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse, urlunsplit
 
 log = logging.getLogger("boss_cdp")  # 与主文件同名 logger，日志路由一致
 

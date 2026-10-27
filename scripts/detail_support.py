@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """详情页就绪等待与失败截图（从 boss_cdp_raw.py 增量拆分）。
 
 含：JD 区渲染就绪等待（页面内 awaitPromise 优先，宿主轮询兜底）、

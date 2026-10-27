@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """详情解析纯逻辑（从 boss_cdp_raw.py 增量拆分）。
 
 含：列表条目映射（map_api_job/map_api_jobs）、详情异常体系、
