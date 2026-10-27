@@ -489,6 +489,18 @@ def build(args):
     target = args.target
     if not os.path.isabs(target):
         target = os.path.join(args.result_dir, target)
+    # 交付物重建必须是「以本次候选为全量」的语义：否则 target 已存在时
+    # _merge_jd_into_export 会优先读旧交付物，只更新旧岗位、**新岗位永远进不来**
+    # （2026-10-28 实测：每日重建计数一直停在 242，实际规则保留了 245）。
+    prefer_base = bool(args.from_db or args.from_artifacts)
+    if prefer_base and os.path.exists(target):
+        old = _load_payload(target)
+        if isinstance(old, dict):
+            for key in ("dropped_junk", "dropped_no_jd"):
+                if key in old and key not in base:
+                    base[key] = old[key]
+            if "target_roots" not in base and old.get("target_roots"):
+                base["target_roots"] = old["target_roots"]
     extra = {}
     if args.scope:
         extra["scope"] = args.scope
@@ -502,7 +514,8 @@ def build(args):
                                        artifacts_stats, len(excluded))
     res = ec._merge_jd_into_export(target, list(details.values()), base=base,
                                    keep_junk=args.keep_junk,
-                                   extra_meta=extra or None)
+                                   extra_meta=extra or None,
+                                   prefer_base=prefer_base)
     if res is None:
         print("合并失败：输入不可处理")
         return 0, 1

@@ -339,6 +339,31 @@ class BuildFromArtifactsTests(unittest.TestCase):
         self.assertEqual(final["artifact"]["inputs"]["kind"], "artifacts")
         self.assertTrue(os.path.exists(self.target.rsplit(".", 1)[0] + ".csv"))
 
+    def test_inplace_rebuild_includes_new_candidates(self):
+        """原地重建必须以本次候选为准：旧 target 存在时新岗位也要进来（2026-10-28 修）。"""
+        args = ["--result-dir", self.result_dir, "--from-artifacts",
+                "--city", "杭州", "--recruit-type", "intern",
+                "--exclude-job-ids-file", self.exclude_path,
+                "--target", self.target]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.module.main(args), 0)
+        with open(self.target, encoding="utf-8") as handle:
+            self.assertEqual([j["job_id"] for j in json.load(handle)["jobs"]],
+                             ["a"])
+        # 新增一个岗位 + 它的详情，原地重建同一 target
+        write_json(self.result_dir, "boss_jobs_20261028_120000_2.json", {
+            "keyword": "AI产品实习", "city": "杭州", "format_version": 2,
+            "scraped_at": "2026-10-28T12:00:00+08:00",
+            "jobs": [_job("d", title="AIGC运营实习生")],
+        })
+        write_json(self.result_dir, "boss_details_20261028_120000_2.json",
+                   [_detail("d")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.module.main(args), 0)
+        with open(self.target, encoding="utf-8") as handle:
+            ids = sorted(j["job_id"] for j in json.load(handle)["jobs"])
+        self.assertEqual(ids, ["a", "d"])
+
     def test_exclude_file_formats(self):
         for payload in (["x", "y"], {"job_ids": ["x"]}, "x,y"):
             path = os.path.join(self.result_dir, "e.json")
