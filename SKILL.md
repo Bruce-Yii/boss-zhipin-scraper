@@ -146,6 +146,20 @@ python3 "$SUMMARY_PATH" \
   --top 15
 ```
 
+### 交付物重建（不重新抓取）
+
+多次抓取的结果会自动累积进 SQLite 原材料库（`--db` 默认启用、按 job_id 去重）。要出交付物时不必再翻文件清单，直接从库里按口径重建：
+
+```bash
+# 从默认库重建：城市 + 招聘类型（可逗号组合）+ 可选 --since 控制"最近还在架上"
+python3 scripts/build_deliverable.py \
+  --from-db --city 杭州 --recruit-type intern,campus \
+  --target boss_jobs_杭州实习校招.json \
+  --scope "库口径：杭州 实习+校招 AI 非技术岗"
+```
+
+`--from-db` 与 `--lists/--details` 二选一；两种模式都走同一条生产合并路径（口径一剔无 JD、删库、派生字段、验收、CSV）。库只读打开、不改库；产物 `meta.source` 记录库路径与口径。历史产物复现仍用文件模式（`--lists/--details/--old`）。
+
 ## 开发与测试隔离
 
 单元测试必须完全 mock，不连接真实 Chrome、不发 BOSS 请求。提交前运行目标测试和隔离守卫；守卫会在临时 HOME 下执行完整 discovery，并检查 profile、run lock、cooldown、audit、runner trace 未被改写：

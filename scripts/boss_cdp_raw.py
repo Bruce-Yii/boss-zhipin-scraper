@@ -4471,8 +4471,11 @@ def _run_cli_impl(p, args):
 
     # P4c-2：列表增量入库（唯一键 upsert，与 JSON/CSV 并存）
     if db_conn is not None:
+        # keyword 一并入库（schema v2 列此前一直空置）：交付物从库重建时
+        # 才能按关键词圈口径（issue #184）。
         ins, upd = upsert_db_jobs(db_conn, list_data.get("jobs", []),
                                   run_id=db_run_id,
+                                  keyword=list_data.get("keyword") or args.keyword,
                                   city=list_data.get("city") or args.city)
         print(f"🗄️  列表入库: 新增 {ins}，更新 {upd}")
 

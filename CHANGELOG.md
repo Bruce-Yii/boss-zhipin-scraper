@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 交付物可从 SQLite 原材料库一键重建（issue #184）：`build_deliverable.py` 新增 `--from-db [PATH]`，按 `--city`/`--keyword`/`--since`/`--recruit-type` 口径直接取库内列表与详情（多轮抓取已按 job_id 去重），走同一条生产合并路径出 JSON/CSV/验收，meta 记 `source`（库路径/库内总量/选中量/口径）可溯源；库只读打开不改库。`--recruit-type` 支持逗号组合（如 `intern,campus`）。列表入库补写 `keyword` 列（schema v2 该列此前一直空置；旧行 NULL 时按该行所属 run 的关键词标签兜底匹配）。新增 `boss-deliverable` 入口命令。实测 `--city 杭州 --recruit-type intern,campus` 与 2026-10-27 手工四库合并的 263 条交付物逐 job_id 完全一致（263/263，零新请求）。
 - 详情 sidecar 不再冒充详情文件：`--verify` / `--status` / `--list-results` 忽略 `.failures.json`（此前 `--verify` 会把失败明细当最新详情，报 0% 覆盖率）；`--archive` 让 failures 跟着详情本体走，不在根目录留孤儿。补 2 条回归测试。拆分重构引入的 426 条 ruff 报错一并归零（F821 动态 re-export 误报，用 per-file ignore 说明；B008 保留 `_core()` 默认值约定）；全量 837 tests OK。
 - 继续拆分 boss_cdp_raw.py：新增 scripts/city.py（城市码表/resolve_city/fetch_boss_json）、scripts/login_probe.py（登录态探测）、scripts/risk.py（风控页面探测与分类）、scripts/activity.py（岗位活跃度判定与导出过滤）、scripts/chrome_setup.py（Chrome CDP 环境准备与进程管理），函数真正移动、re-export 保持 scripts.boss_cdp_raw.X 导入面；tests 全绿 + 隔离守卫通过。
 - AI 解决方案工程师类豁免技术门（issue #181）：用户口径「解决方案工程师只要有 ai 关键词就可以」——标题含「解决方案」且有 AI 证据的不再按技术岗删；无 AI 的解决方案工程师仍删。
