@@ -2330,6 +2330,22 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             return result
         print(f"  ↩️  encryptJobId 通道未命中"
               f"（{result['reason']}:{result.get('category', '')}），回退 DOM 渲染")
+    detail_url = build_detail_url(job)
+    # 已知坏页跳过（2026-10-22）：某些岗位页的解析路径不适用（每天固定
+    # 3 个 invalid_detail），结果可复现 → 不必每天重试、白花额度。
+    # 命中台账 → 直接跳过（**不消耗日额度**）；--retry-job 可强制重试。
+    if job_id and _known_failures.is_known(job_id):
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "known_bad_page",
+                "message": "已知解析失败的页面（已沉淀），跳过以免浪费额度",
+                "channel": "dom"}
+    # 日预算：详情页请求前先记一次（超限立即停，不浪费一次真实请求）
+    allowed, used, limit, why = _consume_detail_page_budget(job_id=job_id)
+    if why == "duplicate":
+        return {"ok": False, "detail": None, "job_id": job_id,
+                "reason": "skipped_today",
+                "message": "今天已抓过该岗位（不重复消耗日额度）",
+                "channel": "dom"}
 
     ws = None
     tid = None
@@ -2344,22 +2360,6 @@ def _scrape_one_detail(job, cdp_port=DEFAULT_CDP_PORT, stop_event=None,
             if DOM_BLOCK_ASSETS_ENABLED:
                 _apply_asset_blocking(ws, sid)
 
-        detail_url = build_detail_url(job)
-        # 已知坏页跳过（2026-10-22）：某些岗位页的解析路径不适用（每天固定
-        # 3 个 invalid_detail），结果可复现 → 不必每天重试、白花额度。
-        # 命中台账 → 直接跳过（**不消耗日额度**）；--retry-job 可强制重试。
-        if job_id and _known_failures.is_known(job_id):
-            return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "known_bad_page",
-                    "message": "已知解析失败的页面（已沉淀），跳过以免浪费额度",
-                    "channel": "dom"}
-        # 日预算：详情页请求前先记一次（超限立即停，不浪费一次真实请求）
-        allowed, used, limit, why = _consume_detail_page_budget(job_id=job_id)
-        if why == "duplicate":
-            return {"ok": False, "detail": None, "job_id": job_id,
-                    "reason": "skipped_today",
-                    "message": "今天已抓过该岗位（不重复消耗日额度）",
-                    "channel": "dom"}
         if not allowed:
             return {"ok": False, "detail": None, "job_id": job_id,
                     "reason": "daily_budget_exhausted",
