@@ -41,6 +41,8 @@ docs/
 ._*
 Thumbs.db
 
+# User scratch scripts and temporary data
+temp/
 # 覆盖全局 gitignore 对 AGENTS.md 的忽略，本项目需要提交
 !AGENTS.md
 

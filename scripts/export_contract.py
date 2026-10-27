@@ -27,7 +27,7 @@ import logging
 import os
 import re
 import time
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunparse, urlunsplit
 
 log = logging.getLogger("boss_cdp")  # 与主文件同名 logger，日志路由一致
 
@@ -549,8 +549,11 @@ def _merge_dropped_items(prev, new, present_ids=()):
     for item in list(prev or []) + list(new or []):
         if not isinstance(item, dict):
             continue
-        jid = str(item.get("job_id") or "")
-        if jid and jid not in merged:
+        jid = item.get("job_id")
+        if jid is None or str(jid).strip() == "":
+            continue
+        jid = str(jid)
+        if jid not in merged:
             merged[jid] = item
     for jid in present_ids:
         merged.pop(jid, None)
@@ -810,3 +813,172 @@ def cleanup_corrupted_json(directory):
             except OSError:
                 pass
     return quarantined
+
+
+# --- merge helpers (extracted from boss_cdp_raw.py) ---
+def merge_jobs(external_path, new_jobs):
+    """从外部 JSON 加载 jobs，与 new_jobs 按 job_id 合并去重。
+
+    Args:
+        external_path: 已有 JSON 文件路径
+        new_jobs: 新抓取的 jobs 列表
+
+    Returns:
+        合并后的 jobs 列表
+    """
+    try:
+        with open(external_path, encoding="utf-8") as f:
+            old_data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning(f"无法加载合并文件 {external_path}: {e}")
+        return new_jobs
+
+    old_jobs = old_data.get("jobs", [])
+    merged = merge_unique(old_jobs, new_jobs)
+    # 链接取新（2026-10-22）：同一 job_id 再次出现时**新链接覆盖旧链接**，其余字段保持
+    # 旧记录。注：链接本身是稳的（实测隔天用真导航打开仍是同一岗位），这里只是保证
+    # 合并时用最新一次列表拿到的链接。
+    # 链接刷新已移除（见上方说明）：job_id=md5(job_link)，刷新 job_link 会改变 job_id
+    added = len(merged) - len(old_jobs)
+    print(f"合并: 旧文件 {len(old_jobs)} 条 + 新抓取 {len(new_jobs)} 条 = {len(merged)} 条 (新增 {added})")
+    return merged
+
+
+# ── 链接刷新（已移除，2026-10-23）──────────────────────────────────────
+# 根因：job_id = md5(job_link)，刷新 job_link 会改变 job_id，导致按 job_id
+# 匹配永远找不到。设计上 job_link 跨天稳定（实测），refresh_links 从未起过作用。
+# 如需重新获取链接，直接重新抓取（--merge 会去重）。
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def merge_details(external_path, new_details):
+    """从外部 JSON 加载详情，与 new_details 按 job_id 合并去重。
+
+    详情文件本身可能是列表结构（scrape_details 输出）或带 jobs/details 键的字典，
+    这里都做兼容。优先保留 new_details 中的同名记录（更新覆盖旧值）。
+
+    Args:
+        external_path: 已有详情 JSON 文件路径
+        new_details: 新抓取的详情列表（可为空）
+
+    Returns:
+        合并后的详情列表
+    """
+    if not external_path:
+        return new_details
+    try:
+        with open(external_path, encoding="utf-8") as f:
+            old_data = json.load(f)
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        log.warning(f"无法加载合并详情文件 {external_path}: {e}")
+        return new_details
+
+    if isinstance(old_data, list):
+        old_details = old_data
+    elif isinstance(old_data, dict):
+        old_details = old_data.get("details") or old_data.get("jobs") or []
+    else:
+        old_details = []
+
+    merged = merge_details_from_lists(old_details, new_details)
+    print(f"合并详情: 旧文件 {len(old_details)} 条 + 新抓取 {len(new_details)} 条 = {len(merged)} 条")
+    return merged
+
+
+def merge_details_from_lists(old_details, new_details):
+    """把两份详情列表按 job_id 合并去重，new_details 优先（同 id 用新覆盖旧）。"""
+    return merge_unique(old_details, new_details, new_overrides=True)
+
+
+# ============================================================
+# 构建搜索 URL
+# ============================================================
+
+
+# --- search helpers (extracted from boss_cdp_raw.py) ---
+def build_search_url(keyword, city_code, page, filters):
+    params = {"query": keyword, "city": city_code, "page": page}
+    for key, code in filters.items():
+        if code:
+            params[key] = code
+    return f"https://www.zhipin.com/web/geek/job?{urlencode(params)}"
+
+
+def should_use_dom_fallback(jobs, allow_dom_fallback=False):
+    return allow_dom_fallback and not jobs
+
+
+def parse_api_jobs_eval_value(value):
+    """兼容两种返回形状：旧版是 jobs 数组，新版是 {jobs: [...], raw: {...}}。"""
+    jobs, _raw = parse_api_eval_value(value)
+    return jobs
+
+
+def parse_api_eval_value(value):
+    """解析页面内 fetch 的返回值 → (映射后的 jobs, 平台**原始响应**)。
+
+    原始响应用于保真核对（"纸片上什么样，爬出来就应该是什么样"）与溯源；
+    没有它，字段对不对只能靠人读产物。
+    """
+    if not value:
+        return [], None
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return [], None
+    raw = None
+    if isinstance(parsed, dict):
+        raw = parsed.get("raw")
+        parsed = parsed.get("jobs")
+    if not isinstance(parsed, list):
+        return [], raw
+
+    jobs = []
+    for item in parsed:
+        if not isinstance(item, dict) or item.get("error"):
+            continue
+        if item.get("title") or item.get("job_link"):
+            jobs.append(item)
+    return jobs, raw
+
+
+
+
+# --- URL helpers (extracted from boss_cdp_raw.py) ---
+def is_zhipin_host(url):
+    """精确校验 URL 主机为 zhipin.com 或其子域（防伪造 host 的钓鱼导航）。
+
+    对照开源 boss-agent-cli 实践：不做子串判断（"zhipin.com" in url 会被
+    zhipin.com.evil.example 这类伪造 host 骗过）。
+    """
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    host = host.rstrip(".").lower()
+    return host == "zhipin.com" or host.endswith(".zhipin.com")
+
+
+def build_detail_url(job):
+    """Build the URL used for detail navigation without mutating job_link.
+
+    仅接受 zhipin.com 主机：job_link 可能来自外部文件（--merge/--input），
+    拒绝导航到任意站点。
+    """
+    link = job.get("job_link", "")
+    if not link:
+        return ""
+    if not is_zhipin_host(link):
+        log.warning(f"跳过非 zhipin.com 详情链接（防外部导航）: {link}")
+        return ""
+
+    parsed = urlparse(link)
+    params = parse_qsl(parsed.query, keep_blank_values=True)
+    existing_keys = {key for key, _ in params}
+    for query_key, job_key in (("lid", "lid"), ("securityId", "security_id")):
+        value = job.get(job_key) or job.get(query_key) or ""
+        if value and query_key not in existing_keys:
+            params.append((query_key, value))
+            existing_keys.add(query_key)
+
+    return urlunparse(parsed._replace(query=urlencode(params)))

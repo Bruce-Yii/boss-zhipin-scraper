@@ -766,13 +766,13 @@ class JobRecord:
         salary = raw.get("salaryDesc") or ""
         # 2026-10-22 保真核对：平台只给 cityName 时，原实现会拼出 "杭州··"
         # （两个空段 → 两个多余分隔符）。只拼**有值**的段。
-        location = "·".join([part for part in (
+        location = "·".join([str(part) for part in (
             raw.get("cityName") or "",
             raw.get("areaDistrict") or "",
             raw.get("businessDistrict") or "",
         ) if part])
         tags = " | ".join(
-            t for t in (raw.get("jobExperience") or "", raw.get("jobDegree") or "")
+            str(t) for t in (raw.get("jobExperience") or "", raw.get("jobDegree") or "")
             if t and t != "不限"
         )
 
@@ -792,7 +792,7 @@ class JobRecord:
             "boss_active_status": _list_active_status(raw),
             "anonymous": optional("anonymous"),
             "job_valid_status": optional("jobValidStatus"),
-            "icon_flags": "|".join(raw.get("iconFlagList") or []),
+            "icon_flags": "|".join(str(x) for x in (raw.get("iconFlagList") or [])),
             "icon_word": raw.get("iconWord") or "",
             "proxy_job": raw.get("proxyJob") or "",
             "proxy_type": raw.get("proxyType") or "",
@@ -802,7 +802,7 @@ class JobRecord:
             "company_scale": raw.get("brandScaleName") or "",
             "company_stage": raw.get("brandStageName") or "",
             "company_industry": raw.get("brandIndustry") or "",
-            "job_labels": " | ".join(raw.get("jobLabels") or []),
+            "job_labels": " | ".join(str(x) for x in (raw.get("jobLabels") or [])),
             "skills": raw.get("skills") or [],
             "security_id": raw.get("securityId") or "",
             "lid": raw.get("lid") or "",
@@ -817,7 +817,7 @@ class JobRecord:
                 f"https://www.zhipin.com/gongsi/{encrypt_brand_id}.html"
                 if encrypt_brand_id else ""
             ),
-            "welfare": " | ".join(raw.get("welfareList") or []),
+            "welfare": " | ".join(str(x) for x in (raw.get("welfareList") or [])),
         }
         if link_verified_at is None:
             import datetime as _dt
@@ -935,7 +935,7 @@ class JobRecord:
         detail = detail or {}
         merged = dict(self.data)
         for key, value in detail.items():
-            if value in (None, "", [], {}):
+            if value is None or value == "" or value == [] or value == {}:
                 continue
             merged[key] = value
         record = JobRecord(merged)

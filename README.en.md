@@ -32,6 +32,7 @@ python3 scripts/boss_cdp_raw.py --setup-chrome
 
 # 3. Scrape + analyze
 python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city 上海 --pages 3 --analysis
+python3 scripts/boss_cdp_raw.py --keyword "AI Agent" --city Shanghai --pages 3 --quick  # one-shot: list+details+summary
 
 # Cities nationwide are supported (incl. tier-3/4/5), e.g.:
 python3 scripts/boss_cdp_raw.py --keyword "前端" --city 赣州 --pages 3
@@ -54,7 +55,7 @@ Right after scraping you get: salary ranges, experience requirements, top skill 
 - Incremental writes (no data loss on crash)
 - One-shot environment check + persistent isolated Chrome CDP profile
 - Multi-dimension filters (scale, funding, salary, experience, degree, industry)
-- macOS + Linux support (a Windows code path is reserved but untested — not guaranteed to work)
+- macOS + Linux + Windows support (developed and tested on Windows, but some flows are not fully validated)
 
 <details>
 <summary>🔍 Why not a Selenium / Playwright crawler?</summary>

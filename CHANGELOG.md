@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 详情 sidecar 不再冒充详情文件：`--verify` / `--status` / `--list-results` 忽略 `.failures.json`（此前 `--verify` 会把失败明细当最新详情，报 0% 覆盖率）；`--archive` 让 failures 跟着详情本体走，不在根目录留孤儿。补 2 条回归测试。拆分重构引入的 426 条 ruff 报错一并归零（F821 动态 re-export 误报，用 per-file ignore 说明；B008 保留 `_core()` 默认值约定）；全量 837 tests OK。
+- 继续拆分 boss_cdp_raw.py：新增 scripts/city.py（城市码表/resolve_city/fetch_boss_json）、scripts/login_probe.py（登录态探测）、scripts/risk.py（风控页面探测与分类）、scripts/activity.py（岗位活跃度判定与导出过滤）、scripts/chrome_setup.py（Chrome CDP 环境准备与进程管理），函数真正移动、re-export 保持 scripts.boss_cdp_raw.X 导入面；tests 全绿 + 隔离守卫通过。
 - AI 解决方案工程师类豁免技术门（issue #181）：用户口径「解决方案工程师只要有 ai 关键词就可以」——标题含「解决方案」且有 AI 证据的不再按技术岗删；无 AI 的解决方案工程师仍删。
 - 岗名词表补「解决方案」（issue #179）：AI解决方案实习生是用户点名的目标岗位，此前无 JD 时被当「标题无岗名」误删；无 AI 证据的解决方案岗仍按跨行业噪声删，本质标准不放宽。
 - 跨 run 对账（issue #175）：`--db` 默认启用（`--no-db` 关闭），每次列表入库前对**同城市**历史做快照，列表 meta 记 `cross_run`——added（今天首次见到）/ removed（历史见过、本次没搜到，只是下架候选信号）/ kept_count（仍在），首次运行记 baseline。「昨天挖空、今天新增哪些」从此机器可答；schema v1→v2（jobs 表补 keyword/city，旧库自动迁移、旧数据不动）；默认库打不开只告警不挡抓取，显式 `--db` 打不开仍硬失败。
@@ -27,8 +29,6 @@
 - 验收规格登记 `tier`/`tier_evidence`（issue #132）：分层交付物写这两个字段，
   验收器 P2 误报"规格未登记"。只补登记，不改判定逻辑。
 
-## 未发布
-
 ## v2.22.0 (2026-10-23)
 
 ### 删库规则落地（用户拍板：销售/技术/噪声直接删库，issue #135）
@@ -44,8 +44,6 @@
 - 详情前筛（用户 2026-10-23：筛完再爬）：`scrape_details` 之前对列表 jobs 跑
   一遍删库标题规则（无 JD 只走标题分支 + FDE 例外），垃圾不进详情队列、
   不耗日预算；`--keep-junk` 跳过。供给×额度协调按筛后供给算。
-
-## 未发布
 
 ## v2.21.0 (2026-10-22)
 
@@ -243,9 +241,7 @@
 - **详情 API 通道（`api`/`encrypt`）标注为已封存**：该接口被平台限流并升级为短时账号封禁
   （tangzhiyao/boss-show-time#42），我方历史实测也是几十条即 code 37。保留代码，需显式指定。
 
-## 未发布
-
-### 性能（DOM 详情链路）
+## 未发布（性能链路，历史记录）
 - **新增 `--detail-channel html`：详情页 HTML 直取**（DOM 家族快路径）——停靠 tab
   同源 `fetch` 详情页首屏 SSR HTML，`DOMParser` 解析取 JD，不执行页面 JS、不整页渲染。
   - 实测（2026-10-21 真机，295 条杭州列表）：`fetch` 详情页 **151-179ms**，整页渲染就绪

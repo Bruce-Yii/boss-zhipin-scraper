@@ -151,6 +151,8 @@ class ListBatchSemanticsTests(unittest.TestCase):
             (result_dir / "boss_details_real.json").write_text("[]", encoding="utf-8")
             (result_dir / "boss_details_real.json.pending.json").write_text(
                 "[]", encoding="utf-8")
+            (result_dir / "boss_details_real.json.failures.json").write_text(
+                "[]", encoding="utf-8")
             fake_requests = mock.Mock()
             fake_requests.ConnectionError = ConnectionError
             fake_requests.Timeout = TimeoutError
@@ -168,6 +170,7 @@ class ListBatchSemanticsTests(unittest.TestCase):
         self.assertIn("详情文件        : 1 个", output.getvalue())
         self.assertIn("最新 boss_details_real.json", output.getvalue())
         self.assertNotIn("最新 boss_details_real.json.pending.json", output.getvalue())
+        self.assertNotIn("failures.json", output.getvalue())
         self.assertIn("pending 文件    : 1 个", output.getvalue())
 
     def test_run_batch_forwards_safe_per_task_options(self):

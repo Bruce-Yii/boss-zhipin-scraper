@@ -300,6 +300,9 @@ _SALES_JD_TERMS = ("提成", "业绩指标", "完成业绩", "回款", "签单",
 _TECH_TITLE_TERMS = ("开发", "研发", "算法", "测试", "工程师", "运维",
                      "数据标注", "剪辑", "美工", "设计", "体验官", "管培",
                      "运营合伙人", "招募", "技术支持", "工程")
+# 非 AI 的运营/电商/客服类标题词（2026-10-27 口径：猎 AI 非技术岗，
+# 这类标题与目标无关，列表阶段直接毙，不进详情；标题带 AI/产品的走正常判定）。
+_NONAI_OPS_TITLE_TERMS = ("运营", "新媒体", "电商", "直播", "主播", "客服")
 # 标题/JD/技能里算"有 AI 证据"的核心词。刻意比 AI_DIRECTION_TERMS 窄：
 # "算法/向量/CV"这类泛技术词不算（地质算法岗 JD 通篇算法但无 AI 产品语义，
 # 不能靠它留下来）。
@@ -415,6 +418,8 @@ def drop_junk_jobs(jobs):
     2. 销售：标题命中销售词（强判定）→ 删；
     3. 技术/设计/杂：标题命中技术词 → 删（产品经理/产品运营结尾不算；
        标题含「解决方案」且有 AI 关键词的也不算，issue #181）；
+    3.5. 非 AI 的运营/新媒体/电商/直播/主播/客服类标题 → 删（2026-10-27
+       口径：与 AI 非技术岗无关，列表阶段直接毙；标题带 AI/产品的走正常判定）；
     4. 标题没有非技术岗名词汇（产品/运营/增长/策略/内容/数据/助理/专员/
        项目/营销/解决方案/pm）且标题不含 AIGC（issue #155 用户口径：aigc 没问题——
        AIGC 本身就是岗位领域明示，放行到 JD 层再判）→ 删（噪声：连招什么岗
@@ -459,6 +464,17 @@ def drop_junk_jobs(jobs):
                 dropped["tech"] += 1
         if reason:
             pass
+        elif "新媒体" in low:
+            # 新媒体标题无例外：即使带 AI/产品也与目标无关（2026-10-27 口径）。
+            reason = "新媒体岗（标题）"
+            dropped["noise"] += 1
+        elif (any(w in low for w in _NONAI_OPS_TITLE_TERMS)
+                and "产品" not in low
+                and not _ai_evidence_level(title, "", [])):
+            # 非 AI 运营/电商/客服类标题：与 AI 非技术岗无关，列表阶段直接毙
+            # （标题带 AI/产品的走正常判定；FDE 例外在前）。
+            reason = "非AI运营岗（标题）"
+            dropped["noise"] += 1
         elif not any(w in low for w in _ROLE_WORDS) and "aigc" not in low:
             # 标题含 AIGC 的不算"连招什么岗都说不清"（issue #155 用户口径：
             # aigc 没问题）——AIGC 本身就是岗位领域明示，放行到 JD 层再判。
@@ -598,13 +614,6 @@ def classify_extract_failure(message, page_text=""):
     # 有页面内容但无"职位描述"段落 → 无JD段落（audit: navigation chrome without a JD）
     if page_text and "职位描述" not in page_text:
         return "no_section"
-    return "unknown"
-    for name, markers in _EXTRACT_FAILURE_PATTERNS:
-        for marker in markers:
-            if marker and marker in text:
-                return name
-    if "too short" in text:
-        return "too_short"
     return "unknown"
 
 

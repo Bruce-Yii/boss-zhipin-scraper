@@ -898,6 +898,10 @@ def format_summary(summary):
         f"技能标签: {_format_items(summary['skill_tags'])}",
         f"JD 高频词: {_format_items(summary['jd_terms'])}",
     ]
+    lines += [
+        "",
+        "求职建议: 优先关注薪资中位数附近岗位；结合技能标签查漏补缺；风险标记岗位谨慎投递；用 --input 深入读取完整 JD。",
+    ]
     return "\n".join(lines)
 
 
