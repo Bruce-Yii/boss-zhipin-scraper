@@ -1,5 +1,5 @@
 {
-  "_comment": "日常作业配置示例：复制到 ~/.boss-zhipin-scraper/daily.json 后按需改。JSON 没有行注释，说明写在 _comment / comment 字段里。",
+  "_comment": "日常作业模板示例：复制到 ~/.boss-zhipin-scraper/profiles/ 下改。可以放多份模板（不同关键词/城市/口径）；--daily <模板名> 选一套跑，--daily 不带参数只列模板。",
   "name": "杭州11词实习-日常",
   "city": "杭州",
   "keywords": [
@@ -16,13 +16,17 @@
     "ai产品运营实习生"
   ],
   "pages": 3,
-  "recruit_types": ["intern"],
+  "recruit_types": [
+    "intern"
+  ],
+  "source": "artifacts",
+  "exclude_job_ids_file": "~/.boss-zhipin-scraper/exclude/杭州实习杂项.json",
   "max_details": null,
   "max_jobs": null,
   "filters": {},
-  "scope": "杭州 11 词实习 AI 非技术岗（日常库）",
-  "scope_key": "杭州|intern|11词日常",
-  "deliverable": "boss_jobs_杭州实习_日常.json",
-  "_comment_clean": "干净版（225/244）里的 19 条杂项是人工口径，不在自动流水线里；以后要做自动排除再加配置项。",
-  "comment": "每天默认跑法：11 个关键词 × 3 页 → 详情 → 从库重建日常交付物 → 今日简报"
+  "scope": "杭州 11 词实习 AI 非技术岗（全量产物并集 + 现行规则 + 剔除杂项19）",
+  "scope_key": "杭州|intern|全量干净",
+  "deliverable": "boss_jobs_杭州实习AI非技术岗_全量干净.json",
+  "_comment_fields": "source=db|artifacts（artifacts=产物目录并集，覆盖库启用前的历史 JD）；exclude_job_ids_file 指向排除名单（JSON 数组或 {job_ids:[]}）。",
+  "comment": "杭州这一套的跑法：11 个关键词 × 3 页 → 详情 → 产物并集重建（剔除杂项19）→ 今日简报"
 }

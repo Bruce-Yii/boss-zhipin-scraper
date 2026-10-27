@@ -35,6 +35,13 @@ def _job(jid, title="AI产品经理", job_type="4"):
     }
 
 
+def write_json(directory, name, payload):
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False)
+    return path
+
+
 JD = "负责AI产品规划与设计。" * 30
 
 
@@ -291,6 +298,57 @@ class DbDeliverableTests(unittest.TestCase):
                 "--lists", "x.json", "--details", "y.json",
                 "--target", os.path.join(self.tmp.name, "out.json")])
         self.assertEqual(code, 2)
+
+
+class BuildFromArtifactsTests(unittest.TestCase):
+    """--from-artifacts：从产物目录并集重建 + 排除名单（issue #193）。"""
+
+    def setUp(self):
+        self.module = load_module(
+            "build_deliverable", SCRIPTS / "build_deliverable.py")
+        self.tmp = tempfile.TemporaryDirectory(prefix="deliverable-artifacts-")
+        self.addCleanup(self.tmp.cleanup)
+        self.result_dir = self.tmp.name
+        write_json(self.result_dir, "boss_jobs_20261027_120000_1.json", {
+            "keyword": "AI产品实习", "city": "杭州", "format_version": 2,
+            "scraped_at": "2026-10-27T12:00:00+08:00",
+            "jobs": [_job("a"), _job("b"), _job("c")],
+        })
+        write_json(self.result_dir, "boss_details_20261027_120000_1.json",
+                   [_detail("a"), _detail("b")])
+        self.exclude_path = os.path.join(self.result_dir, "exclude.json")
+        with open(self.exclude_path, "w", encoding="utf-8") as handle:
+            json.dump({"job_ids": ["b"]}, handle)
+        self.target = os.path.join(self.result_dir, "out.json")
+
+    def test_from_artifacts_applies_exclusions_and_stamps_source(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = self.module.main([
+                "--result-dir", self.result_dir, "--from-artifacts",
+                "--city", "杭州", "--recruit-type", "intern",
+                "--exclude-job-ids-file", self.exclude_path,
+                "--target", self.target,
+                "--scope", "全量干净", "--scope-key", "杭州|intern|全量干净"])
+        self.assertEqual(code, 0)
+        with open(self.target, encoding="utf-8") as handle:
+            final = json.load(handle)
+        # b 被排除名单剔除；c 无 JD 被口径一剔除；只留 a
+        self.assertEqual([j["job_id"] for j in final["jobs"]], ["a"])
+        self.assertEqual(final["source"]["kind"], "artifacts")
+        self.assertEqual(final["source"]["excluded_job_ids"], 1)
+        self.assertEqual(final["artifact"]["inputs"]["kind"], "artifacts")
+        self.assertTrue(os.path.exists(self.target.rsplit(".", 1)[0] + ".csv"))
+
+    def test_exclude_file_formats(self):
+        for payload in (["x", "y"], {"job_ids": ["x"]}, "x,y"):
+            path = os.path.join(self.result_dir, "e.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                if isinstance(payload, str):
+                    handle.write(payload)
+                else:
+                    json.dump(payload, handle)
+            ids = self.module.load_exclude_ids(path)
+            self.assertTrue(ids)
 
 
 if __name__ == "__main__":

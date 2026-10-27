@@ -365,7 +365,7 @@ python3 scripts/boss_cdp_raw.py --daily --json
 ```
 
 - 抓取/流水线在关键节点把状态写 `~/.boss-zhipin-scraper/run_state.json`（阶段、完成/总数、成功数、预算、最后心跳）；超过阈值未更新标记 `stale`（可能卡住/已结束）。
-- 日常跑法固化在 `~/.boss-zhipin-scraper/daily.json`（示例 `data/daily_profile.example.json`：城市/关键词/页数/招聘类型/口径/交付物文件名），改配置即可改每天跑法。
+- 日常跑法固化成**多套模板**：`~/.boss-zhipin-scraper/profiles/*.json`（示例 `data/daily_profile.example.json`）。`--daily` 不带名字**只列模板不执行**，`--daily <模板名>` 才跑；模板可配 `source=db|artifacts`（artifacts=产物目录并集，覆盖库启用前的历史 JD）与 `exclude_job_ids_file`（人工剔除名单）。
 - `--brief` 的"岗位结构"以**当前最新交付物**为准（已过口径、带 JD），并给出与同口径上一版的 `+新增/-消失/保持`。
 
 ## 文件结构
