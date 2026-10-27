@@ -1,0 +1,28 @@
+{
+  "_comment": "日常作业配置示例：复制到 ~/.boss-zhipin-scraper/daily.json 后按需改。JSON 没有行注释，说明写在 _comment / comment 字段里。",
+  "name": "杭州11词实习-日常",
+  "city": "杭州",
+  "keywords": [
+    "产品实习生",
+    "AI产品实习生",
+    "AI产品经理实习生",
+    "AI解决方案实习生",
+    "Agent产品经理实习生",
+    "AIGC产品经理实习生",
+    "FDE实习生",
+    "AIGC产品实习生",
+    "agent产品实习生",
+    "AI产品助理实习生",
+    "ai产品运营实习生"
+  ],
+  "pages": 3,
+  "recruit_types": ["intern"],
+  "max_details": null,
+  "max_jobs": null,
+  "filters": {},
+  "scope": "杭州 11 词实习 AI 非技术岗（日常库）",
+  "scope_key": "杭州|intern|11词日常",
+  "deliverable": "boss_jobs_杭州实习_日常.json",
+  "_comment_clean": "干净版（225/244）里的 19 条杂项是人工口径，不在自动流水线里；以后要做自动排除再加配置项。",
+  "comment": "每天默认跑法：11 个关键词 × 3 页 → 详情 → 从库重建日常交付物 → 今日简报"
+}

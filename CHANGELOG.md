@@ -2,6 +2,11 @@
 
 ## 未发布
 
+- agent 日常运行支撑（issue #189）：长任务进度可观测 + 今日简报 + 日常作业配置。
+  - `scripts/run_state.py` + `--progress [--json]`：抓取/流水线在 列表/详情/导出/交付物 阶段原子写 `run_state.json`（阶段、完成/总数、成功数、预算、最后心跳），`stale` 自动标记；解决"长任务期间只有工具调用、看不到进度"。
+  - `scripts/brief.py` + `--brief [--json]`：今日简报——今日 runs/新增岗位、**岗位结构（归一化标题 → 数量）**、详情请求/预算、每个口径最新交付物、与同口径上一版的 `+新增/-消失/保持`、异常（风控事件/坏页台账/失败文件）、下一步；岗位结构以当前最新交付物（已过口径、带 JD）为准。
+  - `scripts/daily.py` + `--daily [CONFIG]`：把 列表+详情 → 从库重建交付物 → 刷新产物清单 → 今日简报 固化成一条命令；配置 `~/.boss-zhipin-scraper/daily.json`（示例 `data/daily_profile.example.json`，含注释字段）。
+  - 文档：SKILL/AGENTS 增加「长任务后台跑 + 轮询 + 定时汇报」规程与汇报契约；README 中英、测试 +8。
 - 产物层统一清单（issue #186）：新增 `scripts/artifacts.py` 与 `--artifacts`（`--json` 给 agent 纯 JSON）。把 job-result 目录扫成一份可重建清单：分类（list/details/deliverable/ledger）、口径（city/keyword/recruit_types/scope_key）、同口径交付物的取代关系（新的 active、旧的 superseded，只打标不移动）、时效标记、raw/quarantine 计数，并给出 `latest`（最新列表/详情 + 每个口径最新交付物）；`build_deliverable` 构建时给交付物盖 `artifact` 章（scope_key/口径/输入血缘），支持 `--scope-key` 显式指定系列。清单只读、缓存损坏自动重建；新增 `boss-artifacts` 入口。列表快照/详情/sidecar 不再需要按 mtime 猜。
 - 交付物可从 SQLite 原材料库一键重建（issue #184）：`build_deliverable.py` 新增 `--from-db [PATH]`，按 `--city`/`--keyword`/`--since`/`--recruit-type` 口径直接取库内列表与详情（多轮抓取已按 job_id 去重），走同一条生产合并路径出 JSON/CSV/验收，meta 记 `source`（库路径/库内总量/选中量/口径）可溯源；库只读打开不改库。`--recruit-type` 支持逗号组合（如 `intern,campus`）。列表入库补写 `keyword` 列（schema v2 该列此前一直空置；旧行 NULL 时按该行所属 run 的关键词标签兜底匹配）。新增 `boss-deliverable` 入口命令。实测 `--city 杭州 --recruit-type intern,campus` 与 2026-10-27 手工四库合并的 263 条交付物逐 job_id 完全一致（263/263，零新请求）。
 - 详情 sidecar 不再冒充详情文件：`--verify` / `--status` / `--list-results` 忽略 `.failures.json`（此前 `--verify` 会把失败明细当最新详情，报 0% 覆盖率）；`--archive` 让 failures 跟着详情本体走，不在根目录留孤儿。补 2 条回归测试。拆分重构引入的 426 条 ruff 报错一并归零（F821 动态 re-export 误报，用 per-file ignore 说明；B008 保留 `_core()` 默认值约定）；全量 837 tests OK。

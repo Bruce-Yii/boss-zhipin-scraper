@@ -177,6 +177,46 @@ python3 "$SCRIPT_PATH" --artifacts
 - 交付物带 `artifact.scope_key`：同一口径重复重建时新的为 `active`、旧的自动标 `superseded`（只打标，不移动文件），避免"到底哪份是当前版"；
 - 归档仍显式 `--archive`；清单不删、不改、不移动任何产物。
 
+### 长任务：后台跑 + 轮询进度 + 定时汇报（agent 必读）
+
+用户只能看到工具调用，**看不到命令 stdout 的实时滚动**。所有长任务（抓取、`--daily`）必须按这个规程来，否则用户会长时间"什么都看不到"：
+
+1. **后台运行**：不要同步等命令跑完；抓取一轮 15-20 分钟，同步等待期间无法汇报。
+2. **轮询**：每 2-5 分钟跑一次 `--progress --json`，拿 `state/phase/progress_pct/detail_done/detail_ok/budget_used/age_seconds`。
+3. **定时汇报**：每 10-15 分钟向用户汇报一次进度（阶段、已完成/总数、成功数、预算剩多少、是否 stale）；`state=stale` 或长时间不动 → 主动提示"可能卡住/已结束"，不要静默。
+4. **收尾**：任务结束后用 `--brief`（或 `--brief --json`）汇报结果，说明交付物路径、条数、岗位结构变化与异常。
+
+```bash
+python3 "$SCRIPT_PATH" --progress          # 人看：一行进度
+python3 "$SCRIPT_PATH" --progress --json   # agent：纯 JSON
+python3 "$SCRIPT_PATH" --brief             # 今日简报（人看）
+python3 "$SCRIPT_PATH" --brief --json      # 今日简报（agent）
+```
+
+### 日常作业（一句指令跑完一天）
+
+每天固定的跑法固化在 `~/.boss-zhipin-scraper/daily.json`（示例见 `data/daily_profile.example.json`；JSON 无行注释，用 `_comment` 字段写说明）：
+
+```bash
+# 列表+详情 → 从库重建该口径交付物 → 刷新产物清单 → 今日简报
+python3 "$SCRIPT_PATH" --daily
+
+# 机器可读最终结果（过程仍看 --progress）
+python3 "$SCRIPT_PATH" --daily --json
+```
+
+- 配置字段：`city / keywords / pages / recruit_types / scope / scope_key / deliverable / filters / max_details`；
+- 交付物目标文件名固定（如 `boss_jobs_杭州实习_日常.json`），同 `scope_key` 重建时产物清单自动把旧版标 superseded；
+- 手工口径（如"干净版"剔除 19 条杂项）不在自动流水线里；要自动排除需在配置里另行约定。
+
+### 日常汇报契约（用户定的）
+
+汇报 = **成果数字 + 含义 + 待拍板**，不贴命令、不讲实现。固定结构：
+
+1. **进度**（长任务中途）：阶段 / 详情 完成数/总数（成功数）/ 预算剩余 / 是否卡住；
+2. **结果**：今日新增岗位数 + **岗位结构（岗位名 → 数量）** + 详情请求数与预算 + 交付物（路径/条数/较上版 +新增/-消失）+ 异常（风控/失败/坏页）+ 下一步建议；
+3. 所有数字必须来自 `--progress` / `--brief` 的真实输出，**不许估算或编造**。
+
 ## 开发与测试隔离
 
 单元测试必须完全 mock，不连接真实 Chrome、不发 BOSS 请求。提交前运行目标测试和隔离守卫；守卫会在临时 HOME 下执行完整 discovery，并检查 profile、run lock、cooldown、audit、runner trace 未被改写：
