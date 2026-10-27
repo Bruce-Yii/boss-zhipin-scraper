@@ -36,6 +36,7 @@ dev = [
 # 安装后顶层包名为 scripts，故入口是 scripts.boss_cdp_raw:main
 boss-scraper = "scripts.boss_cdp_raw:main"
 boss-summary = "scripts.job_summary:main"
+boss-deliverable = "scripts.build_deliverable:main"
 
 [build-system]
 requires = ["hatchling"]

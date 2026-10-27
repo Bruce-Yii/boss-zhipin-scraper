@@ -169,6 +169,13 @@ python3 scripts/build_deliverable.py \
   --keyword "产品实习生,AI产品实习生" --city 杭州 \
   --target-roots "产品实习,AI产品,FDE,AIGC,大模型" \
   --scope "口径说明写这里"
+
+# 7. 或者：直接从 SQLite 原材料库重建（逐轮抓取已自动入库 + 按 job_id 去重，
+#    不用再挑文件；--from-db 与 --lists/--details 二选一）
+python3 scripts/build_deliverable.py \
+  --from-db --city 杭州 --recruit-type intern,campus \
+  --target boss_jobs_杭州实习校招.json \
+  --scope "库口径：杭州 实习+校招 AI 非技术岗"
 ```
 
 ## 参数
@@ -308,6 +315,25 @@ uv run boss-summary --top 15
 
 摘要会覆盖这些维度：薪资区间、经验要求、学历要求、地区分布、高频公司、技能标签、JD 高频词。提示词会要求模型基于这些统计去做简历关键词补齐、项目经历改写方向和面试准备清单，但明确要求不要虚构经历。
 
+## 交付物重建（文件 / 原材料库两种口径）
+
+`scripts/build_deliverable.py` 是唯一的交付物构建入口，两种输入来源二选一，输出走**同一条生产路径**（口径一剔无 JD、删库、派生字段、验收结论、CSV 随附）：
+
+- **文件模式**：`--lists/--details/--old` 手工指定，适合复现历史产物、跨库拼装。
+- **原材料库模式**（issue #184）：`--from-db [PATH]` 读取 SQLite 原材料库（`--db` 抓取时默认自动累积，跨 run 按 `job_id` 去重），不用再翻文件清单：
+  - `--city` 精确过滤（建议总是给，多城市会混）；
+  - `--keyword` 逗号分隔、任一命中（匹配库内 `jobs.keyword`，旧行 keyword 为 NULL 时回退到该行所属 run 的关键词标签）；
+  - `--since YYYY-MM-DD` 只保留该日期之后仍在列表里出现过的岗位（按 `updated_at`，即最后一次出现的时刻；库内时间戳为 UTC）；
+  - `--recruit-type` 支持逗号组合（如 `intern,campus`），"实习+校招"这类跨类型交付物一次出；
+  - 库**只读打开**，不会改库；产物 `meta.source` 记录库路径与口径（库内总量 / 选中量 / since / city / keyword），交付物可溯源。
+  - 实测：`--from-db --city 杭州 --recruit-type intern,campus` 与 2026-10-27 手工四库合并的 263 条交付物逐 `job_id` **完全一致（263/263）**，零新请求。
+
+打包安装后也可以用入口命令：
+
+```bash
+uv run boss-deliverable --from-db --city 杭州 --recruit-type intern,campus --target 杭州实习校招.json
+```
+
 ## 文件结构
 
 ```
@@ -324,6 +350,7 @@ boss-zhipin-scraper/
 │   ├── ratelimit.py      # BurstThrottle / 自适应限速
 │   ├── export_contract.py# 导出契约、递归脱敏、原子写
 │   ├── db_store.py       # SQLite schema / run lineage
+│   ├── build_deliverable.py # 交付物重建（文件 / SQLite 原材料库两种口径）
 │   ├── audit.py          # 风险事件审计
 │   └── job_summary.py    # 抓取后摘要 + 提示词
 └── requirements.txt

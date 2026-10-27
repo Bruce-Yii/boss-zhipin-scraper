@@ -167,6 +167,14 @@ python3 scripts/build_deliverable.py \
   --keyword "产品实习生,AI产品实习生" --city 杭州 \
   --target-roots "产品实习,AI产品,FDE,AIGC,大模型" \
   --scope "scope note goes here"
+
+# 7. Or rebuild straight from the SQLite raw-material store (every run is
+# upserted and de-duplicated by job_id — no need to pick files;
+# --from-db is mutually exclusive with --lists/--details)
+python3 scripts/build_deliverable.py \
+  --from-db --city 杭州 --recruit-type intern,campus \
+  --target boss_jobs_hangzhou_intern_campus.json \
+  --scope "DB scope: Hangzhou intern+campus AI non-tech"
 ```
 
 ## Parameters
@@ -306,6 +314,25 @@ uv run boss-summary --top 15
 
 The summary covers: salary ranges, experience requirements, degree requirements, regional distribution, top companies, skill tags, frequent JD terms. The prompt asks the model to use these stats to fill in résumé keywords, suggest project-story rewrite directions, and produce an interview-prep checklist — while explicitly instructing it not to fabricate experience.
 
+## Deliverable Rebuild (files or raw-material store)
+
+`scripts/build_deliverable.py` is the single deliverable entry point. Pick one input source; both go through the **same production path** (drop jobs without JD, junk removal, derived fields, acceptance verdict, companion CSV):
+
+- **File mode**: `--lists/--details/--old` — manual, for reproducing historical outputs or cross-library assembly.
+- **Raw-material store mode** (issue #184): `--from-db [PATH]` reads the SQLite store (`--db` accumulates by default during scraping, de-duplicated by `job_id` across runs) — no more hunting through file lists:
+  - `--city` exact scope filter (always recommended; multiple cities would mix);
+  - `--keyword` comma-separated, any match (matches `jobs.keyword`, falling back to the owning run's keyword label for legacy NULL rows);
+  - `--since YYYY-MM-DD` keeps only jobs still seen in a listing on/after that date (`updated_at` = last-seen time; timestamps are stored in UTC);
+  - `--recruit-type` accepts comma combinations (e.g. `intern,campus`) — cross-type deliverables in one shot;
+  - the DB is opened **read-only** (never modified); `meta.source` records the DB path and scope (total / selected / since / city / keyword) for lineage.
+  - Verified: `--from-db --city 杭州 --recruit-type intern,campus` reproduced the hand-merged 263-record deliverable of 2026-10-27 **exactly, job_id by job_id (263/263)**, with zero new requests.
+
+After installing the package you can also use the entry command:
+
+```bash
+uv run boss-deliverable --from-db --city 杭州 --recruit-type intern,campus --target hangzhou_intern_campus.json
+```
+
 ## File Structure
 
 ```
@@ -323,6 +350,7 @@ boss-zhipin-scraper/
 │   ├── ratelimit.py      # BurstThrottle / adaptive limiting
 │   ├── export_contract.py# Export contract, recursive redaction, atomic writes
 │   ├── db_store.py       # SQLite schema / run lineage
+│   ├── build_deliverable.py # Deliverable rebuild (file or SQLite raw-material store)
 │   ├── audit.py          # Risk-event audit log
 │   └── job_summary.py    # Post-scrape summary + prompt
 └── requirements.txt
