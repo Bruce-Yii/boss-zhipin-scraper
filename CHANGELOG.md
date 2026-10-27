@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 交付物原地重建修漏（issue #197）：`build_deliverable` 原地重建（target 已存在）时，`_merge_jd_into_export` 会优先读旧 target 当候选全集，本次候选池被忽略 → 旧交付物里没有的新岗位永远进不来（每日重建卡在 242 的真因）。新增 `prefer_base` 开关，`--from-db`/`--from-artifacts` 重建以本次候选为全量，同时带入旧 target 的累计 dropped/target_roots；修复后重出 **245 条**（242 + FDE工程师 + AIGC运营日常实习生 + AIGC实习生新帖），规则复核三条均保留、不是误删。+1 回归测试。
 - code 37 自愈（issue #195，机理同 boss-agent-cli PR #453）：`__zp_stoken__` 被标记后所有自动化请求返回 code 37；新增 `--warm-stoken [秒]`（真实打开搜索页等待安全 JS，默认 75s）与 `scripts/warm_stoken.py`；登录探测命中 37 时**自动热刷新并重探一次**（`--setup-chrome` 等待登录同样生效），仍失败才停——不循环、不硬怼；热刷新后紧接着跑抓取可恢复（2026-10-27 实测：11 词×3 页全过）。顺带修 `run_state.update()` 在父子进程竞争下可能把运行中误标成 `running=false`（更新语义强制回填 true）。
 - 全量口径重建 + 人工剔除 + 多模板日常作业（issue #193）：
   - `build_deliverable` 新增 `--from-artifacts`：从产物目录（列表/详情快照并集，含 archive）重建——库只从启用 `--db` 那天起算，更早的 JD 只存在文件里（实测文件并集比库多 31 条详情），该模式把历史补回来；只读产物、不改文件。

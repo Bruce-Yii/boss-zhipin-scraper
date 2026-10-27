@@ -561,7 +561,7 @@ def _merge_dropped_items(prev, new, present_ids=()):
 
 
 def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False,
-                          extra_meta=None, keep_junk=False):
+                          extra_meta=None, keep_junk=False, prefer_base=False):
     """把详情 jd 并入列表导出（口径一：默认只保留有 JD 的岗位）。
 
     - 每条 job 追加 `jd` 字段（有详情时）
@@ -580,12 +580,11 @@ def _merge_jd_into_export(target_path, details, base=None, keep_without_jd=False
         details: 详情记录列表（每条含 job_id/jd）
         base: target 不存在时的基础列表 dict（如 --input 模式）
         keep_without_jd: True 时保留无 JD 岗位（仅标注）
-
-    Returns:
-        (kept, dropped) 或 None（无法处理时）
+        prefer_base: True 时**忽略 target 已有内容、以 base 为全量候选**
+            （交付物重建用：否则原地重建会只更新旧交付物里的岗位，新岗位永远进不来）
     """
     data = None
-    if target_path and os.path.exists(target_path):
+    if target_path and os.path.exists(target_path) and not prefer_base:
         try:
             with open(target_path, encoding="utf-8") as f:
                 data = json.load(f)
