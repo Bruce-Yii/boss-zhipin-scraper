@@ -120,6 +120,12 @@ class RunStateTests(IsolatedEnvMixin):
         self.assertEqual(payload["state"], "unknown")
         self.assertTrue(payload["stale"])
 
+    def test_write_disabled_under_tests_without_explicit_path(self):
+        """测试进程里默认不写真实状态文件；显式 BOSS_RUN_STATE_PATH 才写。"""
+        self.assertFalse(self.module._write_disabled())  # setUp 显式给了路径
+        os.environ.pop("BOSS_RUN_STATE_PATH", None)
+        self.assertTrue(self.module._write_disabled())
+
 
 class BriefTests(IsolatedEnvMixin):
 

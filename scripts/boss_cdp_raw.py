@@ -2967,8 +2967,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
             print(progress)
         run_state_update(phase="detail", detail_total=len(jobs),
                          detail_done=idx + 1, detail_ok=serial_ok,
-                         detail_failed=sum(serial_reasons.values()),
-                         message=f"详情 {idx + 1}/{len(jobs)}（成功 {serial_ok}）")
+                         detail_failed=sum(serial_reasons.values()))
 
         # 批次冷却（#78）：每 COOL_EVERY 条主动冷却（+可选 Chrome 重启）；
         # 重启后共享会话失效 → 置空待下岗位重建
@@ -3539,9 +3538,7 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 run_state_update(phase="detail", detail_total=total,
                                  detail_done=visible_completed,
                                  detail_ok=parallel_ok,
-                                 detail_failed=sum(parallel_reasons.values()),
-                                 message=f"详情 {visible_completed}/{total}"
-                                         f"（成功 {parallel_ok}）")
+                                 detail_failed=sum(parallel_reasons.values()))
                 if output_path and completed % write_every == 0:
                     persist()
                 # 批次冷却（#78）：并行模式仅冷却（不重启，避免池重建）
