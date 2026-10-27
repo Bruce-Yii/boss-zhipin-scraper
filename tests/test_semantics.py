@@ -495,6 +495,30 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual([j["job_id"] for j in kept], ["a"])
         self.assertEqual(dropped["noise"], 1)
 
+    def test_ai_company_generic_product_role_kept(self):
+        """AI 公司的通用产品岗（JD 没写 AI 词）也算 AI 非技术岗（2026-10-28）。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "产品实习生", "company_name": "蓝芯机器人",
+             "company_industry": "智能硬件", "jd": "协助产品经理整理需求与竞品"},
+            {"job_id": "b", "title": "产品实习生", "company_name": "某贸易公司",
+             "company_industry": "贸易/进出口", "jd": "协助整理订单与报关资料"},
+        ])
+        self.assertEqual([j["job_id"] for j in kept], ["a"])
+        self.assertEqual(len(dropped["items"]), 1)
+
+    def test_ai_company_non_target_roles_still_dropped(self):
+        """AI 公司里的零售/结构/外呼等非目标岗仍删。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "零售运营实习生", "company_name": "智能精准学",
+             "company_industry": "人工智能", "jd": "门店零售日常运营"},
+            {"job_id": "b", "title": "结构助理实习生", "company_name": "梅卡曼德机器人",
+             "company_industry": "人工智能", "jd": "协助机械结构设计"},
+            {"job_id": "c", "title": "运营实习生（外呼）", "company_name": "中关村科金",
+             "company_industry": "人工智能", "jd": "外呼回访客户"},
+        ])
+        self.assertEqual(kept, [])
+        self.assertEqual(len(dropped["items"]), 3)
+
     def test_robotics_ai_domain_terms_count_as_evidence(self):
         """机器人/具身智能/智能硬件等 AI 领域词也算 AI 证据（2026-10-28 扩词表）。"""
         kept, dropped = self._drop([

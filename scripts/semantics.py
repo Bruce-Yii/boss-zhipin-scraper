@@ -303,6 +303,16 @@ _TECH_TITLE_TERMS = ("开发", "研发", "算法", "测试", "工程师", "运�
 # 非 AI 的运营/电商/客服类标题词（2026-10-27 口径：猎 AI 非技术岗，
 # 这类标题与目标无关，列表阶段直接毙，不进详情；标题带 AI/产品的走正常判定）。
 _NONAI_OPS_TITLE_TERMS = ("运营", "新媒体", "电商", "直播", "主播", "客服")
+# 公司侧 AI 信号（2026-10-28 复查误杀）：AI 公司里的通用产品/运营岗，
+# JD 未必写 AI 词，但岗位就是 AI 产品线的非技术岗（如蓝芯机器人产品实习生、
+# 成都福客 AI 产品实习生）。只认"人工智能"行业或公司名带 AI/机器人/具身智能。
+_AI_COMPANY_NAME_RE = re.compile(
+    r"(?i)(人工智能|机器人|具身智能|智能体|(?<![a-z])ai(?![a-z]))")
+_AI_COMPANY_INDUSTRIES = ("人工智能",)
+# 公司 AI 信号豁免时要排除的非目标标题（技术/硬件/门店/外呼等）
+_AI_COMPANY_TITLE_EXCLUDES = ("结构", "工艺", "硬件", "电子", "维修", "拍摄",
+                              "客服", "外呼", "零售", "门店", "直播", "主播",
+                              "剪辑", "设计", "销售", "bd", "新媒体")
 # 标题/JD/技能里算"有 AI 证据"的核心词。刻意比 AI_DIRECTION_TERMS 窄：
 # "算法/向量/CV"这类泛技术词不算（地质算法岗 JD 通篇算法但无 AI 产品语义，
 # 不能靠它留下来）。
@@ -369,6 +379,23 @@ def _has_ai_evidence(*texts):
     jd = texts[1] if len(texts) > 1 else ""
     skills = texts[2] if len(texts) > 2 else ""
     return bool(_ai_evidence_level(title, jd, skills))
+
+
+def _company_ai_signal(job):
+    """公司侧 AI 信号：AI 公司的通用非技术岗，JD 未必写 AI 词也算目标岗。
+
+    2026-10-28 复查误杀：蓝芯机器人「产品实习生」、成都福客人工智能
+    「产品实习生」这类 JD 没写 AI 词，但岗位就是 AI 产品线的非技术岗，
+    此前按"跨行业噪声"删掉了。
+    """
+    if not isinstance(job, dict):
+        return False
+    industry = str(job.get("company_industry")
+                   or job.get("brand_industry_name") or "")
+    if any(word in industry for word in _AI_COMPANY_INDUSTRIES):
+        return True
+    name = str(job.get("company_name") or "")
+    return bool(_AI_COMPANY_NAME_RE.search(name))
 
 
 def _title_jd_match(job, head=160):
@@ -469,6 +496,14 @@ def drop_junk_jobs(jobs):
             # 新媒体标题无例外：即使带 AI/产品也与目标无关（2026-10-27 口径）。
             reason = "新媒体岗（标题）"
             dropped["noise"] += 1
+        elif (_company_ai_signal(job)
+                and any(w in low for w in _ROLE_WORDS)
+                and not any(w in low for w in _AI_COMPANY_TITLE_EXCLUDES)):
+            # 2026-10-28 复查：AI 公司（行业=人工智能 / 公司名带 AI/机器人/具身）
+            # 的通用产品/运营/解决方案/项目岗，JD 没写 AI 词也是 AI 产品线的
+            # 非技术岗——此前被当"跨行业噪声"删了（蓝芯机器人产品实习生等）。
+            kept.append(job)
+            continue
         elif (any(w in low for w in _NONAI_OPS_TITLE_TERMS)
                 and "产品" not in low
                 and not _ai_evidence_level(title, str(job.get("jd") or ""),
