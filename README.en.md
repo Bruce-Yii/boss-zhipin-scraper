@@ -366,6 +366,7 @@ python3 scripts/boss_cdp_raw.py --daily --json
 - Scraping/pipeline writes state to `~/.boss-zhipin-scraper/run_state.json` (phase, done/total, successes, budget, last heartbeat); stale heartbeats are flagged (`stale` = likely finished or stuck).
 - Daily routines are captured as **multiple templates** under `~/.boss-zhipin-scraper/profiles/*.json` (example: `data/daily_profile.example.json`). `--daily` with no name **lists templates only**; `--daily <name>` runs one. Templates support `source=db|artifacts` (artifacts = union of the artifact directory, covering historical JDs from before the DB existed) and `exclude_job_ids_file` (manual exclusion list).
 - The `--brief` job-title breakdown is based on the **current newest deliverable** (already filtered, with JD), plus `+added/-removed/kept` versus the previous version of the same scope.
+- **On `code 37 "environment anomaly"`**: this means `__zp_stoken__` was flagged (same mechanism as boss-agent-cli #453). Run `--warm-stoken` (open a real search page and wait 75s so the platform's security JS re-issues the token); a login probe hitting 37 now **auto-warms and re-probes once**. Run the scrape immediately after warming — do not insert extra probes.
 
 ## File Structure
 

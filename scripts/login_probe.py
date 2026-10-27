@@ -2,13 +2,43 @@
 
 import json
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from enum import Enum
 from urllib.parse import urlencode
 
 log = logging.getLogger("boss_cdp")
 
+# code 37 = 安全令牌 __zp_stoken__ 被标记（boss-agent-cli PR #453 机理）：
+# 真实浏览搜索页、等安全 JS 重跑即可换发新令牌；先自愈一次，仍失败才停手。
+WARM_TRIGGER_CODES = (37,)
+WARM_FORCE_ENV = "BOSS_WARM_STOKEN_FORCE"
+WARM_DISABLE_ENV = "BOSS_NO_WARM_STOKEN"
+
 _IMPORTER_NAMES = []
+
+def _warm_disabled():
+    """测试进程默认不做 75s 热刷新（除非显式 FORCE）。"""
+    if os.environ.get(WARM_FORCE_ENV) == "1":
+        return False
+    if os.environ.get(WARM_DISABLE_ENV) == "1":
+        return True
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
+def _warm_once(cdp_port):
+    """执行一次 stoken 热刷新；失败只告警（不抛）。"""
+    try:
+        try:
+            from scripts import warm_stoken as _warm
+        except ImportError:  # pragma: no cover - 直接运行脚本时走此分支
+            import warm_stoken as _warm
+        return bool(_warm.warm_stoken(cdp_port=cdp_port).get("ok"))
+    except Exception as exc:  # 旁路自愈能力，失败不影响原有判定
+        log.warning("stoken 热刷新异常（已跳过）：%s", exc)
+        return False
+
 
 def _record_importer():
     try:
@@ -258,6 +288,16 @@ def check_login_state(cdp_port=None, use_cache=True):
             and _core().time.time() - cached["ts"] < _core().LOGIN_PROBE_CACHE_TTL:
         return cached["result"]
     result = _probe_login_state_uncached(cdp_port)
+    # code 37 = stoken 被标记，可自愈：真实搜索页等待安全 JS 重跑后重探一次。
+    # 只做一次（不循环），仍失败就返回，保持"风控不硬怼"的红线。
+    if (result.status is LoginProbeStatus.RESTRICTED
+            and result.code in WARM_TRIGGER_CODES
+            and not _warm_disabled()):
+        print("♻️  检测到 code 37（安全令牌被标记）→ 真实搜索页热刷新后重探一次")
+        if _warm_once(cdp_port):
+            result = _probe_login_state_uncached(cdp_port)
+        else:
+            print("⚠️  stoken 热刷新未成功，按原判定处理")
     cached["ts"] = _core().time.time()
     cached["result"] = result
     return result

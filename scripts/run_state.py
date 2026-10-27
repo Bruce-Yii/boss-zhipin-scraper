@@ -109,7 +109,11 @@ def start(phase="preflight", **fields):
 
 
 def update(**fields):
-    """合并更新状态；**没有进行中的运行就不写**（避免只读/单测路径凭空造状态）。"""
+    """合并更新状态；**没有进行中的运行就不写**（避免只读/单测路径凭空造状态）。
+
+    更新语义上就是"还在跑"：除非显式传 ``running``（finish 传 False），
+    否则强制回填 ``running=True``——防止父子进程写同一文件时把运行中误标成结束。
+    """
     if _write_disabled():
         return {}
     with _lock:
@@ -117,6 +121,8 @@ def update(**fields):
         if not payload:
             return {}
         payload.update(fields)
+        if "running" not in fields:
+            payload["running"] = True
         payload["updated_at"] = _now_iso()
         _write(payload)
         return payload
