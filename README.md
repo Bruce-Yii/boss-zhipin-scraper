@@ -334,6 +334,21 @@ uv run boss-summary --top 15
 uv run boss-deliverable --from-db --city 杭州 --recruit-type intern,campus --target 杭州实习校招.json
 ```
 
+## 产物层统一清单
+
+产物目录长期混着列表快照、详情快照、交付物、sidecar（当前 150+ 个文件），"哪份最新、哪个口径对应哪份"以前只能按 mtime 猜。`--artifacts` 把目录扫成一份统一清单（**文件仍是唯一真相，清单是可随时重建的缓存**）：
+
+```bash
+python3 scripts/boss_cdp_raw.py --artifacts          # 人看：分类 + 每个口径最新交付物 + 时效
+python3 scripts/boss_cdp_raw.py --artifacts --json   # agent 用：纯 JSON（stdout 无横幅）
+```
+
+- 分类：`list` / `details` / `deliverable` / `ledger`（pending、failures、quarantine）；
+- `summary`：各类数量、总字节、active/archived/superseded/stale、raw 原始响应数；
+- `latest`：最新列表、最新详情、**每个口径的最新交付物**；
+- 交付物构建时盖 `artifact.scope_key`：同口径重复重建时新的为 `active`、旧的自动标 `superseded`（只打标，不移动文件；归档仍用 `--archive`）；
+- 清单只读：不删、不改、不移动任何产物；缓存损坏会自动重建。
+
 ## 文件结构
 
 ```
@@ -351,6 +366,7 @@ boss-zhipin-scraper/
 │   ├── export_contract.py# 导出契约、递归脱敏、原子写
 │   ├── db_store.py       # SQLite schema / run lineage
 │   ├── build_deliverable.py # 交付物重建（文件 / SQLite 原材料库两种口径）
+│   ├── artifacts.py      # 产物层统一清单（分类/口径/取代/时效）
 │   ├── audit.py          # 风险事件审计
 │   └── job_summary.py    # 抓取后摘要 + 提示词
 └── requirements.txt

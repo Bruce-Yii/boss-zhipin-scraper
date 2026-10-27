@@ -160,6 +160,23 @@ python3 scripts/build_deliverable.py \
 
 `--from-db` 与 `--lists/--details` 二选一；两种模式都走同一条生产合并路径（口径一剔无 JD、删库、派生字段、验收、CSV）。库只读打开、不改库；产物 `meta.source` 记录库路径与口径。历史产物复现仍用文件模式（`--lists/--details/--old`）。
 
+### 产物层统一清单（会话起手先看这个）
+
+产物目录里同时有列表快照、详情快照、交付物、sidecar，**不要按 mtime 猜最新文件**。`--artifacts` 把整个目录扫成一份清单（文件仍是唯一真相，清单是可随时重建的缓存）：
+
+```bash
+# agent 用：纯 JSON（stdout 无横幅），含 summary / latest / artifacts 三段
+python3 "$SCRIPT_PATH" --artifacts --json
+
+# 人看：分类 + 同口径最新交付物 + 最新列表/详情 + 时效
+python3 "$SCRIPT_PATH" --artifacts
+```
+
+- `summary`：各类数量、总字节、active/archived/superseded/stale、raw 原始响应数；
+- `latest`：最新列表、最新详情、**每个口径的最新交付物**——选文件优先用它；
+- 交付物带 `artifact.scope_key`：同一口径重复重建时新的为 `active`、旧的自动标 `superseded`（只打标，不移动文件），避免"到底哪份是当前版"；
+- 归档仍显式 `--archive`；清单不删、不改、不移动任何产物。
+
 ## 开发与测试隔离
 
 单元测试必须完全 mock，不连接真实 Chrome、不发 BOSS 请求。提交前运行目标测试和隔离守卫；守卫会在临时 HOME 下执行完整 discovery，并检查 profile、run lock、cooldown、audit、runner trace 未被改写：

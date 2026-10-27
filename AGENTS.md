@@ -10,7 +10,7 @@
 2. **运行态**（此刻能不能跑）：`python scripts/boss_cdp_raw.py --status` → CDP 端口/Chrome profile/互斥锁/熔断冷却；登录态用 `--check` 探测
 3. **缓存态**（攒下的数据）：`~/.boss-zhipin-scraper/job-result/`（列表/详情/pending/archive），文件自带 meta（`format_version`/`mode`/`observed_jobs`/`exhausted`/`jd_coverage`）
 
-接管三步：`--status` 看全局 → `--check` 确认可跑 → `--list-results`/`--verify` 看数据是否完整。
+接管流程：`--status` 看全局 → `--check` 确认可跑 → `--artifacts --json` 看产物清单（最新列表/详情、每个口径的最新交付物、取代关系）→ 再用 `--verify` 复核数据完整性。
 
 ## 执行与汇报约定
 
@@ -26,13 +26,15 @@ scripts/boss_cdp_raw.py   # 核心：抓取 + CLI 编排（CDP/链路/CLI）
 scripts/ratelimit.py      # 稳定纯逻辑：BurstThrottle + 令牌桶 + 自适应限速
 scripts/export_contract.py# 稳定纯逻辑：契约/递归脱敏/口径一/原子写
 scripts/db_store.py       # 稳定纯逻辑：SQLite schema、只读统计、run lineage
+scripts/artifacts.py      # 产物层统一：目录清单、口径、取代关系、时效（--artifacts）
+scripts/build_deliverable.py # 交付物重建（文件 / SQLite 原材料库 --from-db）
 scripts/audit.py          # 稳定纯逻辑：风险事件审计、递归脱敏、轮转锁
 scripts/job_summary.py    # 抓取结果 → Markdown 求职分析摘要
 data/city_codes.json      # 全量城市码表（300+ 城市，外置；见下）
 tests/test_chrome_setup.py    # unittest，全 mock，不依赖真实 Chrome/网络
 tests/test_job_summary.py     # 摘要测试
 tests/test_isolation_guard.py  # 受保护运行态隔离守卫
-pyproject.toml            # hatchling 打包；入口 boss-scraper / boss-summary
+pyproject.toml            # hatchling 打包；入口 boss-scraper / boss-summary / boss-deliverable / boss-artifacts
 requirements.txt          # requests + websocket-client + pandas + matplotlib
 SKILL.md / README(.en).md / CHANGELOG.md / CONTRIBUTING.md
 ```
