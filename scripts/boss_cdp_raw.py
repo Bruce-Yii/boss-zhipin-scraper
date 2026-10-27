@@ -1436,6 +1436,7 @@ def wait_for_login(cdp_port=DEFAULT_CDP_PORT, timeout=DEFAULT_LOGIN_TIMEOUT, int
     logged_in = False
     attempt = 0
     transient_errors = 0
+    warmed_once = False
     print(f"等待 BOSS 登录完成（最长 {timeout}s）", end="", flush=True)
     try:
         while time.time() <= deadline:
@@ -1459,6 +1460,14 @@ def wait_for_login(cdp_port=DEFAULT_CDP_PORT, timeout=DEFAULT_LOGIN_TIMEOUT, int
                     print("\n✅ 已检测到 BOSS 登录态，且接口返回明文薪资")
                     return True
                 if result.status is LoginProbeStatus.RESTRICTED:
+                    if (result.code in WARM_TRIGGER_CODES and not warmed_once
+                            and not _warm_disabled()):
+                        # code 37 = stoken 被标记：真实搜索页热刷新后重探一次（不循环）
+                        print(f"\n♻️  {describe_login_probe_result(result)}"
+                              " → stoken 热刷新后重探一次")
+                        warmed_once = True
+                        _warm_once(cdp_port)
+                        continue
                     print(f"\n❌ {describe_login_probe_result(result)}，已停止登录探测")
                     print("   当前问题不是尚未登录；请先在浏览器中完成验证或稍后再试")
                     return False
@@ -3822,6 +3831,10 @@ def build_parser():
                              help="日常作业：按模板（默认目录 ~/.boss-zhipin-scraper/profiles/）"
                                   "跑 列表+详情 → 重建交付物 → 今日简报；不带值只列模板；"
                                   "--json 输出最终 JSON（过程看 --progress）")
+    g_tool_excl.add_argument("--warm-stoken", nargs="?", const=75, type=int,
+                             default=None, metavar="SECONDS",
+                             help="stoken 热刷新：真实打开搜索页等待安全 JS（默认 75s）——"
+                                  "code 37 '环境异常'自愈；登录探测命中 37 时也会自动做一次")
     g_tool_excl.add_argument("--report", nargs="?", const="__latest__", default=None,
                              metavar="LIST.json",
                              help="跑后战报：列表→删库→详情→导出的整条漏斗、新增、失败原因、产物与预算（缺省取最新列表）")
@@ -3900,7 +3913,7 @@ def _cli_uses_outer_run_lock(args):
     # 与 run_cli 的分派顺序保持一致：靠前模式优先，避免组合参数误入抓取路径。
     if (args.check or args.status or args.verify or args.list_results
             or args.artifacts or args.progress or args.brief
-            or args.daily is not None
+            or args.daily is not None or args.warm_stoken is not None
             or args.archive is not None or args.report is not None):
         return False
     if args.batch:
@@ -4105,6 +4118,9 @@ def _run_cli_impl(p, args):
         config_path = None if args.daily == "__default__" else args.daily
         sys.exit(run_daily(config_path, result_dir=DEFAULT_RESULT_DIR,
                            as_json=args.json))
+    if getattr(args, "warm_stoken", None) is not None:
+        summary = warm_stoken(seconds=args.warm_stoken)
+        sys.exit(0 if summary.get("ok") else 1)
     _apply_verbosity(args.verbose, args.quiet)
     # 一键模式
     if getattr(args, "quick", False):
@@ -4765,8 +4781,17 @@ except Exception:
     import sys as _sys
     _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
     import login_probe as _login_probe_mod
-for _n in ['LoginProbeStatus','LoginProbeResult','classify_login_probe_response','is_logged_in_search_response','build_login_probe_url','probe_login_state','describe_login_probe_result','check_login_state','_probe_login_state_uncached']:
+for _n in ['LoginProbeStatus','LoginProbeResult','classify_login_probe_response','is_logged_in_search_response','build_login_probe_url','probe_login_state','describe_login_probe_result','check_login_state','_probe_login_state_uncached','_warm_disabled','_warm_once','WARM_TRIGGER_CODES']:
     globals()[_n] = getattr(_login_probe_mod, _n)
+
+try:
+    from . import warm_stoken as _warm_stoken_mod
+except Exception:
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import warm_stoken as _warm_stoken_mod
+warm_stoken = _warm_stoken_mod.warm_stoken
 
 try:
     from . import risk as _risk_mod

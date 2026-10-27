@@ -23,6 +23,8 @@
 
 日常跑法固化成**多套模板**：`~/.boss-zhipin-scraper/profiles/*.json`（示例 `data/daily_profile.example.json`）。`--daily` 不带名字只列模板、不执行；`--daily <模板名>` 才跑（列表+详情→重建交付物→简报）。模板可配 `source=db|artifacts`（artifacts=产物目录并集，覆盖库启用前的历史 JD）与 `exclude_job_ids_file`（人工剔除名单）。汇报契约=成果数字+含义+待拍板，不贴命令、不讲实现，数字必须来自 `--progress`/`--brief` 真实输出。
 
+**code 37「环境异常」= `__zp_stoken__` 被标记**（boss-agent-cli PR #453）：真实打开搜索页等安全 JS 重跑可换令牌。用 `--warm-stoken [秒]`（默认 75）；登录探测命中 37 会自动热刷新+重探一次；热刷新后**紧接着**跑抓取，中间不要插 `--check`/重复探测；仍 37 改 `--list-mode passive` 或等冷却。
+
 ## 执行与汇报约定
 
 - **完整计时**：汇报任务耗时的起点取「用户下达命令 / 任务开始」的时刻，终点取任务完成（含产出校验），给出完整墙钟时长；轮询类长任务另附内部阶段耗时。

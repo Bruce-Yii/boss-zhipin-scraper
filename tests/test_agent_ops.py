@@ -126,6 +126,19 @@ class RunStateTests(IsolatedEnvMixin):
         os.environ.pop("BOSS_RUN_STATE_PATH", None)
         self.assertTrue(self.module._write_disabled())
 
+    def test_update_keeps_running_true(self):
+        """更新语义=仍在跑：即使文件被并发写坏成 running=false，也回填 true。"""
+        self.module.start(phase="list", keywords_total=11)
+        with open(self.state_path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        data["running"] = False
+        with open(self.state_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+        self.module.update(phase="detail", detail_total=10)
+        state = self.module.read()
+        self.assertTrue(state["running"])
+        self.assertEqual(state["phase"], "detail")
+
 
 class BriefTests(IsolatedEnvMixin):
 
