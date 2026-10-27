@@ -177,6 +177,29 @@ python3 "$SCRIPT_PATH" --artifacts
 - 交付物带 `artifact.scope_key`：同一口径重复重建时新的为 `active`、旧的自动标 `superseded`（只打标，不移动文件），避免"到底哪份是当前版"；
 - 归档仍显式 `--archive`；清单不删、不改、不移动任何产物。
 
+### Agent 会话内问答（ask：只读、对话原生）
+
+**用户始终在 Agent 会话里使用本工具，直接问就行，不要教用户敲命令。** 用户问"今天怎么样 / 这条为什么没上榜 / 跟昨天比呢 / 有哪些模板 / 最近批次健康吗"，agent 调 `scripts/ask.py` 的只读 API 回答，再用它返回的 `human`（一屏 markdown）转述；`data` 是给 agent 下钻用的结构化字段。**不做 xlsx/固定报告文件/Web 页面，human 不是交付物。**
+
+```python
+from scripts import ask
+payload = ask.run_ask("status", {}, result_dir=None)   # 统一入口，命令见下
+print(ask.format_answer(payload, as_json=False))       # False=human 一屏；True=纯 JSON
+```
+
+| 命令 | 回答什么 |
+|------|----------|
+| `status` | 一屏状态：最近运行/阶段/进度、今日新增与详情、日预算、锁/冷却/CDP、每口径最新交付物（较上版 +−）、异常、待拍板 |
+| `today` | 今日简报（run 数、新增岗位与岗位结构、详情/预算、交付物、异常） |
+| `why` | 某 `job_id` 为什么留/删：所在交付物、`dropped_junk` 原因、无 JD 剔除、人工剔除名单、规则版本、DB 来源批次、证据词；拿不到就列出查过哪些来源，**不编造原因** |
+| `diff` | 最新交付物 vs 同口径上一版：逐条 +新增/−消失/保持，附原因（规则剔除/无 JD/上版被剔除后保留/下架待定） |
+| `templates` | 日常模板：名称/别名/口径/交付物/上次构建/上次运行/剔除名单 |
+| `batches` | 批次健康度（`batch_health.jsonl` 最近 N 条；文件可能还没生成） |
+
+- 统一信封 `{"ok", "command", "data", "human", "errors"}`；`ok=False` 表示这条问题答不了（未知命令/查无此岗/核心来源缺失），缺文件/缺库/旧 DB schema 只进 `errors` 降级，**任何情况都不抛异常**——agent 可直接展示 `human`；
+- 纯只读：不抓取、不发 BOSS 请求、不写产物/清单/DB；`status` 默认只探测本机 CDP 端口，登录态仍需 `--check`（会发一次 BOSS 请求，别在问问题时乱跑）；
+- CLI 的 `--ask` 只是编排层对 agent 的内部转发（`--ask status --json` 输出纯 JSON），不是给用户的新命令面；用户侧永远只有"对话提问"。
+
 ### 长任务：后台跑 + 轮询进度 + 定时汇报（agent 必读）
 
 用户只能看到工具调用，**看不到命令 stdout 的实时滚动**。所有长任务（抓取、`--daily`）必须按这个规程来，否则用户会长时间"什么都看不到"：

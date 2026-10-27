@@ -367,6 +367,11 @@ python3 scripts/boss_cdp_raw.py --daily --json
 - Daily routines are captured as **multiple templates** under `~/.boss-zhipin-scraper/profiles/*.json` (example: `data/daily_profile.example.json`). `--daily` with no name **lists templates only**; `--daily <name>` runs one. Templates support `source=db|artifacts` (artifacts = union of the artifact directory, covering historical JDs from before the DB existed) and `exclude_job_ids_file` (manual exclusion list).
 - The `--brief` job-title breakdown is based on the **current newest deliverable** (already filtered, with JD), plus `+added/-removed/kept` versus the previous version of the same scope.
 - **On `code 37 "environment anomaly"`**: this means `__zp_stoken__` was flagged (same mechanism as boss-agent-cli #453). Run `--warm-stoken` (open a real search page and wait 75s so the platform's security JS re-issues the token); a login probe hitting 37 now **auto-warms and re-probes once**. Run the scrape immediately after warming — do not insert extra probes.
+- **Agent-session Q&A**: the user only asks in-conversation ("how is today", "why is this job excluded", "diff vs yesterday"); the agent calls internal read-only APIs. `--ask status|today|why <job_id>|diff [scope]|templates` and `--batches` are agent forwarding entry points, not a user-facing command surface. Implementation: `scripts/ask.py`.
+- **Asset store v3**: `boss.db` gains normalized `jobs` columns (title/company/salary/recruit_type/state/content_hash/canonical_id), `job_versions` (JD/title/salary history), `job_flags`, and `runs` metadata (scope/template/ruleset_version/budget); `scripts/assets_migrate.py --json` performs idempotent migration/backfill (`--dry-run` is read-only). Deliverable meta records `ruleset_version`.
+- **Resume**: the detail queue is persisted to `~/.boss-zhipin-scraper/pending/details_<run_id>.json`; after an interruption or budget cutoff the next same-scope run resumes first and never refetches existing JDs. Daily templates support `max_details` (alias `detail_budget`) to cap per-scope detail fetches.
+
+## File Structure
 
 ## File Structure
 

@@ -512,6 +512,8 @@ def build(args):
     # 产物层统一：交付物自带身份/口径/输入血缘，清单据此排序与取代
     extra["artifact"] = _artifact_meta(args, recruit_types, db_stats,
                                        artifacts_stats, len(excluded))
+    # 口径可回溯：每条交付物记录规则版本，--why/审计据此解释"为什么留/删"。
+    extra["ruleset_version"] = semantics.RULESET_VERSION
     res = ec._merge_jd_into_export(target, list(details.values()), base=base,
                                    keep_junk=args.keep_junk,
                                    extra_meta=extra or None,

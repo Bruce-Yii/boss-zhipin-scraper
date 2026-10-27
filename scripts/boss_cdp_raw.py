@@ -329,6 +329,525 @@ DEFAULT_CDP_DATA_DIR = os.path.expanduser("~/.boss-zhipin-scraper/chrome-profile
 DEFAULT_RESULT_DIR = os.path.expanduser("~/.boss-zhipin-scraper/job-result")
 
 # ============================================================
+# 详情断点续跑队列（跨 run）
+# ============================================================
+# 详情阶段前把"本次待抓"的 job_id 落盘到仓库外
+# ``<state_dir>/pending/details_<run_id>.json``，每成功一条原子移除；进程被**强杀**
+# （finally 不执行）时文件仍在，下次同 scope（keyword + city + recruit_type）启动
+# 优先消费这份断点，并跳过 DB/详情文件里已有 JD 的岗位。文件只含 job_id 与
+# keyword/city/created_at 等元数据，**不含 securityId/cookie**（红线）。
+DETAIL_PENDING_DIR_ENV = "BOSS_PENDING_DIR"
+DETAIL_PENDING_FORMAT_VERSION = 1
+BATCH_HEALTH_PATH_ENV = "BOSS_BATCH_HEALTH_PATH"
+BATCH_HEALTH_FILENAME = "batch_health.jsonl"
+# 最近一次详情阶段统计（本 run 成功/失败/完成条数），供批次健康度落盘
+LAST_DETAIL_RUN_STATS = {}
+
+
+def _runtime_state_dir():
+    """仓库外状态目录（``BOSS_STATE_DIR`` 可覆盖；**运行期取**，测试改 HOME 即隔离）。"""
+    return os.environ.get(STATE_DIR_ENV) or os.path.expanduser(
+        "~/.boss-zhipin-scraper")
+
+
+def runtime_state_writes_disabled():
+    """测试进程默认**不写**真实运行态（断点/批次健康度），防污染真实状态目录。
+
+    显式给了状态目录/路径覆盖（``BOSS_STATE_DIR``/``BOSS_PENDING_DIR``/
+    ``BOSS_BATCH_HEALTH_PATH``）= 调用方明确指定目标，照写（测试自己的临时目录）。
+    生产运行时子进程不会 import unittest/pytest。
+    """
+    if (os.environ.get(BATCH_HEALTH_PATH_ENV)
+            or os.environ.get(DETAIL_PENDING_DIR_ENV)
+            or os.environ.get(STATE_DIR_ENV)):
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
+def detail_pending_dir():
+    """详情断点续跑目录（``BOSS_PENDING_DIR`` 优先，其次 ``<state_dir>/pending``）。"""
+    explicit = os.environ.get(DETAIL_PENDING_DIR_ENV)
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    return os.path.join(_runtime_state_dir(), "pending")
+
+
+def detail_scope_key(keyword, city, recruit_type=""):
+    """详情续跑/批次健康度的 scope 键：``城市|招聘类型|关键词``。
+
+    recruit_type 允许逗号分隔（intern,campus），归一化为排序后的小写集合，
+    保证 ``intern,campus`` 与 ``campus,intern`` 视为同一 scope。
+    """
+    types = ",".join(sorted({
+        part.strip().lower() for part in str(recruit_type or "").split(",")
+        if part.strip()}))
+    return "|".join(str(part or "").strip()
+                    for part in (city, types or "all", keyword))
+
+
+def detail_pending_path(run_id):
+    """本 run 的断点文件路径（run_id 为空时用 uuid 兜底）。"""
+    name = str(run_id or "").strip() or uuid.uuid4().hex
+    return os.path.join(detail_pending_dir(), f"details_{name}.json")
+
+
+def _read_detail_pending(path):
+    """读一个断点文件；缺失/损坏/版本不认识返回 None（旁路状态，不影响抓取）。"""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        version = int(data.get("format_version") or 0)
+    except (TypeError, ValueError):
+        return None
+    if 0 < version > DETAIL_PENDING_FORMAT_VERSION:
+        return None  # 未来格式，按不认识处理（不猜语义）
+    return data
+
+
+def _iter_detail_pending_files():
+    """枚举断点目录下的 ``details_*.json``（目录缺失返回空）。"""
+    directory = detail_pending_dir()
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    return [os.path.join(directory, name) for name in names
+            if name.startswith("details_") and name.endswith(".json")]
+
+
+def load_detail_resume(scope_key):
+    """读取同 scope 的历史断点 → ``(ordered_job_ids, files)``。
+
+    多个断点文件（强杀残留/并发兜底）按 created_at 排序后按序合并去重；
+    ``files`` 供调用方在新断点写好后清理（先写新再删旧，任何时刻强杀都不丢进度）。
+    """
+    entries = []
+    for path in _iter_detail_pending_files():
+        data = _read_detail_pending(path)
+        if not data or data.get("scope_key") != scope_key:
+            continue
+        ids = [str(item).strip() for item in (data.get("job_ids") or [])
+               if str(item).strip()]
+        entries.append((str(data.get("created_at") or ""),
+                        os.path.basename(path), path, ids))
+    entries.sort()
+    ordered, files = [], []
+    for _, _, path, ids in entries:
+        files.append(path)
+        for job_id in ids:
+            if job_id not in ordered:
+                ordered.append(job_id)
+    return ordered, files
+
+
+class DetailResumeQueue:
+    """详情断点续跑队列：每成功一条原子落盘，进程被强杀也不丢未完成清单。"""
+
+    def __init__(self, run_id="", scope_key="", keyword="", city="",
+                 recruit_type="", job_ids=None, path=None):
+        self.path = path or detail_pending_path(run_id)
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.data = {
+            "format_version": DETAIL_PENDING_FORMAT_VERSION,
+            "run_id": str(run_id or ""),
+            "scope_key": str(scope_key or ""),
+            "keyword": str(keyword or ""),
+            "city": str(city or ""),
+            "recruit_type": str(recruit_type or ""),
+            "created_at": now,
+            "updated_at": now,
+            "job_ids": [str(item) for item in (job_ids or []) if str(item)],
+        }
+
+    @property
+    def pending_ids(self):
+        return list(self.data.get("job_ids") or [])
+
+    @property
+    def is_empty(self):
+        return not self.data.get("job_ids")
+
+    def mark_done(self, job_id):
+        """成功抓完一条 → 原子移除并落盘；返回是否发生变化。"""
+        key = str(job_id or "").strip()
+        if not key or key not in self.data.get("job_ids", []):
+            return False
+        self.data["job_ids"] = [item for item in self.data["job_ids"]
+                                if item != key]
+        self.save()
+        return True
+
+    def save(self):
+        """原子写回断点；清单空时删除文件（全部完成）。返回文件路径或 None。"""
+        if runtime_state_writes_disabled():
+            return None
+        self.data["updated_at"] = datetime.now().astimezone().isoformat(
+            timespec="seconds")
+        if self.is_empty:
+            self._remove()
+            return None
+        try:
+            _atomic_write_json(self.path, self.data)
+        except OSError as exc:  # 断点是旁路可观测性，写失败不影响抓取
+            log.warning("详情断点写盘失败 %s: %s", self.path, exc)
+            return None
+        return self.path
+
+    def finish(self):
+        """结束/中断后的收尾：未完成保留，全部完成删文件。"""
+        return self.save()
+
+    def _remove(self):
+        try:
+            if os.path.exists(self.path):
+                os.remove(self.path)
+        except OSError:
+            pass
+
+
+def order_jobs_for_resume(jobs, queue_ids):
+    """把断点里的 job_id 排到最前面（按断点顺序），其余保持列表原序。"""
+    wanted = {str(job_id): index for index, job_id in enumerate(queue_ids or [])}
+    if not wanted:
+        return list(jobs)
+    head, tail = [], []
+    for job in jobs:
+        job_id = str(job.get("job_id") or "") if isinstance(job, dict) else ""
+        if job_id in wanted:
+            head.append((wanted[job_id], job))
+        else:
+            tail.append(job)
+    head.sort(key=lambda item: item[0])
+    return [job for _, job in head] + tail
+
+
+def prepare_detail_resume_queue(list_data, run_id="", recruit_type="",
+                                existing_ids=None):
+    """合并同 scope 历史断点与本次待抓 → 新 run 的断点队列（写盘并清理旧断点）。
+
+    - 只保留**当前列表里存在**的 job_id（断点文件只有 id，没有链接就抓不了，
+      不在本次列表里的旧 id 视为过期，放弃）；
+    - 已有 JD 的 job_id（DB/详情文件，``existing_ids``）不写进队列；
+    - 历史断点里的 job_id 排在最前面（跨 run 续跑优先级）。
+    """
+    jobs = [job for job in (list_data.get("jobs") or [])
+            if isinstance(job, dict)]
+    job_ids = []
+    for job in jobs:
+        job_id = str(job.get("job_id") or "").strip()
+        if job_id and job_id not in job_ids:
+            job_ids.append(job_id)
+    known = {str(item).strip() for item in (existing_ids or set())
+             if str(item).strip()}
+    keyword = str(list_data.get("keyword") or "")
+    city = str(list_data.get("city") or "")
+    scope_key = detail_scope_key(keyword, city, recruit_type)
+    previous_ids, previous_files = load_detail_resume(scope_key)
+    current_ids = [job_id for job_id in job_ids if job_id not in known]
+    queue_ids = []
+    for job_id in list(previous_ids) + current_ids:
+        if job_id not in job_ids or job_id in known or job_id in queue_ids:
+            continue
+        queue_ids.append(job_id)
+    queue = DetailResumeQueue(run_id=run_id, scope_key=scope_key,
+                              keyword=keyword, city=city,
+                              recruit_type=recruit_type, job_ids=queue_ids)
+    queue.save()
+    # 新断点写成功后再删旧断点：任何时刻被强杀，最多多一份旧文件（下次合并去重）
+    if runtime_state_writes_disabled():
+        return queue
+    for old_path in previous_files:
+        if os.path.abspath(old_path) == os.path.abspath(queue.path):
+            continue
+        try:
+            os.remove(old_path)
+        except OSError:
+            pass
+    return queue
+
+
+# ============================================================
+# 批次健康度（每次 run 结束 append 一行 → batch_health.jsonl）
+# ============================================================
+BATCH_HEALTH_FIELDS = (
+    "run_id", "started_at", "finished_at", "mode", "keyword", "city",
+    "scope_key", "list_pages", "detail_ok", "detail_failed", "budget_used",
+    "risk_events", "status",
+)
+
+
+def batch_health_path():
+    """批次健康度 JSONL 路径（``BOSS_BATCH_HEALTH_PATH`` 优先 → ``<state_dir>``）。"""
+    explicit = os.environ.get(BATCH_HEALTH_PATH_ENV)
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    return os.path.join(_runtime_state_dir(), BATCH_HEALTH_FILENAME)
+
+
+def append_batch_health(record):
+    """追加一条批次健康度（append-only JSONL；best-effort，绝不中断主流程）。"""
+    if not isinstance(record, dict):
+        return False
+    if runtime_state_writes_disabled():
+        return False
+    path = batch_health_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+            handle.flush()
+    except OSError as exc:
+        log.warning("批次健康度写入失败 %s: %s", path, exc)
+        return False
+    return True
+
+
+def read_batch_health(limit=None):
+    """读最近 ``limit`` 条批次健康度（``None``=全部；坏行跳过，按文件顺序）。"""
+    path = batch_health_path()
+    records = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if isinstance(item, dict):
+                    records.append(item)
+    except OSError:
+        return []
+    if limit is not None and limit >= 0:
+        return records[-limit:]
+    return records
+
+
+def format_batches(records, path=None, total=None):
+    """批次健康度的人类可读输出（一屏）。"""
+    path = path or batch_health_path()
+    total = len(records) if total is None else total
+    if not records:
+        return f"还没有批次健康度记录（{path}）"
+    icons = {"success": "✅", "failed": "❌", "aborted": "⏹"}
+    lines = [f"\n=== 批次健康度（最近 {len(records)} 条 / 累计 {total} 条）===",
+             f"  记录：{path}"]
+    for record in records:
+        status = str(record.get("status") or "?")
+        icon = icons.get(status, "❔")
+        scope = str(record.get("scope_key") or "").strip() or (
+            f"{record.get('city', '')}·{record.get('keyword', '')}")
+        lines.append(
+            f"  {icon} {record.get('finished_at') or record.get('started_at') or '?'}"
+            f"  {status:<8}{scope}")
+        lines.append(
+            f"      列表 {record.get('list_pages', 0)} 页"
+            f"｜详情 {record.get('detail_ok', 0)} 成功"
+            f"/{record.get('detail_failed', 0)} 失败"
+            f"｜预算 {record.get('budget_used', 0)}"
+            f"｜风控 {record.get('risk_events', 0)}"
+            f"｜run={str(record.get('run_id') or '')[:12]}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def run_batches(limit=10, as_json=False):
+    """``--batches [N]`` 实现：只读最近 N 条批次健康度（不拿 run 锁/不发网络）。"""
+    path = batch_health_path()
+    all_records = read_batch_health(None)
+    selected = all_records[-limit:] if limit else []
+    if as_json:
+        print(json.dumps({
+            "ok": True,
+            "path": path,
+            "total": len(all_records),
+            "count": len(selected),
+            "batches": selected,
+        }, ensure_ascii=False, indent=2))
+    else:
+        print(format_batches(selected, path, len(all_records)))
+    return 0
+
+
+def _audit_event_count():
+    """当前审计事件条数（批次健康度统计本 run 风控事件用；失败返回 0）。"""
+    try:
+        return len(_audit.read_events())
+    except (OSError, TypeError, ValueError):
+        return 0
+
+
+def _begin_batch_health(args):
+    """live run 开始：在 args 上挂状态，结束时由 _finalize_batch_health 落一行。"""
+    LAST_DETAIL_RUN_STATS.clear()
+    run_id = str(getattr(args, "_run_id", "") or uuid.uuid4().hex)
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    args._run_id = run_id
+    args._batch_health_audit_baseline = _audit_event_count()
+    args._batch_health = {
+        "run_id": run_id,
+        "started_at": started_at,
+        "finished_at": None,
+        "mode": "input" if getattr(args, "input", None) else "single",
+        "keyword": str(getattr(args, "keyword", "") or ""),
+        "city": str(getattr(args, "city", "") or ""),
+        "scope_key": detail_scope_key(
+            getattr(args, "keyword", ""), getattr(args, "city", ""),
+            getattr(args, "recruit_type", "")),
+        "list_pages": 0,
+        "detail_ok": 0,
+        "detail_failed": 0,
+        "budget_used": 0,
+        "risk_events": 0,
+        "status": "running",
+    }
+    return args._batch_health
+
+
+def _update_batch_health(args, **fields):
+    """更新本 run 的批次健康度字段（run 结束前随时可更新；未开始的 run 忽略）。"""
+    record = getattr(args, "_batch_health", None)
+    if not isinstance(record, dict):
+        return record
+    for key, value in fields.items():
+        if key in BATCH_HEALTH_FIELDS:
+            record[key] = value
+    return record
+
+
+def _settle_batch_health(args, code):
+    """按退出码/状态给本 run 的批次健康度定终态（幂等：已定终态不再改）。"""
+    record = getattr(args, "_batch_health", None)
+    if not isinstance(record, dict) or record.get("status") != "running":
+        return
+    if code in (0, None, "success"):
+        record["status"] = "success"
+    elif code == 130 or code == "aborted":
+        record["status"] = "aborted"
+    else:
+        record["status"] = "failed"
+
+
+def _finalize_batch_health(args):
+    """run 收尾（成功/失败/中断都走这里）：补齐统计并 append 一行。"""
+    record = getattr(args, "_batch_health", None)
+    if not isinstance(record, dict) or record.get("_written"):
+        return None
+    record["finished_at"] = datetime.now().astimezone().isoformat(
+        timespec="seconds")
+    if record.get("status") == "running":
+        _settle_batch_health(args, "failed")
+    try:
+        budget_state = _daily_budget.read_state()
+        record["budget_used"] = int(budget_state.get("detail") or 0)
+    except (OSError, TypeError, ValueError):
+        pass
+    baseline = int(getattr(args, "_batch_health_audit_baseline", 0) or 0)
+    record["risk_events"] = max(_audit_event_count() - baseline, 0)
+    record["_written"] = True
+    payload = {key: record.get(key) for key in BATCH_HEALTH_FIELDS}
+    payload["list_pages"] = int(payload.get("list_pages") or 0)
+    payload["detail_ok"] = int(payload.get("detail_ok") or 0)
+    payload["detail_failed"] = int(payload.get("detail_failed") or 0)
+    payload["budget_used"] = int(payload.get("budget_used") or 0)
+    payload["risk_events"] = int(payload.get("risk_events") or 0)
+    append_batch_health(payload)
+    return payload
+
+
+def _load_ask_module():
+    """懒加载交互层 ``scripts.ask``（未就绪返回 None，不阻塞 CLI）。"""
+    try:
+        from scripts import ask as ask_module
+    except ImportError:
+        try:
+            import ask as ask_module
+        except ImportError:
+            return None
+    return ask_module
+
+
+def run_ask_command(tokens, result_dir=None, as_json=False):
+    """``--ask status|today|templates|diff`` / ``--ask why <job_id>`` 只读分派。
+
+    只读：不拿 run 锁、不发网络请求；全部数据来自 scripts.ask 的只读接口。
+    ``--json`` 时 stdout 必须是纯 JSON。返回退出码（CLI 误用/交互层不可用 = 2）。
+    """
+    if not isinstance(tokens, (list, tuple)) or not tokens:
+        print("❌ --ask 需要子命令：status / today / templates / diff / why <job_id>",
+              file=sys.stderr)
+        return 2
+    command = str(tokens[0]).strip().lower()
+    rest = [str(item).strip() for item in tokens[1:]]
+    if command not in ("status", "today", "templates", "diff", "why"):
+        print(f"❌ 未知 --ask 子命令：{command}"
+              "（可选：status / today / templates / diff / why <job_id>）",
+              file=sys.stderr)
+        return 2
+    payload_args = {}
+    if command == "why":
+        if len(rest) != 1 or not rest[0]:
+            print("❌ 用法：--ask why <job_id>", file=sys.stderr)
+            return 2
+        payload_args = {"job_id": rest[0]}
+    elif command == "diff" and rest:
+        # 对话里常问"跟昨天比，杭州这一套呢"：允许带一个口径子串。
+        if len(rest) != 1 or not rest[0]:
+            print("❌ 用法：--ask diff [口径子串]", file=sys.stderr)
+            return 2
+        payload_args = {"scope_key": rest[0]}
+    elif rest:
+        print(f"❌ --ask {command} 不接受额外参数：{' '.join(rest)}",
+              file=sys.stderr)
+        return 2
+    module = _load_ask_module()
+    if module is None:
+        print("❌ --ask 交互层不可用：缺少 scripts/ask.py（请先完成交互层）",
+              file=sys.stderr)
+        return 2
+    runner = getattr(module, "run_ask", None)
+    if not callable(runner):
+        print("❌ scripts/ask.py 未提供 run_ask(command, args, result_dir=...)",
+              file=sys.stderr)
+        return 2
+    try:
+        result = runner(command, payload_args,
+                        result_dir=result_dir or DEFAULT_RESULT_DIR)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+        print(f"❌ --ask {command} 执行失败：{_scrub_secrets(str(exc))}",
+              file=sys.stderr)
+        return 2
+    if not isinstance(result, dict):
+        print("❌ --ask 返回结果格式非法（应为 dict）", file=sys.stderr)
+        return 2
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        text = ""
+        formatter = getattr(module, "format_answer", None)
+        if callable(formatter):
+            try:
+                text = str(formatter(result, as_json=False) or "")
+            except (KeyError, TypeError, ValueError):
+                text = ""
+        if not text:
+            text = str(result.get("human") or "")
+        if not text:
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+        print(text)
+    return 0 if result.get("ok", True) else 1
+
+
+# ============================================================
 # securityId 受限 sidecar（P1 双通道策略；红线例外，严格约束）
 # 仅 securityId（每岗短期接口令牌，**非登录凭据**）允许落盘，且：仓库外 +
 # 600 权限 + 短 TTL + run 结束即删 + 绝不进导出/日志/git。登录 cookie 绝不落盘。
@@ -2554,7 +3073,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
                    cdp_port=DEFAULT_CDP_PORT, fmt="json", pending_ids=None,
                    concurrency=DEFAULT_CONCURRENCY, list_output_path=None,
                    security_map=None, max_seconds=None, preloaded_details=None,
-                   detail_channel="auto", channel_stats=None):
+                   detail_channel="auto", channel_stats=None,
+                   resume_queue=None):
     """抓取详情。
 
     Args:
@@ -2567,12 +3087,21 @@ def scrape_details(list_data, max_details=None, output_path=None,
             （P4c-2 断点续抓）：并入 results 并计入 existing_ids，既免重抓，
             又保证这些岗位仍带 JD 进入本 run 导出（避免"跳过即丢 JD"）。
         channel_stats: 可选可变 dict；按本 run 成功结果累计 api/encrypt/dom/panel。
+        resume_queue: 可选 DetailResumeQueue——跨 run 断点续跑队列：断点里的
+            job_id 优先抓，每成功一条原子移除，结束/中断保留未完成项。
     """
     if channel_stats is None:
         channel_stats = {}
     else:
         channel_stats.clear()
+    LAST_DETAIL_RUN_STATS.clear()
+    LAST_DETAIL_RUN_STATS.update(ok=0, failed=0, done=0)
     jobs = list_data.get("jobs", [])
+    if resume_queue is not None:
+        resume_ids = resume_queue.pending_ids
+        if resume_ids:
+            jobs = order_jobs_for_resume(jobs, resume_ids)
+            print(f"♻️  详情断点续跑：{len(resume_ids)} 个同 scope 未完成岗位优先抓取")
     if max_details:
         jobs = jobs[:max_details]
     if not output_path:
@@ -2646,7 +3175,8 @@ def scrape_details(list_data, max_details=None, output_path=None,
             jobs, list_data, output_path, cdp_port, fmt,
             existing_ids=existing_ids, pending_ids=pending,
             existing_results=results, list_output_path=list_output_path,
-            max_seconds=max_seconds, channel_stats=channel_stats)
+            max_seconds=max_seconds, channel_stats=channel_stats,
+            resume_queue=resume_queue)
 
     # encrypt 通道目前仅串行实现（同 panel 策略）：并发请求降为串行
     if detail_channel == "encrypt" and concurrency > 1:
@@ -2656,8 +3186,7 @@ def scrape_details(list_data, max_details=None, output_path=None,
     # 并发模式（--concurrency > 1）：worker 只取数，主线程统一合并/渐进落盘/pending
     if concurrency > 1:
         print(f"⚡ 并发详情抓取（--concurrency {concurrency}，全局限速 + 错误率自适应降速）")
-        results, pending = _scrape_details_parallel(
-            jobs, cdp_port, concurrency,
+        parallel_kwargs = dict(
             existing_ids=existing_ids, pending_ids=pending,
             existing_results=results, output_path=output_path,
             list_output_path=list_output_path,
@@ -2668,6 +3197,13 @@ def scrape_details(list_data, max_details=None, output_path=None,
             max_seconds=max_seconds,
             detail_channel=detail_channel,
             channel_stats=channel_stats)
+        # 断点队列仅在存在时透传（保持被测试/外部 monkeypatch 的旧签名兼容）
+        if resume_queue is not None:
+            parallel_kwargs["resume_queue"] = resume_queue
+        results, pending = _scrape_details_parallel(
+            jobs, cdp_port, concurrency, **parallel_kwargs)
+        if resume_queue is not None:
+            resume_queue.finish()
         if pending:
             print(resume_hint(pending, output_path))
         if results:
@@ -2763,6 +3299,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
         # 跨运行跳过已抓详情（pending 中的例外，待重试）
         if job_id and job_id in existing_ids and job_id not in pending:
             print(f"[{idx+1}/{len(jobs)}] 跳过已抓详情: {company} - {title}")
+            # 断点续跑：JD 已在库/文件里 → 该岗位从断点队列移除（不重复占位）
+            if resume_queue is not None:
+                resume_queue.mark_done(job_id)
             continue
 
         t0 = time.time()
@@ -2884,6 +3423,9 @@ def scrape_details(list_data, max_details=None, output_path=None,
             # 抓取成功：从待重试清单移除
             if job_id:
                 pending.pop(job_id, None)
+                # 断点续跑：成功一条立即原子移除（进程被强杀也不重复抓已抓 JD）
+                if resume_queue is not None:
+                    resume_queue.mark_done(job_id)
             if detail.get("tags"):
                 print(f"  技能: {', '.join(detail['tags'])}")
             if detail.get("boss_active_status"):
@@ -3030,6 +3572,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
         if detail_raw_path:
             print(f"详情原文已保存（详情侧保真核对）: {detail_raw_path}")
     LAST_DETAIL_RAW_PATH = detail_raw_path
+    LAST_DETAIL_RUN_STATS.update(
+        ok=serial_ok, failed=sum(serial_reasons.values()), done=serial_done)
+    if resume_queue is not None:
+        resume_queue.finish()
     return results
 
 
@@ -3082,7 +3628,8 @@ def _scrape_one_detail_via_panel(job, ws, sid):
 def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
                               existing_ids=None, pending_ids=None,
                               existing_results=None, list_output_path=None,
-                              max_seconds=None, channel_stats=None):
+                              max_seconds=None, channel_stats=None,
+                              resume_queue=None):
     """右面板 JD 串行抓取：开一个停靠的真实搜索页，逐岗点卡片读面板（零新增请求）。"""
     if channel_stats is None:
         channel_stats = {}
@@ -3133,6 +3680,8 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             seen_links.add(link)
             if job_id and job_id in existing_ids and job_id not in pending:
                 print(f"[{idx + 1}/{len(jobs)}] 跳过已抓详情: {job.get('title', '')}")
+                if resume_queue is not None:
+                    resume_queue.mark_done(job_id)
                 continue
             print(f"[{idx + 1}/{len(jobs)}] {job.get('boss_name', '')} - {job.get('title', '')}")
             incr_request("detail")
@@ -3166,6 +3715,8 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
                 ok += 1
                 if job_id:
                     pending.pop(job_id, None)
+                    if resume_queue is not None:
+                        resume_queue.mark_done(job_id)
                 print(f"  JD: {len(result['detail'].get('jd', ''))} 字")
                 if output_path:
                     _atomic_write_export_json(output_path, results)
@@ -3216,6 +3767,10 @@ def _scrape_details_via_panel(jobs, list_data, output_path, cdp_port, fmt,
             _close_api_tab(session)
         if dom_session is not None:
             _close_api_tab(dom_session)
+    LAST_DETAIL_RUN_STATS.update(
+        ok=ok, failed=sum(reasons.values()), done=done)
+    if resume_queue is not None:
+        resume_queue.finish()
     if output_path and results:
         _atomic_write_export_json(output_path, results)
     save_pending_ids(output_path, pending)
@@ -3238,7 +3793,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                              write_every=5, list_output_path=None,
                              keyword="", city="", security_map=None,
                              city_code="", max_seconds=None,
-                             detail_channel="dom", channel_stats=None):
+                             detail_channel="dom", channel_stats=None,
+                             resume_queue=None):
     """并发详情抓取：worker 只取数，主线程统一合并、渐进写盘与 pending。
 
     Args:
@@ -3296,6 +3852,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             continue
         seen_links.add(link)
         if job_id and job_id in existing_ids and job_id not in pending:
+            # 断点续跑：JD 已在库/文件里 → 从断点队列移除（不重复占位）
+            if resume_queue is not None:
+                resume_queue.mark_done(job_id)
             continue
         todo.append(job)
 
@@ -3329,6 +3888,8 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
             results.append(result["detail"])
             if job_id:
                 pending.pop(job_id, None)
+                if resume_queue is not None:
+                    resume_queue.mark_done(job_id)
             return
         reason = result["reason"]
         if reason in ("invalid_detail", "stopped", "skipped_today",
@@ -3401,6 +3962,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
         for _ in range(concurrency):
             dom_pool.put(None)
 
+    # 本 run 详情统计（异常/中断也要有值 → 先初始化，批次健康度会读）
+    completed = parallel_ok = parallel_stopped = 0
+    parallel_reasons = {}
     pool = ThreadPoolExecutor(max_workers=concurrency)
     try:
         # 有界提交窗口：同时持有的在飞任务不超过 concurrency*2（背压），
@@ -3586,6 +4150,9 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                 print(f"  🧷 DOM tab 复用：{dom_tabs} 个 tab 共 {dom_navs} 次导航")
         if output_path:
             persist()
+    LAST_DETAIL_RUN_STATS.update(
+        ok=parallel_ok, failed=sum(parallel_reasons.values()),
+        done=max(completed - parallel_stopped, 0))
     return results, pending
 
 
@@ -3747,7 +4314,7 @@ def build_parser():
                           help="输出格式")
     g_output.add_argument("--json", action="store_true",
                           help="只读/作业命令输出机器可读 JSON（配合 --artifacts / "
-                               "--progress / --brief / --daily；默认文本）")
+                               "--progress / --brief / --daily / --ask / --batches；默认文本）")
     g_output.add_argument("--merge", default=None,
                           help="合并已有 JSON 文件 (按 job_id 去重)")
     g_output.add_argument("--db", nargs="?", const=DEFAULT_DB_PATH, default=None,
@@ -3826,6 +4393,15 @@ def build_parser():
     g_tool_excl.add_argument("--brief", action="store_true",
                              help="今日简报（新增岗位/岗位结构/详情/预算/交付物/异常；"
                                   "只读；--json 机器可读）")
+    g_tool_excl.add_argument("--ask", nargs="+", default=None, metavar="命令",
+                             help="只读问答入口（agent 会话用）：status / today / "
+                                  "templates / diff / why <job_id>；只读、不拿 run 锁、"
+                                  "不发网络请求；--json 输出纯 JSON（需要 scripts/ask.py）")
+    g_tool_excl.add_argument("--batches", nargs="?", const=10, default=None, type=int,
+                             metavar="N",
+                             help="最近 N 次 run 的批次健康度（默认 10；读 "
+                                  "~/.boss-zhipin-scraper/batch_health.jsonl；只读、"
+                                  "不拿 run 锁；--json 机器可读）")
     g_tool_excl.add_argument("--daily", nargs="?", const="__default__", default=None,
                              metavar="模板名|CONFIG.json",
                              help="日常作业：按模板（默认目录 ~/.boss-zhipin-scraper/profiles/）"
@@ -3913,6 +4489,7 @@ def _cli_uses_outer_run_lock(args):
     # 与 run_cli 的分派顺序保持一致：靠前模式优先，避免组合参数误入抓取路径。
     if (args.check or args.status or args.verify or args.list_results
             or args.artifacts or args.progress or args.brief
+            or args.ask or args.batches is not None
             or args.daily is not None or args.warm_stoken is not None
             or args.archive is not None or args.report is not None):
         return False
@@ -3961,7 +4538,11 @@ def _abort_db_run_state(args):
 
 def _run_cli_with_db_cleanup(p, args):
     try:
-        return _run_cli_impl(p, args)
+        result = _run_cli_impl(p, args)
+    except SystemExit as exc:
+        # 退出码 → 批次健康度终态（0=成功 / 130=人工中断 / 其他=失败）
+        _settle_batch_health(args, exc.code)
+        raise
     except BaseException:
         _abort_db_run_state(args)
         # 长任务异常中断：状态文件不能永远停在 running
@@ -3972,9 +4553,14 @@ def _run_cli_with_db_cleanup(p, args):
                                       message="进程异常中断（见日志/审计）")
             except Exception:
                 pass
+        _settle_batch_health(args, "aborted")
         raise
+    else:
+        _settle_batch_health(args, 0)
+        return result
     finally:
         _close_db_run_state(args)
+        _finalize_batch_health(args)
 
 
 RUNNER_TRACE_PATH = os.path.expanduser("~/.boss-zhipin-scraper/runner_trace.jsonl")
@@ -4102,11 +4688,15 @@ def _run_cli_impl(p, args):
         read_only.append("progress")
     if getattr(args, "brief", False):
         read_only.append("brief")
+    if getattr(args, "ask", None):
+        read_only.append("ask")
+    if getattr(args, "batches", None) is not None:
+        read_only.append("batches")
     if getattr(args, "daily", None) is not None:
         read_only.append("daily")
     if getattr(args, "json", False) and not read_only:
-        print("--json 需要配合 --artifacts / --progress / --brief / --daily 使用",
-              file=sys.stderr)
+        print("--json 需要配合 --artifacts / --progress / --brief / --daily "
+              "/ --ask / --batches 使用", file=sys.stderr)
         sys.exit(2)
     if "progress" in read_only:
         sys.exit(run_progress(as_json=args.json))
@@ -4114,6 +4704,13 @@ def _run_cli_impl(p, args):
         sys.exit(run_brief(result_dir=DEFAULT_RESULT_DIR, as_json=args.json))
     if "artifacts" in read_only:
         sys.exit(run_artifacts(result_dir=DEFAULT_RESULT_DIR, as_json=args.json))
+    if "ask" in read_only:
+        sys.exit(run_ask_command(args.ask, result_dir=DEFAULT_RESULT_DIR,
+                                 as_json=args.json))
+    if "batches" in read_only:
+        if args.batches <= 0:
+            p.error(f"--batches 必须是正整数: {args.batches}")
+        sys.exit(run_batches(limit=args.batches, as_json=args.json))
     if "daily" in read_only:
         config_path = None if args.daily == "__default__" else args.daily
         sys.exit(run_daily(config_path, result_dir=DEFAULT_RESULT_DIR,
@@ -4339,6 +4936,10 @@ def _run_cli_impl(p, args):
         val = getattr(args, key)
         if val:
             filters[key] = val
+
+    # 批次健康度：live run 从此刻起记录，结束时（成功/失败/中断）由
+    # _run_cli_with_db_cleanup → _finalize_batch_health 追加一行到 batch_health.jsonl。
+    _begin_batch_health(args)
 
     # SQLite run lineage：先落 started run，再进行列表/详情等任何抓取。
     # #175：--db **默认启用**默认库（跨 run 新增/消失对账）；--no-db 关闭；
@@ -4575,6 +5176,17 @@ def _run_cli_impl(p, args):
                                   city=list_data.get("city") or args.city)
         print(f"🗄️  列表入库: 新增 {ins}，更新 {upd}")
 
+    # 批次健康度：列表阶段元数据（--input 模式没有列表抓取 → list_pages=0）
+    _list_keyword = list_data.get("keyword") or args.keyword
+    _list_city = list_data.get("city") or args.city
+    _update_batch_health(
+        args,
+        keyword=_list_keyword,
+        city=_list_city,
+        scope_key=detail_scope_key(_list_keyword, _list_city,
+                                   getattr(args, "recruit_type", "")),
+        list_pages=0 if args.input else max(int(args.pages or 0), 0))
+
     # 抓详情
     details = None
     channel_stats = {}
@@ -4605,6 +5217,22 @@ def _run_cli_impl(p, args):
             # 供给 × 额度协调检查：把"今天的真实产出上限"算出来（额度 ≠ 供给）
             # 详情前筛（用户 2026-10-23）：先筛标题垃圾再抓详情，供给口径按筛后算。
             prefilter_detail_queue(list_data, keep_junk=args.keep_junk)
+            # 详情断点续跑（跨 run）：详情输出路径 + 已有 JD 集合先在主线程算好，
+            # 同 scope 上次未完成的 job_id 排到最前；成功一条移除、全部完成删文件。
+            detail_output_path = args.detail_output or default_output_path("details")
+            existing_detail_ids = load_existing_detail_ids(detail_output_path)
+            if preloaded_details:
+                existing_detail_ids |= {
+                    str(item.get("job_id")) for item in preloaded_details
+                    if isinstance(item, dict) and item.get("job_id")}
+            detail_resume_queue = prepare_detail_resume_queue(
+                list_data, run_id=getattr(args, "_run_id", ""),
+                recruit_type=getattr(args, "recruit_type", ""),
+                existing_ids=existing_detail_ids)
+            if detail_resume_queue.pending_ids:
+                print(f"♻️  详情断点续跑：同 scope 待抓 "
+                      f"{len(detail_resume_queue.pending_ids)} 个"
+                      f"（{detail_resume_queue.path}）")
             supply_info = _check_supply_vs_budget(list_data)
             sidecar_owned = None
             try:
@@ -4614,7 +5242,7 @@ def _run_cli_impl(p, args):
                     sidecar_owned = write_security_sidecar(
                         list_data.get("output_path"), list_data.get("security_map"))
                 details = scrape_details(
-                    list_data, args.max_details, args.detail_output,
+                    list_data, args.max_details, detail_output_path,
                     cdp_port=args.cdp_port, fmt=args.format,
                     concurrency=args.concurrency,
                     pending_ids=pending_ids,
@@ -4629,6 +5257,7 @@ def _run_cli_impl(p, args):
                     max_seconds=(args.max_seconds or None),
                     detail_channel=args.detail_channel,
                     channel_stats=channel_stats,
+                    resume_queue=detail_resume_queue,
                 )
             finally:
                 if sidecar_owned:
@@ -4687,6 +5316,13 @@ def _run_cli_impl(p, args):
 
     if db_state is not None:
         db_state["details"] = details
+
+    # 批次健康度：详情阶段统计（成功/失败条数；异常中断时由收尾兜底为已记录值）
+    _detail_stats = LAST_DETAIL_RUN_STATS or {}
+    _update_batch_health(
+        args,
+        detail_ok=int(_detail_stats.get("ok") or 0),
+        detail_failed=int(_detail_stats.get("failed") or 0))
 
     # 分析
     if args.analysis:
