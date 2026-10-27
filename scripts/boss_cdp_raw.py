@@ -3818,9 +3818,9 @@ def build_parser():
                              help="今日简报（新增岗位/岗位结构/详情/预算/交付物/异常；"
                                   "只读；--json 机器可读）")
     g_tool_excl.add_argument("--daily", nargs="?", const="__default__", default=None,
-                             metavar="CONFIG.json",
-                             help="日常作业：按配置（默认 ~/.boss-zhipin-scraper/daily.json）"
-                                  "跑 列表+详情 → 从库重建交付物 → 今日简报；"
+                             metavar="模板名|CONFIG.json",
+                             help="日常作业：按模板（默认目录 ~/.boss-zhipin-scraper/profiles/）"
+                                  "跑 列表+详情 → 重建交付物 → 今日简报；不带值只列模板；"
                                   "--json 输出最终 JSON（过程看 --progress）")
     g_tool_excl.add_argument("--report", nargs="?", const="__latest__", default=None,
                              metavar="LIST.json",

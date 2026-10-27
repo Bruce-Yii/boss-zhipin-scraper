@@ -21,7 +21,7 @@
 3. 每 10-15 分钟向用户汇报一次进度（阶段/完成总数/成功数/预算剩多少）；
 4. 结束后 `--brief`（`--json` 给 agent）汇报：今日新增、**岗位结构（岗位名→数量）**、详情/预算、交付物（路径/条数/较上版 +−）、异常、下一步。
 
-日常固定跑法固化在 `~/.boss-zhipin-scraper/daily.json`（示例 `data/daily_profile.example.json`），一句 `--daily` 跑完 列表+详情→重建交付物→简报。汇报契约=成果数字+含义+待拍板，不贴命令、不讲实现，数字必须来自 `--progress`/`--brief` 真实输出。
+日常跑法固化成**多套模板**：`~/.boss-zhipin-scraper/profiles/*.json`（示例 `data/daily_profile.example.json`）。`--daily` 不带名字只列模板、不执行；`--daily <模板名>` 才跑（列表+详情→重建交付物→简报）。模板可配 `source=db|artifacts`（artifacts=产物目录并集，覆盖库启用前的历史 JD）与 `exclude_job_ids_file`（人工剔除名单）。汇报契约=成果数字+含义+待拍板，不贴命令、不讲实现，数字必须来自 `--progress`/`--brief` 真实输出。
 
 ## 执行与汇报约定
 
@@ -45,7 +45,7 @@ scripts/daily.py          # 日常作业流水线（--daily；列表+详情→�
 scripts/audit.py          # 稳定纯逻辑：风险事件审计、递归脱敏、轮转锁
 scripts/job_summary.py    # 抓取结果 → Markdown 求职分析摘要
 data/city_codes.json      # 全量城市码表（300+ 城市，外置；见下）
-data/daily_profile.example.json # 日常作业配置示例（复制到 ~/.boss-zhipin-scraper/daily.json）
+data/daily_profile.example.json # 日常作业模板示例（复制到 ~/.boss-zhipin-scraper/profiles/）
 tests/test_chrome_setup.py    # unittest，全 mock，不依赖真实 Chrome/网络
 tests/test_job_summary.py     # 摘要测试
 tests/test_isolation_guard.py  # 受保护运行态隔离守卫

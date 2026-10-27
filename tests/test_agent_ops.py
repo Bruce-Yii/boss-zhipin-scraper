@@ -302,6 +302,47 @@ class DailyTests(IsolatedEnvMixin):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["stage"], "scrape")
 
+    def test_profiles_listing_and_name_resolution(self):
+        """多套模板：不带名字只列模板；按名字/路径选；重名报错。"""
+        profiles = os.path.join(self.dir, "profiles")
+        os.makedirs(profiles, exist_ok=True)
+        first = dict(self.config, name="杭州11词实习", city="杭州")
+        second = dict(first, name="上海AI实习", city="上海",
+                      deliverable="boss_jobs_上海.json")
+        write_json(os.path.join(profiles, "hz.json"), first)
+        write_json(os.path.join(profiles, "sh.json"), second)
+        old = os.environ.get("BOSS_DAILY_PROFILES_DIR")
+        os.environ["BOSS_DAILY_PROFILES_DIR"] = profiles
+        self.addCleanup(self._restore_profiles_env, old)
+        self.assertEqual(len(self.module.list_profiles()), 2)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = self.module.run_daily(None, as_json=True)
+        self.assertEqual(code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(len(payload["profiles"]), 2)
+        self.assertTrue(self.module.resolve_config("杭州11词实习").endswith("hz.json"))
+        self.assertTrue(self.module.resolve_config("sh").endswith("sh.json"))
+        with self.assertRaises(ValueError):
+            self.module.resolve_config("实习")  # 两个模板都含"实习" → 歧义
+
+    def _restore_profiles_env(self, old):
+        if old is None:
+            os.environ.pop("BOSS_DAILY_PROFILES_DIR", None)
+        else:
+            os.environ["BOSS_DAILY_PROFILES_DIR"] = old
+
+    def test_source_artifacts_argv(self):
+        """source=artifacts 时用产物并集重建，并带上排除名单。"""
+        cfg = self.module.load_config(self.config_path)
+        cfg["source"] = "artifacts"
+        cfg["exclude_job_ids_file"] = "~/exclude.json"
+        deliver = self.module.build_deliverable_argv(cfg, python="python",
+                                                     result_dir=self.dir)
+        self.assertIn("--from-artifacts", deliver)
+        self.assertNotIn("--from-db", deliver)
+        self.assertIn("--exclude-job-ids-file", deliver)
+
 
 if __name__ == "__main__":
     unittest.main()

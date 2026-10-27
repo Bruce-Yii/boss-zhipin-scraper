@@ -364,7 +364,7 @@ python3 scripts/boss_cdp_raw.py --daily --json
 ```
 
 - Scraping/pipeline writes state to `~/.boss-zhipin-scraper/run_state.json` (phase, done/total, successes, budget, last heartbeat); stale heartbeats are flagged (`stale` = likely finished or stuck).
-- The daily routine is captured in `~/.boss-zhipin-scraper/daily.json` (template: `data/daily_profile.example.json` — city/keywords/pages/recruit types/scope/deliverable filename); edit the config to change the daily run.
+- Daily routines are captured as **multiple templates** under `~/.boss-zhipin-scraper/profiles/*.json` (example: `data/daily_profile.example.json`). `--daily` with no name **lists templates only**; `--daily <name>` runs one. Templates support `source=db|artifacts` (artifacts = union of the artifact directory, covering historical JDs from before the DB existed) and `exclude_job_ids_file` (manual exclusion list).
 - The `--brief` job-title breakdown is based on the **current newest deliverable** (already filtered, with JD), plus `+added/-removed/kept` versus the previous version of the same scope.
 
 ## File Structure

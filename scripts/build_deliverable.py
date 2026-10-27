@@ -38,10 +38,11 @@ import sys
 from datetime import UTC, datetime
 
 try:
-    from scripts import db_store, semantics
+    from scripts import artifacts, db_store, semantics
     from scripts import export_contract as ec
 except ImportError:  # 直接 python scripts/build_deliverable.py 运行时
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import artifacts
     import db_store
     import export_contract as ec
     import semantics
@@ -59,6 +60,95 @@ def _load_jobs(path):
         jobs = data.get("jobs")
         return jobs if isinstance(jobs, list) else []
     return []
+
+
+def _load_payload(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def load_exclude_ids(path):
+    """读取排除名单（job_id）：JSON 数组 / {"job_ids": [...]} / 逗号或换行文本。"""
+    text = str(path or "").strip()
+    if not text:
+        return set()
+    full = os.path.abspath(os.path.expanduser(text))
+    with open(full, encoding="utf-8") as handle:
+        raw = handle.read()
+    ids = set()
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        values = data.get("job_ids") or data.get("exclude_job_ids") or []
+    elif isinstance(data, list):
+        values = data
+    else:
+        values = [part for part in raw.replace("\n", ",").split(",")]
+    for item in values or []:
+        jid = str(item or "").strip()
+        if jid:
+            ids.add(jid)
+    return ids
+
+
+def load_artifacts_scope(result_dir, city="", include_archived=True):
+    """从产物目录（列表/详情快照，含 archive）并集取候选与详情。
+
+    为什么要这个口径：DB 只从启用 `--db` 的那天开始积累，更早的 JD 只存在产物
+    文件里（实测文件并集比库多 31 条详情）。文件是唯一真相，库只是缓存；
+    本函数只读产物，不移动/不改文件。
+
+    返回 ``(jobs, details, stats)``；details 是含 jd 的 payload。
+    """
+    result_dir = os.path.abspath(os.path.expanduser(result_dir))
+    index = artifacts.build_index(result_dir, include_archive=include_archived,
+                                  stale_days=-1)
+    city_text = str(city or "").strip()
+    jobs = {}
+    files = {"lists": 0, "details": 0}
+    for entry in index.get("artifacts") or []:
+        if entry.get("kind") not in ("list", "deliverable"):
+            continue
+        payload = _load_payload(os.path.join(result_dir, entry["path"]))
+        if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+            continue
+        entry_city = str((entry.get("scope") or {}).get("city")
+                         or payload.get("city") or "").strip()
+        if city_text and entry_city and entry_city != city_text:
+            continue
+        files["lists"] += 1
+        for job in payload["jobs"]:
+            if isinstance(job, dict) and job.get("job_id"):
+                jobs.setdefault(str(job["job_id"]), job)
+    ids = set(jobs)
+    detail_map = {}
+    for entry in index.get("artifacts") or []:
+        if entry.get("kind") != "details":
+            continue
+        payload = _load_payload(os.path.join(result_dir, entry["path"]))
+        if not isinstance(payload, list):
+            continue
+        files["details"] += 1
+        for detail in payload:
+            if not isinstance(detail, dict):
+                continue
+            jid = str(detail.get("job_id") or "")
+            if jid in ids and str(detail.get("jd") or "").strip():
+                detail_map.setdefault(jid, detail)
+    stats = {
+        "result_dir": result_dir,
+        "jobs_in_files": len(jobs),
+        "details_with_jd": len(detail_map),
+        "files": files,
+        "include_archived": bool(include_archived),
+        "city": city_text,
+    }
+    return list(jobs.values()), list(detail_map.values()), stats
 
 
 def _collect_details(paths):
@@ -209,7 +299,8 @@ def _scope_key(args, recruit_types):
     return f"{city}|{types}|{label}"
 
 
-def _artifact_meta(args, recruit_types, db_stats):
+def _artifact_meta(args, recruit_types, db_stats, artifacts_stats=None,
+                   excluded_count=0):
     """构建时盖章（产物层统一清单据此识别交付物系列，不再靠文件名猜）。"""
     if db_stats is not None:
         inputs = {
@@ -218,6 +309,14 @@ def _artifact_meta(args, recruit_types, db_stats):
             "jobs_in_db": db_stats.get("jobs_in_db", 0),
             "jobs_selected": db_stats.get("jobs_selected", 0),
         }
+    elif artifacts_stats is not None:
+        inputs = {
+            "kind": "artifacts",
+            "result_dir": os.path.basename(str(artifacts_stats.get("result_dir") or "")),
+            "jobs_in_files": artifacts_stats.get("jobs_in_files", 0),
+            "details_with_jd": artifacts_stats.get("details_with_jd", 0),
+            "files": artifacts_stats.get("files") or {},
+        }
     else:
         inputs = {
             "kind": "files",
@@ -225,6 +324,8 @@ def _artifact_meta(args, recruit_types, db_stats):
             "details": [os.path.basename(str(p)) for p in (args.details or [])],
             "old": os.path.basename(str(args.old)) if args.old else "",
         }
+    if excluded_count:
+        inputs["excluded_job_ids"] = int(excluded_count)
     return {
         "kind": "deliverable",
         "format_version": 1,
@@ -241,6 +342,20 @@ def _artifact_meta(args, recruit_types, db_stats):
     }
 
 
+def _artifacts_stats_meta(stats, recruit_types, excluded_count=0):
+    return {
+        "kind": "artifacts",
+        "result_dir": stats.get("result_dir", ""),
+        "jobs_in_files": stats.get("jobs_in_files", 0),
+        "details_with_jd": stats.get("details_with_jd", 0),
+        "files": stats.get("files") or {},
+        "include_archived": stats.get("include_archived", True),
+        "city": stats.get("city", ""),
+        "recruit_types": sorted(recruit_types) if recruit_types else ["all"],
+        "excluded_job_ids": int(excluded_count),
+    }
+
+
 def build(args):
     """拼装并落盘，返回 (kept, exit_code)。"""
     try:
@@ -252,11 +367,17 @@ def build(args):
     if args.old and not os.path.exists(args.old):
         print(f"输入文件不存在：{args.old}")
         return 0, 2
+    try:
+        excluded = load_exclude_ids(args.exclude_job_ids_file)
+    except OSError as exc:
+        print(f"排除名单读取失败：{exc}")
+        return 0, 2
 
     db_stats = None
+    artifacts_stats = None
     if args.from_db:
-        if args.lists or args.details:
-            print("--from-db 与 --lists/--details 不能同时使用（二选一）")
+        if args.lists or args.details or args.from_artifacts:
+            print("--from-db 与 --lists/--details/--from-artifacts 不能同时使用")
             return 0, 2
         try:
             db_jobs, db_details, db_stats = load_db_scope(
@@ -289,6 +410,33 @@ def build(args):
             jid = str(detail.get("job_id") or "")
             if jid and str(detail.get("jd") or "").strip():
                 details[jid] = detail
+    elif args.from_artifacts:
+        if args.lists or args.details:
+            print("--from-artifacts 与 --lists/--details 不能同时使用")
+            return 0, 2
+        try:
+            art_jobs, art_details, artifacts_stats = load_artifacts_scope(
+                args.result_dir, city=args.city)
+        except (OSError, ValueError) as exc:
+            print(f"读取产物目录失败：{exc}")
+            return 0, 2
+        if not art_jobs:
+            print("产物目录没有匹配岗位（检查 --city）")
+            return 0, 2
+        pool = {}
+        for job in art_jobs:
+            if isinstance(job, dict) and job.get("job_id"):
+                pool[str(job["job_id"])] = job
+        details = {}
+        for detail in art_details:
+            if isinstance(detail, dict):
+                jid = str(detail.get("job_id") or "")
+                if jid and str(detail.get("jd") or "").strip():
+                    details[jid] = detail
+        print(f"产物并集: {artifacts_stats['jobs_in_files']} 个岗位"
+              f"（列表文件 {artifacts_stats['files']['lists']} / 详情文件 "
+              f"{artifacts_stats['files']['details']}）"
+              f"｜有 JD {artifacts_stats['details_with_jd']}｜含 archive")
     else:
         if not args.lists or not args.details:
             print("文件模式需要 --lists 和 --details（或改用 --from-db 从库重建）")
@@ -323,6 +471,12 @@ def build(args):
         jid = str(job.get("job_id") or "")
         if jid and jid not in details and str(job.get("jd") or "").strip():
             details[jid] = job
+    if excluded:
+        before = len(pool)
+        pool = {jid: job for jid, job in pool.items() if jid not in excluded}
+        details = {jid: detail for jid, detail in details.items()
+                   if jid not in excluded}
+        print(f"排除名单: {len(excluded)} 个 job_id → 候选 {before} → {len(pool)}")
     print(f"详情(JD): {len(details)}")
 
     # ---- 走生产合并路径 ----
@@ -340,8 +494,12 @@ def build(args):
         extra["scope"] = args.scope
     if db_stats is not None:
         extra["source"] = _db_stats_meta(db_stats, recruit_types)
+    elif artifacts_stats is not None:
+        extra["source"] = _artifacts_stats_meta(artifacts_stats, recruit_types,
+                                                len(excluded))
     # 产物层统一：交付物自带身份/口径/输入血缘，清单据此排序与取代
-    extra["artifact"] = _artifact_meta(args, recruit_types, db_stats)
+    extra["artifact"] = _artifact_meta(args, recruit_types, db_stats,
+                                       artifacts_stats, len(excluded))
     res = ec._merge_jd_into_export(target, list(details.values()), base=base,
                                    keep_junk=args.keep_junk,
                                    extra_meta=extra or None)
@@ -413,6 +571,12 @@ def main(argv=None):
                         default=None, metavar="PATH",
                         help="从 SQLite 原材料库重建（不带值用默认库；与 "
                              "--lists/--details 互斥。issue #184）")
+    parser.add_argument("--from-artifacts", action="store_true",
+                        help="从产物目录（列表/详情快照并集，含 archive）重建："
+                             "取全历史口径，库只从启用 --db 那天起算；只读产物")
+    parser.add_argument("--exclude-job-ids-file", default="",
+                        help="排除名单文件（JSON 数组 / {job_ids:[]} / 逗号文本）："
+                             "构建前从候选池剔除（如人工杂项清单）")
     parser.add_argument("--since", default="",
                         help="只保留该日期（YYYY-MM-DD）之后仍在列表里出现过的岗位"
                              "（按库内 updated_at，UTC；仅 --from-db 生效）")
@@ -450,6 +614,9 @@ def main(argv=None):
                         for p in args.details]
     if args.old and not os.path.isabs(args.old):
         args.old = os.path.join(args.result_dir, args.old)
+    if args.exclude_job_ids_file and not os.path.isabs(args.exclude_job_ids_file):
+        args.exclude_job_ids_file = os.path.join(args.result_dir,
+                                                 args.exclude_job_ids_file)
     try:
         _, code = build(args)
     except (OSError, ValueError) as exc:

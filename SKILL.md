@@ -193,21 +193,25 @@ python3 "$SCRIPT_PATH" --brief             # 今日简报（人看）
 python3 "$SCRIPT_PATH" --brief --json      # 今日简报（agent）
 ```
 
-### 日常作业（一句指令跑完一天）
+### 日常作业模板（可以有多套，用哪套必须明说）
 
-每天固定的跑法固化在 `~/.boss-zhipin-scraper/daily.json`（示例见 `data/daily_profile.example.json`；JSON 无行注释，用 `_comment` 字段写说明）：
+固化的跑法放 `~/.boss-zhipin-scraper/profiles/` 下，**一份模板一个 JSON 文件**（示例见 `data/daily_profile.example.json`；JSON 无行注释，用 `_comment` 字段写说明）。可以同时存在多套：不同关键词组/城市/口径各一份。
 
 ```bash
-# 列表+详情 → 从库重建该口径交付物 → 刷新产物清单 → 今日简报
+# 不带模板名：只列出现有模板（不会执行任何抓取）
 python3 "$SCRIPT_PATH" --daily
 
+# 明确指定模板（名字或文件路径）→ 列表+详情 → 重建该口径交付物 → 刷新清单 → 今日简报
+python3 "$SCRIPT_PATH" --daily 杭州11词实习-日常
+
 # 机器可读最终结果（过程仍看 --progress）
-python3 "$SCRIPT_PATH" --daily --json
+python3 "$SCRIPT_PATH" --daily 杭州11词实习-日常 --json
 ```
 
-- 配置字段：`city / keywords / pages / recruit_types / scope / scope_key / deliverable / filters / max_details`；
-- 交付物目标文件名固定（如 `boss_jobs_杭州实习_日常.json`），同 `scope_key` 重建时产物清单自动把旧版标 superseded；
-- 手工口径（如"干净版"剔除 19 条杂项）不在自动流水线里；要自动排除需在配置里另行约定。
+- 模板字段：`name / city / keywords / pages / recruit_types / filters / scope / scope_key / deliverable`；新增 `source`（`db`=只从 SQLite 原材料库，`artifacts`=产物目录并集，覆盖库启用前的历史 JD）与 `exclude_job_ids_file`（人工剔除名单，如杭州实习杂项 19 条）。
+- 多套模板并存时 `--daily` 不带名字只列模板，**不会默认挑一套跑**；名字有歧义会报错并列出候选。
+- 交付物目标文件名在模板里固定，同 `scope_key` 重建时产物清单自动把旧版标 superseded。
+- 模板里的 `source`/`exclude_job_ids_file` 决定口径：`artifacts` + 排除名单 = "所有历史产物里、过现行规则、去掉人工杂项"的全量口径。
 
 ### 日常汇报契约（用户定的）
 
