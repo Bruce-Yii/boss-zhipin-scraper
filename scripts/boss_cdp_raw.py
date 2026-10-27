@@ -1720,7 +1720,8 @@ def _scrape_list_impl(keyword, city_input, max_pages, filters, output_path,
     if list_mode == "passive" and not allow_dom_fallback:
         print("  ⚡ 被动捕获模式：导航真实搜索页 + 滚动，旁听页面自身请求（零注入 XHR）")
         prefetched_pages = _fetch_pages_passive(
-            cdp_port, keyword, city_code, max_pages, filters)
+            cdp_port, keyword, city_code, max_pages, filters,
+            raw_sink=raw_pages)
         if prefetched_pages is _PASSIVE_RISK:
             prefetched_risk = True
         elif prefetched_pages is None:

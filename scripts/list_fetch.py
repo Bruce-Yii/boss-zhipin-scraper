@@ -151,13 +151,16 @@ def _fetch_pages_parallel(cdp_port, keyword, city_code, pages, filters,
     return [out[p] for p in range(1, pages + 1)]
 
 
-def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
+def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters,
+                           raw_sink=None):
     """被动捕获多页列表（上游 #55 思路）：导航真实搜索页 + 滚动触发无限滚动，
     用 Network 域旁听页面自己发出的 joblist 响应，**零注入 XHR**，从而消除注入
     请求特征触发的 `code 37`。
 
     返回：[[page1 jobs], [page2 jobs], ...]（长度 = pages；已 map_api_jobs）。
     任一页未捕获/登录风控异常 → 返回 None（调用方回退串行 XHR，保证稳健）。
+    raw_sink 非空时同步追加 {"page", "response"}（保真核对用，与并行版同口径；
+    缺了它保真核对可比对 0 条 → 按 fail-safe 判失败）。
     """
     core = _core()
     ws = None
@@ -187,6 +190,8 @@ def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
             return core._PASSIVE_RISK
 
         out = [core.map_api_jobs(first)]
+        if raw_sink is not None:
+            raw_sink.append({"page": 1, "response": first})
         for _ in range(2, pages + 1):
             # 滚到底触发无限滚动加载下一页，继续旁听页面自身请求
             ws.eval_js(core.SCROLL_BOTTOM_JS, sid)
@@ -195,6 +200,8 @@ def _fetch_pages_passive(cdp_port, keyword, city_code, pages, filters):
                 core.log.warning("被动捕获：翻页未捕获到响应")
                 return None
             out.append(core.map_api_jobs(page_data))
+            if raw_sink is not None:
+                raw_sink.append({"page": len(out), "response": page_data})
         return out
     except core._cdp_exception_types():
         core.log.warning("被动捕获列表失败，回退串行 XHR", exc_info=True)
