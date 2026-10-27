@@ -313,6 +313,15 @@ _AI_COMPANY_INDUSTRIES = ("人工智能",)
 _AI_COMPANY_TITLE_EXCLUDES = ("结构", "工艺", "硬件", "电子", "维修", "拍摄",
                               "客服", "外呼", "零售", "门店", "直播", "主播",
                               "剪辑", "设计", "销售", "bd", "新媒体")
+# 产品/解决方案类标题（2026-10-28 用户口径）：产品实习生、产品经理实习生、
+# 解决方案实习生等**不能因为 JD 没写 AI 就删**——搜索词本身就是 AI 方向，
+# 岗位类型对就是目标；只排除营销/市场/硬件/结构/销售/新媒体等非目标标题。
+_PRODUCT_SOLUTION_TITLE_TERMS = ("产品", "解决方案", "售前")
+_PRODUCT_SOLUTION_TITLE_EXCLUDES = ("营销", "市场", "渠道", "品牌", "硬件", "结构",
+                                    "工艺", "电子", "维修", "测试", "设计", "拍摄",
+                                    "拍照", "文员", "客服", "外呼", "零售", "门店",
+                                    "直播", "主播", "剪辑", "新媒体", "销售", "bd",
+                                    "开发", "算法", "工程师", "运营合伙人")
 # 标题/JD/技能里算"有 AI 证据"的核心词。刻意比 AI_DIRECTION_TERMS 窄：
 # "算法/向量/CV"这类泛技术词不算（地质算法岗 JD 通篇算法但无 AI 产品语义，
 # 不能靠它留下来）。
@@ -396,6 +405,14 @@ def _company_ai_signal(job):
         return True
     name = str(job.get("company_name") or "")
     return bool(_AI_COMPANY_NAME_RE.search(name))
+
+
+def _is_product_or_solution_title(title):
+    """产品/解决方案类标题（2026-10-28 用户口径：这类岗不能因 JD 没写 AI 就删）。"""
+    low = unicodedata.normalize("NFKC", str(title or "")).lower()
+    if not any(word in low for word in _PRODUCT_SOLUTION_TITLE_TERMS):
+        return False
+    return not any(word in low for word in _PRODUCT_SOLUTION_TITLE_EXCLUDES)
 
 
 def _title_jd_match(job, head=160):
@@ -553,6 +570,12 @@ def drop_junk_jobs(jobs):
             elif not _title_jd_match(job):
                 reason = "JD与岗名不符"
                 dropped["mismatch"] += 1
+            elif _is_product_or_solution_title(title):
+                # 2026-10-28 用户口径：产品实习生/产品经理实习生/解决方案实习生
+                # **不能因为 JD 没写 AI 就删**——搜索词本身就是 AI 方向，岗位
+                # 类型对就是目标（营销/市场/硬件/结构/销售/新媒体等仍排除）。
+                kept.append(job)
+                continue
             else:
                 reason = "跨行业噪声（标题JD技能均无AI）"
                 dropped["noise"] += 1

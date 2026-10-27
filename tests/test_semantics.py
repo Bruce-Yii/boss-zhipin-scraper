@@ -357,13 +357,20 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(len(kept), 1)
         self.assertEqual(dropped["noise"], 0)
 
-    def test_jiejuefangan_without_ai_still_dropped(self):
-        """解决方案只是岗名词：无 AI 证据的解决方案岗仍按跨行业噪声删。"""
+    def test_jiejuefangan_without_ai_kept(self):
+        """解决方案实习生不能因 JD 没写 AI 被删（2026-10-28 用户口径）。"""
         kept, dropped = self._drop([{"job_id": "a", "title": "解决方案实习生",
                                      "company_name": "X",
                                      "jd": "负责客户解决方案落地与交付协调"}])
+        self.assertEqual([j["job_id"] for j in kept], ["a"])
+        self.assertEqual(dropped["noise"], 0)
+
+    def test_product_marketing_title_still_excluded(self):
+        """产品营销/市场类不算产品岗目标（2026-10-28 口径排除项）。"""
+        kept, dropped = self._drop([{"job_id": "a", "title": "产品营销实习生",
+                                     "company_name": "X",
+                                     "jd": "负责美妆产品营销活动策划"}])
         self.assertEqual(kept, [])
-        self.assertEqual(dropped["noise"], 1)
 
     def test_ai_solution_engineer_kept(self):
         """AI 解决方案工程师类，标题带 AI 关键词即放行（issue #181 用户口径：
@@ -429,13 +436,13 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(dropped["mismatch"], 1)
 
-    def test_cross_industry_noise_dropped(self):
-        """标题是产品岗、JD 里无 AI → 跨行业噪声，删。"""
+    def test_product_title_without_ai_kept(self):
+        """产品类标题不再因 JD 没写 AI 被删（2026-10-28 用户口径）。"""
         kept, dropped = self._drop([{"job_id": "a", "title": "软件产品助理",
                                      "company_name": "有信科技",
                                      "jd": "协助产品经理对接，原型设计"}])
-        self.assertEqual(kept, [])
-        self.assertEqual(dropped["noise"], 1)
+        self.assertEqual([j["job_id"] for j in kept], ["a"])
+        self.assertEqual(dropped["noise"], 0)
 
     def test_b_layer_kept(self):
         """B 层：标题普通但 JD 含 AI → 留。"""
