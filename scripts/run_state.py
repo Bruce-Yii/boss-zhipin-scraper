@@ -76,8 +76,23 @@ def _write(payload):
         return
 
 
+def _write_disabled():
+    """测试进程里默认**不写**真实状态文件（避免污染用户运行态 / 隔离守卫）。
+
+    显式设置 ``BOSS_RUN_STATE_PATH`` = 调用方明确指定路径（测试自己的临时文件、
+    多环境），此时照写；生产运行（子进程直接跑脚本）不会 import unittest/pytest。
+    """
+    if os.environ.get(STATE_PATH_ENV):
+        return False
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
 def start(phase="preflight", **fields):
     """开始一次运行：running=True + started_at 固定，其余字段由调用方给。"""
+    if _write_disabled():
+        return {}
     with _lock:
         payload = {
             "running": True,
@@ -95,6 +110,8 @@ def start(phase="preflight", **fields):
 
 def update(**fields):
     """合并更新状态；**没有进行中的运行就不写**（避免只读/单测路径凭空造状态）。"""
+    if _write_disabled():
+        return {}
     with _lock:
         payload = read()
         if not payload:
