@@ -2570,6 +2570,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
         output_path = default_output_path("details")
 
     print(f"\n=== 抓取岗位详情 ({len(jobs)} 个) ===\n")
+    # 长任务进度：详情阶段总数/已完成写 run_state（agent 可 --progress --json 轮询）
+    run_state_update(phase="detail", detail_total=len(jobs), detail_done=0,
+                     detail_ok=0, detail_failed=0, detail_skipped=0,
+                     message=f"开始抓详情（{len(jobs)} 个）")
     # 详情页**清洗前原文**（详情侧保真核对的依据）：只进 raw 落盘，不进导出
     raw_details = []
     global LAST_DETAIL_RAW_PATH
@@ -2961,6 +2965,10 @@ def scrape_details(list_data, max_details=None, output_path=None,
         progress = progress_line(idx + 1, len(jobs), serial_ok)
         if progress:
             print(progress)
+        run_state_update(phase="detail", detail_total=len(jobs),
+                         detail_done=idx + 1, detail_ok=serial_ok,
+                         detail_failed=sum(serial_reasons.values()),
+                         message=f"详情 {idx + 1}/{len(jobs)}（成功 {serial_ok}）")
 
         # 批次冷却（#78）：每 COOL_EVERY 条主动冷却（+可选 Chrome 重启）；
         # 重启后共享会话失效 → 置空待下岗位重建
@@ -3528,6 +3536,12 @@ def _scrape_details_parallel(jobs, cdp_port, concurrency, limiter=None,
                             if visible_completed else None)
                 if progress:
                     print(progress)
+                run_state_update(phase="detail", detail_total=total,
+                                 detail_done=visible_completed,
+                                 detail_ok=parallel_ok,
+                                 detail_failed=sum(parallel_reasons.values()),
+                                 message=f"详情 {visible_completed}/{total}"
+                                         f"（成功 {parallel_ok}）")
                 if output_path and completed % write_every == 0:
                     persist()
                 # 批次冷却（#78）：并行模式仅冷却（不重启，避免池重建）
@@ -3726,7 +3740,8 @@ def build_parser():
     g_output.add_argument("--format", default="json", choices=["json", "csv"],
                           help="输出格式")
     g_output.add_argument("--json", action="store_true",
-                          help="只读工具命令输出机器可读 JSON（配合 --artifacts；默认文本）")
+                          help="只读/作业命令输出机器可读 JSON（配合 --artifacts / "
+                               "--progress / --brief / --daily；默认文本）")
     g_output.add_argument("--merge", default=None,
                           help="合并已有 JSON 文件 (按 job_id 去重)")
     g_output.add_argument("--db", nargs="?", const=DEFAULT_DB_PATH, default=None,
@@ -3799,6 +3814,17 @@ def build_parser():
     g_tool_excl.add_argument("--artifacts", action="store_true",
                              help="产物层统一清单（分类/口径/取代关系/时效；只读；"
                                   "给 --json 输出机器可读 JSON）")
+    g_tool_excl.add_argument("--progress", action="store_true",
+                             help="长任务当前进度（读 run_state.json；只读；"
+                                  "抓取在跑时 agent 用它轮询，--json 机器可读）")
+    g_tool_excl.add_argument("--brief", action="store_true",
+                             help="今日简报（新增岗位/岗位结构/详情/预算/交付物/异常；"
+                                  "只读；--json 机器可读）")
+    g_tool_excl.add_argument("--daily", nargs="?", const="__default__", default=None,
+                             metavar="CONFIG.json",
+                             help="日常作业：按配置（默认 ~/.boss-zhipin-scraper/daily.json）"
+                                  "跑 列表+详情 → 从库重建交付物 → 今日简报；"
+                                  "--json 输出最终 JSON（过程看 --progress）")
     g_tool_excl.add_argument("--report", nargs="?", const="__latest__", default=None,
                              metavar="LIST.json",
                              help="跑后战报：列表→删库→详情→导出的整条漏斗、新增、失败原因、产物与预算（缺省取最新列表）")
@@ -3876,7 +3902,8 @@ def _cli_uses_outer_run_lock(args):
     """当前参数组合是否由 run_cli 外层持锁（batch 自己管理 run 锁）。"""
     # 与 run_cli 的分派顺序保持一致：靠前模式优先，避免组合参数误入抓取路径。
     if (args.check or args.status or args.verify or args.list_results
-            or args.artifacts
+            or args.artifacts or args.progress or args.brief
+            or args.daily is not None
             or args.archive is not None or args.report is not None):
         return False
     if args.batch:
@@ -3927,6 +3954,14 @@ def _run_cli_with_db_cleanup(p, args):
         return _run_cli_impl(p, args)
     except BaseException:
         _abort_db_run_state(args)
+        # 长任务异常中断：状态文件不能永远停在 running
+        state = run_state_read() if "run_state_read" in globals() else None
+        if isinstance(state, dict) and state.get("running"):
+            try:
+                _run_state_mod.finish(phase="aborted",
+                                      message="进程异常中断（见日志/审计）")
+            except Exception:
+                pass
         raise
     finally:
         _close_db_run_state(args)
@@ -4048,14 +4083,31 @@ def run_cli():
 
 def _run_cli_impl(p, args):
     """已由外层完成模式分派；需要 live run 的调用必须持有 run 锁。"""
-    # --artifacts --json：stdout 必须是**纯 JSON**（agent 直接解析），
-    # 因此在任何横幅/预算提示之前分派并退出。
-    if getattr(args, "json", False):
-        if not getattr(args, "artifacts", False):
-            print("--json 目前仅配合 --artifacts（产物层统一清单）使用",
-                  file=sys.stderr)
-            sys.exit(2)
-        sys.exit(run_artifacts(result_dir=DEFAULT_RESULT_DIR, as_json=True))
+    # ── 只读/作业命令：在任何横幅/预算提示之前干净分派 ──
+    # 这些命令是 agent 的机器接口：--json 时 stdout 必须是纯 JSON。
+    read_only = []
+    if getattr(args, "artifacts", False):
+        read_only.append("artifacts")
+    if getattr(args, "progress", False):
+        read_only.append("progress")
+    if getattr(args, "brief", False):
+        read_only.append("brief")
+    if getattr(args, "daily", None) is not None:
+        read_only.append("daily")
+    if getattr(args, "json", False) and not read_only:
+        print("--json 需要配合 --artifacts / --progress / --brief / --daily 使用",
+              file=sys.stderr)
+        sys.exit(2)
+    if "progress" in read_only:
+        sys.exit(run_progress(as_json=args.json))
+    if "brief" in read_only:
+        sys.exit(run_brief(result_dir=DEFAULT_RESULT_DIR, as_json=args.json))
+    if "artifacts" in read_only:
+        sys.exit(run_artifacts(result_dir=DEFAULT_RESULT_DIR, as_json=args.json))
+    if "daily" in read_only:
+        config_path = None if args.daily == "__default__" else args.daily
+        sys.exit(run_daily(config_path, result_dir=DEFAULT_RESULT_DIR,
+                           as_json=args.json))
     _apply_verbosity(args.verbose, args.quiet)
     # 一键模式
     if getattr(args, "quick", False):
@@ -4166,11 +4218,6 @@ def _run_cli_impl(p, args):
     # --list-results 模式（列出历史结果文件）
     if args.list_results:
         sys.exit(run_list_results())
-
-    # --artifacts 模式（产物层统一清单：分类/口径/取代/时效；只读）
-    if args.artifacts:
-        sys.exit(run_artifacts(result_dir=DEFAULT_RESULT_DIR,
-                               as_json=args.json))
 
     # --report 模式（跑后战报，只读产物）
     if args.report is not None:
@@ -4368,6 +4415,17 @@ def _run_cli_impl(p, args):
         if swept_detail:
             print(f"🧹 已清扫 {swept_detail} 个残留详情 tab")
         keywords = split_keywords(args.keyword) or [args.keyword]
+        # 长任务外部可观测性：进度写 run_state.json，agent 可 --progress --json 轮询
+        try:
+            used = max(DAILY_DETAIL_BUDGET - _budget_remaining(DAILY_DETAIL_BUDGET), 0)
+        except (OSError, TypeError, ValueError):
+            used = 0
+        run_state_start(phase="list", keyword=args.keyword, city=args.city,
+                        keywords_total=len(keywords), keyword_index=0,
+                        pages_total=args.pages, pages_done=0,
+                        detail_total=0, detail_done=0, detail_ok=0,
+                        budget_used=used, budget_limit=DAILY_DETAIL_BUDGET,
+                        message=f"开始抓列表（{len(keywords)} 个关键词）")
         if len(keywords) == 1:
             list_data = scrape_list(
                 keywords[0], args.city, args.pages, filters, args.output,
@@ -4387,6 +4445,8 @@ def _run_cli_impl(p, args):
             list_data = None
             for idx, kw in enumerate(keywords, 1):
                 print(f"\n=== [{idx}/{len(keywords)}] 关键词: {kw} ===")
+                run_state_update(phase="list", keyword=kw, keyword_index=idx,
+                                 message=f"抓列表 {idx}/{len(keywords)}：{kw}")
                 part = scrape_list(
                     kw, args.city, args.pages, filters, None,
                     cdp_port=args.cdp_port, fmt=args.format,
@@ -4420,6 +4480,10 @@ def _run_cli_impl(p, args):
 
         # 统一后续流程的关键词标签（单/多关键词一致）
         args.keyword = list_data.get("keyword") or args.keyword
+        run_state_update(phase="list", keyword_index=len(keywords),
+                         pages_done=args.pages,
+                         jobs_found=len(list_data.get("jobs") or []),
+                         message=f"列表完成：{len(list_data.get('jobs') or [])} 条")
 
         # 相关度过滤不在这里做：它必须**在合并之后、所有写盘之前**统一执行
         # （独立审计 F2/F3/F11 的根因：过滤只改内存副本 → 落盘口径不一致；
@@ -4635,8 +4699,22 @@ def _run_cli_impl(p, args):
             if db_state is not None:
                 db_state["closed"] = True
 
+    # 运行进度收尾：明确标记结束（agent --progress 不再显示 running）
+    try:
+        _used = max(DAILY_DETAIL_BUDGET - _budget_remaining(DAILY_DETAIL_BUDGET), 0)
+    except (OSError, TypeError, ValueError):
+        _used = 0
+    run_state_finish(
+        phase="done",
+        jobs_kept=len(list_data.get("jobs") or []),
+        detail_ok=len(details or []),
+        budget_used=_used, budget_limit=DAILY_DETAIL_BUDGET,
+        message=f"完成：导出 {len(list_data.get('jobs') or [])} 条，"
+                f"详情 {len(details or [])} 条")
+
     # 保真核对失败 → 退出码非 0（数据与平台不一致，不能当成功交付）
     if fidelity_failed():
+        run_state_finish(phase="failed", message="保真核对未通过（数据与平台原文不一致）")
         print("\n❌ 本次数据未通过保真核对（与平台原文不一致）——退出码 1")
         sys.exit(1)
 
@@ -4795,6 +4873,40 @@ except Exception:
 for _n in ['run_artifacts','build_index','refresh_index','write_index',
            'load_index','format_human','default_result_dir']:
     globals()[_n] = getattr(_artifacts_mod, _n)
+
+try:
+    from . import run_state as _run_state_mod
+except Exception:
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import run_state as _run_state_mod
+run_state_start = _run_state_mod.start
+run_state_update = _run_state_mod.update
+run_state_finish = _run_state_mod.finish
+run_state_read = _run_state_mod.read
+run_state_view = _run_state_mod.progress_view
+run_progress = _run_state_mod.run_progress
+
+try:
+    from . import brief as _brief_mod
+except Exception:
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import brief as _brief_mod
+run_brief = _brief_mod.run_brief
+build_brief = _brief_mod.collect
+
+try:
+    from . import daily as _daily_mod
+except Exception:
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import daily as _daily_mod
+run_daily = _daily_mod.run_daily
+load_daily_config = _daily_mod.load_config
 
 try:
     from . import filters as _filters_mod

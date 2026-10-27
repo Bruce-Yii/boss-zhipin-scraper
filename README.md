@@ -349,6 +349,25 @@ python3 scripts/boss_cdp_raw.py --artifacts --json   # agent 用：纯 JSON（st
 - 交付物构建时盖 `artifact.scope_key`：同口径重复重建时新的为 `active`、旧的自动标 `superseded`（只打标，不移动文件；归档仍用 `--archive`）；
 - 清单只读：不删、不改、不移动任何产物；缓存损坏会自动重建。
 
+## 日常运行：进度 / 简报 / 一句跑完
+
+项目在 agent 会话里运行，用户看不到命令的实时输出，所以三件事是刚需：
+
+```bash
+# 长任务中途：看进度（抓取在跑时 agent 轮询；--json 机器可读）
+python3 scripts/boss_cdp_raw.py --progress --json
+
+# 跑完/随时：今日简报（新增岗位 + 岗位结构（岗位名→数量）+ 详情/预算 + 交付物 + 异常）
+python3 scripts/boss_cdp_raw.py --brief --json
+
+# 一句跑完一天：列表+详情 → 从库重建交付物 → 刷新产物清单 → 今日简报
+python3 scripts/boss_cdp_raw.py --daily --json
+```
+
+- 抓取/流水线在关键节点把状态写 `~/.boss-zhipin-scraper/run_state.json`（阶段、完成/总数、成功数、预算、最后心跳）；超过阈值未更新标记 `stale`（可能卡住/已结束）。
+- 日常跑法固化在 `~/.boss-zhipin-scraper/daily.json`（示例 `data/daily_profile.example.json`：城市/关键词/页数/招聘类型/口径/交付物文件名），改配置即可改每天跑法。
+- `--brief` 的"岗位结构"以**当前最新交付物**为准（已过口径、带 JD），并给出与同口径上一版的 `+新增/-消失/保持`。
+
 ## 文件结构
 
 ```
@@ -367,6 +386,9 @@ boss-zhipin-scraper/
 │   ├── db_store.py       # SQLite schema / run lineage
 │   ├── build_deliverable.py # 交付物重建（文件 / SQLite 原材料库两种口径）
 │   ├── artifacts.py      # 产物层统一清单（分类/口径/取代/时效）
+│   ├── run_state.py      # 长任务进度状态（--progress）
+│   ├── brief.py          # 今日简报（--brief）
+│   ├── daily.py          # 日常作业流水线（--daily）
 │   ├── audit.py          # 风险事件审计
 │   └── job_summary.py    # 抓取后摘要 + 提示词
 └── requirements.txt

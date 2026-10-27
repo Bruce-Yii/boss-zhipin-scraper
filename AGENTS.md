@@ -12,6 +12,17 @@
 
 接管流程：`--status` 看全局 → `--check` 确认可跑 → `--artifacts --json` 看产物清单（最新列表/详情、每个口径的最新交付物、取代关系）→ 再用 `--verify` 复核数据完整性。
 
+## 长任务与汇报（用户只能看到工具调用，看不到命令输出）
+
+抓取一轮 15-20 分钟，用户看不到 stdout 滚动。**长任务必须后台跑 + 轮询 + 定时汇报**：
+
+1. 后台运行，不要同步阻塞等待；
+2. 每 2-5 分钟 `--progress --json`（`state/phase/progress_pct/detail_done/detail_ok/budget_used/age_seconds`）；`state=stale` 或长时间不动 → 主动说"可能卡住/已结束"；
+3. 每 10-15 分钟向用户汇报一次进度（阶段/完成总数/成功数/预算剩多少）；
+4. 结束后 `--brief`（`--json` 给 agent）汇报：今日新增、**岗位结构（岗位名→数量）**、详情/预算、交付物（路径/条数/较上版 +−）、异常、下一步。
+
+日常固定跑法固化在 `~/.boss-zhipin-scraper/daily.json`（示例 `data/daily_profile.example.json`），一句 `--daily` 跑完 列表+详情→重建交付物→简报。汇报契约=成果数字+含义+待拍板，不贴命令、不讲实现，数字必须来自 `--progress`/`--brief` 真实输出。
+
 ## 执行与汇报约定
 
 - **完整计时**：汇报任务耗时的起点取「用户下达命令 / 任务开始」的时刻，终点取任务完成（含产出校验），给出完整墙钟时长；轮询类长任务另附内部阶段耗时。
@@ -28,9 +39,13 @@ scripts/export_contract.py# 稳定纯逻辑：契约/递归脱敏/口径一/原�
 scripts/db_store.py       # 稳定纯逻辑：SQLite schema、只读统计、run lineage
 scripts/artifacts.py      # 产物层统一：目录清单、口径、取代关系、时效（--artifacts）
 scripts/build_deliverable.py # 交付物重建（文件 / SQLite 原材料库 --from-db）
+scripts/run_state.py      # 长任务进度状态（run_state.json；--progress）
+scripts/brief.py          # 今日简报（--brief；岗位结构/预算/交付物/异常）
+scripts/daily.py          # 日常作业流水线（--daily；列表+详情→交付物→简报）
 scripts/audit.py          # 稳定纯逻辑：风险事件审计、递归脱敏、轮转锁
 scripts/job_summary.py    # 抓取结果 → Markdown 求职分析摘要
 data/city_codes.json      # 全量城市码表（300+ 城市，外置；见下）
+data/daily_profile.example.json # 日常作业配置示例（复制到 ~/.boss-zhipin-scraper/daily.json）
 tests/test_chrome_setup.py    # unittest，全 mock，不依赖真实 Chrome/网络
 tests/test_job_summary.py     # 摘要测试
 tests/test_isolation_guard.py  # 受保护运行态隔离守卫

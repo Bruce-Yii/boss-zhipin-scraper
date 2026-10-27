@@ -348,6 +348,25 @@ python3 scripts/boss_cdp_raw.py --artifacts --json   # agent: pure JSON (no bann
 - Deliverables are stamped with `artifact.scope_key`: rebuilding the same scope marks the new one `active` and older ones `superseded` (labels only — files are never moved; archiving stays explicit via `--archive`);
 - The inventory is read-only: nothing is deleted, modified or moved; a corrupted cache is rebuilt automatically.
 
+## Daily Operation: Progress / Brief / One-Command Run
+
+This project runs inside agent sessions, where the user cannot see live command output — so these three are essential:
+
+```bash
+# Mid-run: progress (agent polls while scraping; --json is machine-readable)
+python3 scripts/boss_cdp_raw.py --progress --json
+
+# After/anytime: today's brief (new jobs + job-title breakdown (title -> count) + details/budget + deliverables + anomalies)
+python3 scripts/boss_cdp_raw.py --brief --json
+
+# One command for a whole day: list+details -> rebuild deliverable from DB -> refresh inventory -> brief
+python3 scripts/boss_cdp_raw.py --daily --json
+```
+
+- Scraping/pipeline writes state to `~/.boss-zhipin-scraper/run_state.json` (phase, done/total, successes, budget, last heartbeat); stale heartbeats are flagged (`stale` = likely finished or stuck).
+- The daily routine is captured in `~/.boss-zhipin-scraper/daily.json` (template: `data/daily_profile.example.json` — city/keywords/pages/recruit types/scope/deliverable filename); edit the config to change the daily run.
+- The `--brief` job-title breakdown is based on the **current newest deliverable** (already filtered, with JD), plus `+added/-removed/kept` versus the previous version of the same scope.
+
 ## File Structure
 
 ```
@@ -367,6 +386,9 @@ boss-zhipin-scraper/
 │   ├── db_store.py       # SQLite schema / run lineage
 │   ├── build_deliverable.py # Deliverable rebuild (file or SQLite raw-material store)
 │   ├── artifacts.py      # Unified artifact inventory (kind/scope/supersede/freshness)
+│   ├── run_state.py      # Long-run progress state (--progress)
+│   ├── brief.py          # Daily brief (--brief)
+│   ├── daily.py          # Daily pipeline (--daily)
 │   ├── audit.py          # Risk-event audit log
 │   └── job_summary.py    # Post-scrape summary + prompt
 └── requirements.txt
