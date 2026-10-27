@@ -333,6 +333,21 @@ After installing the package you can also use the entry command:
 uv run boss-deliverable --from-db --city 杭州 --recruit-type intern,campus --target hangzhou_intern_campus.json
 ```
 
+## Unified Artifact Inventory
+
+The result directory mixes list snapshots, detail snapshots, deliverables and sidecars (150+ files today); "which is latest / which belongs to which scope" used to require guessing by mtime. `--artifacts` scans the directory into one inventory (**files remain the single source of truth; the inventory is a rebuildable cache**):
+
+```bash
+python3 scripts/boss_cdp_raw.py --artifacts          # human: kinds + latest deliverable per scope + freshness
+python3 scripts/boss_cdp_raw.py --artifacts --json   # agent: pure JSON (no banners on stdout)
+```
+
+- Kinds: `list` / `details` / `deliverable` / `ledger` (pending, failures, quarantine);
+- `summary`: per-kind counts, total bytes, active/archived/superseded/stale, raw response count;
+- `latest`: newest list, newest details, **newest deliverable per scope**;
+- Deliverables are stamped with `artifact.scope_key`: rebuilding the same scope marks the new one `active` and older ones `superseded` (labels only — files are never moved; archiving stays explicit via `--archive`);
+- The inventory is read-only: nothing is deleted, modified or moved; a corrupted cache is rebuilt automatically.
+
 ## File Structure
 
 ```
@@ -351,6 +366,7 @@ boss-zhipin-scraper/
 │   ├── export_contract.py# Export contract, recursive redaction, atomic writes
 │   ├── db_store.py       # SQLite schema / run lineage
 │   ├── build_deliverable.py # Deliverable rebuild (file or SQLite raw-material store)
+│   ├── artifacts.py      # Unified artifact inventory (kind/scope/supersede/freshness)
 │   ├── audit.py          # Risk-event audit log
 │   └── job_summary.py    # Post-scrape summary + prompt
 └── requirements.txt

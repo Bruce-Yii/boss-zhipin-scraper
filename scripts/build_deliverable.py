@@ -194,6 +194,53 @@ def _db_stats_meta(stats, recruit_types):
     }
 
 
+def _scope_key(args, recruit_types):
+    """交付物系列标识：同 key 的多次构建互为版本（清单里旧的标 superseded）。
+
+    显式 ``--scope-key`` 优先；否则按 城市|招聘类型|口径说明(或关键词) 推导，
+    让"同一个口径反复重建"能自动认出是同一份菜的版本。
+    """
+    explicit = str(getattr(args, "scope_key", "") or "").strip()
+    if explicit:
+        return explicit
+    city = str(args.city or "").strip() or "*"
+    label = str(args.scope or args.keyword or "").strip() or "*"
+    types = ",".join(sorted(recruit_types)) if recruit_types else "all"
+    return f"{city}|{types}|{label}"
+
+
+def _artifact_meta(args, recruit_types, db_stats):
+    """构建时盖章（产物层统一清单据此识别交付物系列，不再靠文件名猜）。"""
+    if db_stats is not None:
+        inputs = {
+            "kind": "db",
+            "db": os.path.basename(str(db_stats.get("db") or "")),
+            "jobs_in_db": db_stats.get("jobs_in_db", 0),
+            "jobs_selected": db_stats.get("jobs_selected", 0),
+        }
+    else:
+        inputs = {
+            "kind": "files",
+            "lists": [os.path.basename(str(p)) for p in (args.lists or [])],
+            "details": [os.path.basename(str(p)) for p in (args.details or [])],
+            "old": os.path.basename(str(args.old)) if args.old else "",
+        }
+    return {
+        "kind": "deliverable",
+        "format_version": 1,
+        "builder": "build_deliverable",
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "scope_key": _scope_key(args, recruit_types),
+        "scope": {
+            "city": str(args.city or "").strip(),
+            "keyword": str(args.keyword or "").strip(),
+            "label": str(args.scope or "").strip(),
+            "recruit_types": sorted(recruit_types) if recruit_types else ["all"],
+        },
+        "inputs": inputs,
+    }
+
+
 def build(args):
     """拼装并落盘，返回 (kept, exit_code)。"""
     try:
@@ -293,6 +340,8 @@ def build(args):
         extra["scope"] = args.scope
     if db_stats is not None:
         extra["source"] = _db_stats_meta(db_stats, recruit_types)
+    # 产物层统一：交付物自带身份/口径/输入血缘，清单据此排序与取代
+    extra["artifact"] = _artifact_meta(args, recruit_types, db_stats)
     res = ec._merge_jd_into_export(target, list(details.values()), base=base,
                                    keep_junk=args.keep_junk,
                                    extra_meta=extra or None)
@@ -381,6 +430,9 @@ def main(argv=None):
                              "P11 优先用它核对标题命中率，不给就退回 keyword 切分）")
     parser.add_argument("--scope", default="",
                         help="写入 extra_meta.scope 的口径说明")
+    parser.add_argument("--scope-key", default="",
+                        help="交付物系列标识（产物清单用它判定同口径新旧版本；"
+                             "不传则按 城市|招聘类型|口径或关键词 推导）")
     parser.add_argument("--recruit-type", default="all",
                         help="招聘类型过滤：all（默认=全要）/ intern / social / "
                              "campus，可逗号组合（如 intern,campus）")

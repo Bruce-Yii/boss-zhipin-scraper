@@ -37,6 +37,7 @@ dev = [
 boss-scraper = "scripts.boss_cdp_raw:main"
 boss-summary = "scripts.job_summary:main"
 boss-deliverable = "scripts.build_deliverable:main"
+boss-artifacts = "scripts.artifacts:main"
 
 [build-system]
 requires = ["hatchling"]

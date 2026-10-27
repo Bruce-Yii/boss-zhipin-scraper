@@ -114,6 +114,7 @@ def run_list_results(result_dir=_core().DEFAULT_RESULT_DIR):
         modified = _core().datetime.fromtimestamp(e["modified"]).strftime("%Y-%m-%d %H:%M")
         print(f"  [{e['kind']:>7}] {modified}  {e['size']:>9} B  {_core().os.path.basename(e['path'])}")
     print()
+    print("💡 分类/口径/取代关系/时效用 --artifacts（加 --json 输出机器可读清单）")
     return 0
 
 

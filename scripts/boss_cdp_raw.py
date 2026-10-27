@@ -3725,6 +3725,8 @@ def build_parser():
                           help=f"CDP 调试端口 (默认 {DEFAULT_CDP_PORT})")
     g_output.add_argument("--format", default="json", choices=["json", "csv"],
                           help="输出格式")
+    g_output.add_argument("--json", action="store_true",
+                          help="只读工具命令输出机器可读 JSON（配合 --artifacts；默认文本）")
     g_output.add_argument("--merge", default=None,
                           help="合并已有 JSON 文件 (按 job_id 去重)")
     g_output.add_argument("--db", nargs="?", const=DEFAULT_DB_PATH, default=None,
@@ -3794,6 +3796,9 @@ def build_parser():
                              help="校验已抓取结果文件完整性（--input 指定列表或自动取最新；详情自动匹配；只校验不抓取）")
     g_tool_excl.add_argument("--list-results", action="store_true",
                              help="列出结果目录中的历史抓取结果文件")
+    g_tool_excl.add_argument("--artifacts", action="store_true",
+                             help="产物层统一清单（分类/口径/取代关系/时效；只读；"
+                                  "给 --json 输出机器可读 JSON）")
     g_tool_excl.add_argument("--report", nargs="?", const="__latest__", default=None,
                              metavar="LIST.json",
                              help="跑后战报：列表→删库→详情→导出的整条漏斗、新增、失败原因、产物与预算（缺省取最新列表）")
@@ -3871,6 +3876,7 @@ def _cli_uses_outer_run_lock(args):
     """当前参数组合是否由 run_cli 外层持锁（batch 自己管理 run 锁）。"""
     # 与 run_cli 的分派顺序保持一致：靠前模式优先，避免组合参数误入抓取路径。
     if (args.check or args.status or args.verify or args.list_results
+            or args.artifacts
             or args.archive is not None or args.report is not None):
         return False
     if args.batch:
@@ -4042,6 +4048,14 @@ def run_cli():
 
 def _run_cli_impl(p, args):
     """已由外层完成模式分派；需要 live run 的调用必须持有 run 锁。"""
+    # --artifacts --json：stdout 必须是**纯 JSON**（agent 直接解析），
+    # 因此在任何横幅/预算提示之前分派并退出。
+    if getattr(args, "json", False):
+        if not getattr(args, "artifacts", False):
+            print("--json 目前仅配合 --artifacts（产物层统一清单）使用",
+                  file=sys.stderr)
+            sys.exit(2)
+        sys.exit(run_artifacts(result_dir=DEFAULT_RESULT_DIR, as_json=True))
     _apply_verbosity(args.verbose, args.quiet)
     # 一键模式
     if getattr(args, "quick", False):
@@ -4152,6 +4166,11 @@ def _run_cli_impl(p, args):
     # --list-results 模式（列出历史结果文件）
     if args.list_results:
         sys.exit(run_list_results())
+
+    # --artifacts 模式（产物层统一清单：分类/口径/取代/时效；只读）
+    if args.artifacts:
+        sys.exit(run_artifacts(result_dir=DEFAULT_RESULT_DIR,
+                               as_json=args.json))
 
     # --report 模式（跑后战报，只读产物）
     if args.report is not None:
@@ -4765,6 +4784,17 @@ except Exception:
     import results as _results_mod
 for _n in ['_is_detail_sidecar','_classify_result_file','list_results','archive_results','run_list_results','run_archive','latest_results_file','_latest_details_path','default_output_path']:
     globals()[_n] = getattr(_results_mod, _n)
+
+try:
+    from . import artifacts as _artifacts_mod
+except Exception:
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    import artifacts as _artifacts_mod
+for _n in ['run_artifacts','build_index','refresh_index','write_index',
+           'load_index','format_human','default_result_dir']:
+    globals()[_n] = getattr(_artifacts_mod, _n)
 
 try:
     from . import filters as _filters_mod
