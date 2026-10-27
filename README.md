@@ -368,6 +368,9 @@ python3 scripts/boss_cdp_raw.py --daily --json
 - 日常跑法固化成**多套模板**：`~/.boss-zhipin-scraper/profiles/*.json`（示例 `data/daily_profile.example.json`）。`--daily` 不带名字**只列模板不执行**，`--daily <模板名>` 才跑；模板可配 `source=db|artifacts`（artifacts=产物目录并集，覆盖库启用前的历史 JD）与 `exclude_job_ids_file`（人工剔除名单）。
 - `--brief` 的"岗位结构"以**当前最新交付物**为准（已过口径、带 JD），并给出与同口径上一版的 `+新增/-消失/保持`。
 - **遇到 `code 37 您的环境存在异常`**：这是 `__zp_stoken__` 被标记（机制同 boss-agent-cli #453）。用 `--warm-stoken`（真实打开搜索页等 75 秒让平台安全 JS 换令牌）；登录探测命中 37 会**自动热刷新+重探一次**。热刷新后要紧接着跑，中间不要再插探测。
+- **Agent 会话内问答**：用户只在对话里问（"今天怎么样""这条为什么没上榜""跟昨天比呢"），由 agent 调内部只读 API 回答；`--ask status|today|why <job_id>|diff [口径]|templates` 与 `--batches` 只是 agent 的转发入口，不是面向用户的命令面。实现见 `scripts/ask.py`。
+- **资产库 v3**：`boss.db` 的 `jobs` 增加规范化列（title/company/salary/recruit_type/state/content_hash/canonical_id 等）、新增 `job_versions`（JD/标题/薪资变化历史）与 `job_flags`、`runs` 补 scope/template/ruleset_version/预算等元数据；`scripts/assets_migrate.py --json` 幂等迁移/回填（`--dry-run` 只读）。交付物 meta 记录 `ruleset_version`。
+- **断点续跑**：详情队列写 `~/.boss-zhipin-scraper/pending/details_<run_id>.json`，中断/预算截断后下次同口径优先续跑，不重复抓已有 JD；日常模板支持 `max_details`（或 `detail_budget`）按口径限流。
 
 ## 文件结构
 

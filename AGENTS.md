@@ -25,6 +25,23 @@
 
 **code 37「环境异常」= `__zp_stoken__` 被标记**（boss-agent-cli PR #453）：真实打开搜索页等安全 JS 重跑可换令牌。用 `--warm-stoken [秒]`（默认 75）；登录探测命中 37 会自动热刷新+重探一次；热刷新后**紧接着**跑抓取，中间不要插 `--check`/重复探测；仍 37 改 `--list-mode passive` 或等冷却。
 
+## Agent 原生交互（用户只在对话里问，不敲命令）
+
+用户**始终在 Agent 会话里使用本工具**：想了解什么直接在对话里问（"今天怎么样""这条为什么没上榜""跟昨天比呢""有哪些模板"），由 agent 调内部只读 API 回答、再用 `human` 一屏 markdown 转述。**不要把 CLI 参数当成交付给用户的用法说明，也不要做 xlsx/固定报告文件/Web 界面**——人类可读输出只是给 agent 的参考。
+
+调用面（agent 内部）：
+
+```python
+from scripts import ask
+payload = ask.run_ask("status", {}, result_dir=None)   # status/today/why/diff/templates/batches
+print(ask.format_answer(payload, as_json=False))       # human 一屏；True → 纯 JSON
+```
+
+- 统一信封 `{"ok","command","data","human","errors"}`：`ok=False` 表示这条问题无法回答（未知命令/查无此岗/核心来源缺失），缺失文件/旧 DB schema 只进 `errors` 降级，**任何情况都不抛异常**；
+- `ask status` 给单屏状态（运行/预算/锁/冷却/CDP + 今日 + 最新交付物较上版 + 异常 + 待拍板）；`ask today` 今日简报；`ask why <job_id>` 解释保留/删除分支（交付物留痕 / dropped_junk / 人工剔除名单 / 规则版本 / DB 来源批次，拿不到就列出查过的来源，**不编造**）；`ask diff [scope_key]` 逐条 +新增/−消失/保持及原因；`ask templates` 模板与上次运行；`ask batches` 批次健康度（`batch_health.jsonl`，可能尚未生成）；
+- 只读：不抓取、不发 BOSS 请求、不写产物/清单/DB；默认仅探测本机 CDP 端口，登录态仍由 `--check` 负责；
+- `--ask` 只是 CLI 编排层对 agent 的内部转发入口，不是给用户看的新命令面。
+
 ## 执行与汇报约定
 
 - **完整计时**：汇报任务耗时的起点取「用户下达命令 / 任务开始」的时刻，终点取任务完成（含产出校验），给出完整墙钟时长；轮询类长任务另附内部阶段耗时。
@@ -44,6 +61,8 @@ scripts/build_deliverable.py # 交付物重建（文件 / SQLite 原材料库 --
 scripts/run_state.py      # 长任务进度状态（run_state.json；--progress）
 scripts/brief.py          # 今日简报（--brief；岗位结构/预算/交付物/异常）
 scripts/daily.py          # 日常作业流水线（--daily；列表+详情→交付物→简报）
+scripts/ask.py            # Agent 会话只读问答（status/today/why/diff/templates/batches；--ask 转发）
+scripts/assets_migrate.py # 资产库 schema 迁移/回填（幂等；--dry-run/--json）
 scripts/audit.py          # 稳定纯逻辑：风险事件审计、递归脱敏、轮转锁
 scripts/job_summary.py    # 抓取结果 → Markdown 求职分析摘要
 data/city_codes.json      # 全量城市码表（300+ 城市，外置；见下）

@@ -48,6 +48,19 @@ RECRUIT_CHOICES = ("intern", "campus", "social")
 SOURCE_CHOICES = ("db", "artifacts")
 
 
+def _positive_int(value, field):
+    """模板预算字段 → 正整数（None/空=未配置；非法值报错，不静默忽略）。"""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} 必须是正整数：{value!r}") from exc
+    if number <= 0:
+        raise ValueError(f"{field} 必须是正整数：{value!r}")
+    return number
+
+
 def profiles_dir():
     return os.path.abspath(os.path.expanduser(
         os.environ.get(PROFILES_DIR_ENV) or DEFAULT_PROFILES_DIR))
@@ -165,6 +178,8 @@ def load_config(ref=None):
         "recruit_types": raw.get("recruit_types") or [],
         "detail": bool(raw.get("detail", True)),
         "max_details": raw.get("max_details"),
+        "detail_budget": raw.get("detail_budget"),
+        "daily_detail_budget": raw.get("daily_detail_budget"),
         "max_jobs": raw.get("max_jobs"),
         "filters": raw.get("filters") or {},
         "scope": str(raw.get("scope") or "").strip(),
@@ -190,6 +205,16 @@ def load_config(ref=None):
         raise ValueError(f"recruit_types 非法：{unknown}（可选 {','.join(RECRUIT_CHOICES)}）")
     if cfg["source"] not in SOURCE_CHOICES:
         raise ValueError(f"source 非法：{cfg['source']}（可选 {','.join(SOURCE_CHOICES)}）")
+    # 预算字段（可选；未配置不改变默认行为）：
+    #   max_details / detail_budget → 单 run 详情条数上限（同义，二选一，透传 --max-details）
+    #   daily_detail_budget        → 该 scope/模板的详情页日预算（透传 --daily-detail-budget）
+    cfg["max_details"] = _positive_int(cfg.get("max_details"), "max_details")
+    cfg["detail_budget"] = _positive_int(cfg.get("detail_budget"), "detail_budget")
+    if cfg["max_details"] and cfg["detail_budget"]:
+        raise ValueError("max_details 与 detail_budget 只能给一个"
+                         "（两者都映射到 --max-details）")
+    cfg["daily_detail_budget"] = _positive_int(
+        cfg.get("daily_detail_budget"), "daily_detail_budget")
     if not cfg["deliverable"]:
         raise ValueError("日常作业模板缺少 deliverable（交付物文件名）")
     return cfg
@@ -228,8 +253,12 @@ def build_scrape_argv(cfg, python=None):
         argv += ["--recruit-type", ",".join(cfg["recruit_types"])]
     if not cfg["detail"]:
         argv.append("--no-detail")
-    if cfg.get("max_details"):
-        argv += ["--max-details", str(cfg["max_details"])]
+    # 模板预算：detail_budget 是 max_details 的别名；未配置则完全沿用 CLI 默认。
+    detail_cap = cfg.get("max_details") or cfg.get("detail_budget")
+    if detail_cap:
+        argv += ["--max-details", str(detail_cap)]
+    if cfg.get("daily_detail_budget"):
+        argv += ["--daily-detail-budget", str(cfg["daily_detail_budget"])]
     if cfg.get("max_jobs"):
         argv += ["--max-jobs", str(cfg["max_jobs"])]
     for key in FILTER_KEYS:
