@@ -495,6 +495,34 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual([j["job_id"] for j in kept], ["a"])
         self.assertEqual(dropped["noise"], 1)
 
+    def test_robotics_ai_domain_terms_count_as_evidence(self):
+        """机器人/具身智能/智能硬件等 AI 领域词也算 AI 证据（2026-10-28 扩词表）。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "机器人展厅运营实习生", "company_name": "X",
+             "jd": "具身智能未来岛（机器人学校）实习生，负责展厅运营与机器人操控方向"},
+        ])
+        self.assertEqual([j["job_id"] for j in kept], ["a"])
+        self.assertEqual(dropped["noise"], 0)
+
+    def test_sales_jd_compensation_only_keeps_ai_title(self):
+        """AI 标题 + JD 只命中薪酬词（提成）→ 不按卖货删（ANSO 误删修复）。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "AI原生服务运营师（ANSO）",
+             "company_name": "X",
+             "jd": "AI Native 服务公司，实习 200-300 元/天，月薪 4-6K + 提成"},
+        ])
+        self.assertEqual([j["job_id"] for j in kept], ["a"])
+        self.assertEqual(dropped["sales"], 0)
+
+    def test_sales_jd_action_words_still_dropped_for_ai_title(self):
+        """AI 标题 + JD 明着卖货（签单/客户资源）→ 仍删。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "AI产品经理", "company_name": "X",
+             "jd": "负责AI产品，签单提成，自带客户资源，完成销售目标"},
+        ])
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped["sales"], 1)
+
     def test_ai_or_product_ops_title_not_dropped_by_new_rule(self):
         """标题带 AI/产品的运营类（非新媒体）走正常判定，不被新规则误杀。"""
         kept, dropped = self._drop([
