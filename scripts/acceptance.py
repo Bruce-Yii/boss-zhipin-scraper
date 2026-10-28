@@ -25,8 +25,9 @@
   meta.job_count 与实际条数；关键词不可机器解析时明说"无法核对是不是这次要找的岗"。
 - **P12 语义交叉一致性**：派生态（post_type/recruit_type/active_state/title_key/salary）
   必须与平台原始字段自洽；矛盾即 error。
-- **P13 身份 + 时效 + 凭据**：job_id 唯一且由链接推出、link_verified_at 可解析且不超 24 小时、
-  递归扫描凭据参数（复用消费端 contract_check 的实现）、重复组计数与主条一致。
+- **P13 身份 + 时效 + 凭据**：job_id 唯一且由链接推出、link_verified_at 可解析且不超 7 天
+  （岗位挂多天是常态，超过只做 warn）、递归扫描凭据参数（复用消费端 contract_check 的实现）、
+  重复组计数与主条一致。
 
 **产物形态分级**：列表产物（本来就没有 JD）不该被判"内容相同/JD 太短"——
 空指纹跳过 P3、没有 JD 的记录跳过 P9/P10；结论里说明用的是哪一档。
@@ -893,10 +894,11 @@ def _check_p13(payload, records, spec):
             f"（例：{'、'.join(garbage[:3])}）", len(garbage)))
     if stale:
         out.append(_finding(
-            "P13_identity_freshness_credentials", "error",
+            "P13_identity_freshness_credentials", "warn",
             f"有 {len(stale)} 条 link_verified_at 超过 "
-            f"{thresholds.get('link_max_age_hours', 24)} 小时"
-            f"（链接是短时效凭证）：{'、'.join(stale[:3])}", len(stale)))
+            f"{thresholds.get('link_max_age_hours', 168)} 小时（7 天）"
+            f"——岗位挂多天是常态，仅提示可择机刷新：{'、'.join(stale[:3])}",
+            len(stale)))
     if naive:
         out.append(_finding(
             "P13_identity_freshness_credentials", "warn",

@@ -2,7 +2,7 @@
   "version": "2.0",
   "updated": "2026-10-22",
   "why": "验收标准不应该由写代码的同一个人在同一个会话里当场写。那样得到的体检与被体检的东西出自同一个心智模型，天生有相同的盲区——2026-10-22 上午就是这么连续漏掉三类缺陷的，独立审计构造的 17 条单缺陷记录把原版验收器全部放行。本规格的条目来自**消费者（求职者）要回答的问题**，与实现无关；检查器按性质（property）而不是按字段清单来判定，因此能覆盖写规格时没想到的具体情形。",
-  "version_note": "2.0 相对 1.0 的改动：删掉恒假的 P8；P9/P10 改为委托 scripts/semantics.py 的 check_invariants（单一实现，不再在验收器里抄第二份正则）；P5 收紧（通用词不算命中）并降级为信号；P4 改为真正的身份判定；P2 的登记字段表从实现搬进规格（验收器不再与实现同源）；新增 P11/P12/P13 三条性质；每条性质补 `counterexample`（什么样的记录应该让它变红）。",
+  "version_note": "2.0 相对 1.0 的改动：删掉恒假的 P8；P9/P10 改为委托 scripts/semantics.py 的 check_invariants（单一实现，不再在验收器里抄第二份正则）；P5 收紧（通用词不算命中）并降级为信号；P4 改为真正的身份判定；P2 的登记字段表从实现搬进规格（验收器不再与实现同源）；新增 P11/P12/P13 三条性质；每条性质补 `counterexample`（什么样的记录应该让它变红）。 2026-10-28：link_max_age_hours 24→168（岗位挂多天是常态，7 天内不算老；超过只做 warn）。",
   "questions": [
     {
       "id": "who_is_the_company",
@@ -218,7 +218,7 @@
   "thresholds": {
     "keyword_hit_rate_min": 0.6,
     "city_match_rate_min": 0.95,
-    "link_max_age_hours": 24,
+    "link_max_age_hours": 168,
     "jd_min_length": 120
   },
   "thresholds_note": "jd_min_length 只作记录：JD 长度的**判定实现**在 scripts/semantics.py 的 check_invariants（单一实现，验收器不再持有第二份正则）。",
