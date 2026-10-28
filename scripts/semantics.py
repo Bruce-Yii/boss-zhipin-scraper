@@ -556,12 +556,14 @@ def drop_junk_jobs(jobs):
             # 名字没问题才留；JD 里明着卖货（提成/业绩/回款/签单那套）的，
             # 标题再 AI 也删——只预警等于留垃圾。
             sales_hits = [t for t in _SALES_JD_TERMS if t in jlow]
-            # 2026-10-28 修正：标题已有强 AI 证据（AI/AIGC/Agent…）且只命中
-            # 薪酬类词（提成/佣金/业绩考核）时，按"薪资结构"处理而不当卖货——
-            # 例如「AI原生服务运营师（ANSO）」JD 只是写了提成，被误删。
+            # 2026-10-28 修正：标题或 JD 已有 AI 证据、且只命中薪酬类词
+            # （提成/佣金/业绩考核）时，按"薪资结构"处理而不当卖货——
+            # 例如「AI原生服务运营师（ANSO）」、AI 内容公司的账号运营岗，
+            # JD 只是写了提成，被误删。
             comp_only = set(sales_hits) <= {"提成", "佣金", "业绩考核"}
-            strong_ai = _ai_evidence_level(title, "", skills) == "strong"
-            if sales_hits and not (strong_ai and comp_only):
+            has_ai = bool(_ai_evidence_level(title, "", skills)
+                          or _ai_evidence_level(title, jd, skills))
+            if sales_hits and not (has_ai and comp_only):
                 reason = "销售岗（JD）"
                 dropped["sales"] += 1
             # 标题带 AI（产品/运营岗名）→ 名字没问题，不再拿 JD 查 AI，直接留；

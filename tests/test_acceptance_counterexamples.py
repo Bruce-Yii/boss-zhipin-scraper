@@ -323,11 +323,22 @@ class AcceptanceCounterexampleTests(unittest.TestCase):
         self.assertTrue(any("securityId" in h["detail"] for h in hits),
                         f"应点名 securityId：{hits}")
 
-    def test_c21_stale_link_verified_at_is_red(self):
+    def test_c21_two_day_old_link_is_ok(self):
         job = _record(link_verified_at=_ago(48))
         ok, findings = self._check(_payload([job]))
-        self.assertFalse(ok)
-        self._assert_red(findings, "P13_identity_freshness_credentials")
+        self.assertTrue(ok)
+        stale = [f for f in findings
+                 if f.get("id") == "P13_identity_freshness_credentials"
+                 and "超过" in str(f.get("detail"))]
+        self.assertEqual(stale, [])
+
+    def test_c21b_link_older_than_7_days_is_warn(self):
+        job = _record(link_verified_at=_ago(24 * 8))
+        ok, findings = self._check(_payload([job]))
+        self.assertTrue(ok)
+        hits = self._assert_red(findings, "P13_identity_freshness_credentials",
+                                "warn")
+        self.assertIn("7 天", hits[0]["detail"])
 
     def test_c22_naive_timestamp_is_warn_not_silent(self):
         job = _record(link_verified_at="2026-10-20T10:00:00")

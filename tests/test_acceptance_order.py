@@ -83,8 +83,8 @@ class AcceptanceOrderTests(unittest.TestCase):
             self.assertEqual(bad, [])
 
     def test_stale_stamp_survives_merge_and_is_reported(self):
-        """旧戳重合并：P13 要在产物验收里报超 24 小时（issue #142 的预期）。"""
-        old_stamp = (datetime.now(UTC) - timedelta(hours=30)).isoformat()
+        """旧戳重合并：>7 天的 P13 时效提示要跟着产物走（2026-10-28 口径）。"""
+        old_stamp = (datetime.now(UTC) - timedelta(days=8)).isoformat()
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "jobs.json")
             payload = {

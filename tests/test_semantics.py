@@ -545,6 +545,15 @@ class DropJunkTests(unittest.TestCase):
         self.assertEqual([j["job_id"] for j in kept], ["a"])
         self.assertEqual(dropped["sales"], 0)
 
+    def test_sales_jd_compensation_only_keeps_jd_ai_evidence(self):
+        """标题不带 AI、但 JD 有 AI 证据 + 只命中薪酬词（提成）→ 不删。"""
+        kept, dropped = self._drop([
+            {"job_id": "a", "title": "账号运营实习生", "company_name": "X",
+             "jd": "AI 内容公司账号运营，负责 TikTok 矩阵与 AI 合规诊断；薪资含提成"},
+        ])
+        self.assertEqual([j["job_id"] for j in kept], ["a"])
+        self.assertEqual(dropped["sales"], 0)
+
     def test_sales_jd_action_words_still_dropped_for_ai_title(self):
         """AI 标题 + JD 明着卖货（签单/客户资源）→ 仍删。"""
         kept, dropped = self._drop([
