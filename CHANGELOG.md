@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 交付物合并重复发布（issue #217）：`--from-db`/`--from-artifacts` 重建默认把"同标题+同公司+同城市"的多条发布合并为一条（保留 JD 最完整的一条），新增 `duplicate_count` / `duplicate_job_ids` 追溯被合并的 job_id，meta 记 `dedupe`；`--no-dedupe` 关闭、文件模式可用 `--dedupe` 打开。真实库 407 → **395 条**（12 组、去掉 12 条）。
 - ask why 口径修正（issue #211）：结论以**最新构建的交付物**为准——旧交付物里保留、最新口径已删的岗位（如 AI 新媒体）现在正确回答"删除（最新交付物里规则剔除）"，不再因历史文件里有记录就说"保留"；`data.current` 带当前口径元信息。+1 测试。
 - 使用层 P1（issue #209）：① 交付物原地重建"有变化才归档旧版"到 `archive/<name>_prev_<ts>.json`，`ask diff` 因此能回答"跟上一版比 +新增/−消失/保持"；② `ask status` 增加资产行（JD 版本/标记/重复组/岗位状态），真实库显示 1414 版本、2298 标记、74 个重复组；③ `ask diff` 默认取最新构建口径，模糊口径取最新，避免对话里被多口径歧义挡住。
 - 使用层 P0（issue #207，Agent 会话原生）：① 资产库 schema v3——`jobs` 规范化列、`job_versions`（JD/标题/薪资历史）、`job_flags`、`runs` 元数据，`scripts/assets_migrate.py` 幂等迁移/回填（真实库 2758 jobs / 1414 版本 / 2298 flags，二次迁移全 0）；② 交互层 `scripts/ask.py` + `--ask status|today|why <job_id>|diff [口径]|templates` + `--batches`（只读、不拿锁、不发网络、`--json` 纯 JSON），AGENTS/SKILL 明确"用户只在对话里问、CLI 只是 agent 转发入口；不做 xlsx/固定报告/Web"；③ 爬取低风险三项——详情断点续跑（`pending/details_<run_id>.json`，同口径优先、成功即删、kill -9 安全）、模板 `max_details`/`detail_budget` 按口径限流、`batch_health.jsonl` 批次健康度；④ 交付物 meta 记录 `ruleset_version`。真实库已迁移；`python -m pytest tests` 全量见集成记录。

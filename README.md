@@ -371,6 +371,7 @@ python3 scripts/boss_cdp_raw.py --daily --json
 - **Agent 会话内问答**：用户只在对话里问（"今天怎么样""这条为什么没上榜""跟昨天比呢"），由 agent 调内部只读 API 回答；`--ask status|today|why <job_id>|diff [口径]|templates` 与 `--batches` 只是 agent 的转发入口，不是面向用户的命令面。实现见 `scripts/ask.py`。
 - **资产库 v3**：`boss.db` 的 `jobs` 增加规范化列（title/company/salary/recruit_type/state/content_hash/canonical_id 等）、新增 `job_versions`（JD/标题/薪资变化历史）与 `job_flags`、`runs` 补 scope/template/ruleset_version/预算等元数据；`scripts/assets_migrate.py --json` 幂等迁移/回填（`--dry-run` 只读）。交付物 meta 记录 `ruleset_version`。
 - **断点续跑**：详情队列写 `~/.boss-zhipin-scraper/pending/details_<run_id>.json`，中断/预算截断后下次同口径优先续跑，不重复抓已有 JD；日常模板支持 `max_details`（或 `detail_budget`）按口径限流。
+- **重复发布合并**：`--from-db`/`--from-artifacts` 重建交付物时，默认把"同标题+同公司+同城市"的多条发布合并为一条（保留 JD 最完整的一条），字段 `duplicate_count`/`duplicate_job_ids` 可追溯；`--no-dedupe` 关闭，文件模式可用 `--dedupe` 打开。
 
 ## 文件结构
 

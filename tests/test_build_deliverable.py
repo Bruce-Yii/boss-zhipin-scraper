@@ -372,6 +372,36 @@ class BuildFromArtifactsTests(unittest.TestCase):
             self.assertEqual([j["job_id"] for j in json.load(handle)["jobs"]],
                              ["a"])
 
+    def test_dedupe_same_title_company_city(self):
+        """同标题+同公司+同城市的多条重复发布合并为一条（2026-10-28）。"""
+        write_json(self.result_dir, "boss_jobs_20261028_130000_3.json", {
+            "keyword": "AI产品实习", "city": "杭州", "format_version": 2,
+            "scraped_at": "2026-10-28T13:00:00+08:00",
+            "jobs": [_job("d", title="AIGC实习生"),
+                     _job("e", title="AIGC实习生")],
+        })
+        write_json(self.result_dir, "boss_details_20261028_130000_3.json",
+                   [_detail("d"), _detail("e")])
+        args = ["--result-dir", self.result_dir, "--from-artifacts",
+                "--city", "杭州", "--recruit-type", "intern",
+                "--exclude-job-ids-file", self.exclude_path,
+                "--target", self.target]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.module.main(args), 0)
+        with open(self.target, encoding="utf-8") as handle:
+            final = json.load(handle)
+        self.assertEqual(sorted(j["job_id"] for j in final["jobs"]), ["a", "d"])
+        merged = [j for j in final["jobs"] if j["job_id"] == "d"][0]
+        self.assertEqual(merged["duplicate_count"], 2)
+        self.assertEqual(merged["duplicate_job_ids"], ["e"])
+        self.assertEqual(final["dedupe"]["groups"], 1)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self.module.main(args + ["--no-dedupe"]), 0)
+        with open(self.target, encoding="utf-8") as handle:
+            ids = sorted(j["job_id"] for j in json.load(handle)["jobs"])
+        self.assertEqual(ids, ["a", "d", "e"])
+
     def test_exclude_file_formats(self):
         for payload in (["x", "y"], {"job_ids": ["x"]}, "x,y"):
             path = os.path.join(self.result_dir, "e.json")

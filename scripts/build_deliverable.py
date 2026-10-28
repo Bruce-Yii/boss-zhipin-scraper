@@ -33,6 +33,7 @@ import csv
 import json
 import os
 import pathlib
+import re
 import shutil
 import sqlite3
 import sys
@@ -96,6 +97,80 @@ def _archive_previous_deliverable(target, result_dir):
     except OSError as exc:
         print(f"⚠️  上一版归档失败（不影响本次产出）：{exc}")
         return ""
+
+
+def _dedupe_key(job):
+    """交付物内去重键：规范化标题 + 公司 + 城市（不合并跨城同岗）。"""
+    title = semantics.normalize_title(str(job.get("title") or "")).lower()
+    company = re.sub(r"[\s（）()·・\-—_]+", "",
+                     str(job.get("company_name") or "")).lower()
+    city = str(job.get("city") or "").strip()
+    if not city:
+        city = str(job.get("location") or "").split("·")[0].strip()
+    if not title or not company:
+        return None
+    return (title, company, city)
+
+
+def _dedupe_jobs(jobs):
+    """同标题+同公司+同城市的多条发布合并为一条（保留 JD 最完整的一条）。
+
+    返回 ``(deduped_jobs, info)``；不物理删除数据，被合并的 job_id 记在
+    ``duplicate_job_ids`` 里，可追溯。
+    """
+    groups = {}
+    order = []
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        key = _dedupe_key(job)
+        if key is None:
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(job)
+    dropped_ids = set()
+    info = {"groups": 0, "removed": 0, "examples": []}
+    deduped = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            item = dict(group[0])
+            # 合并后不再沿用旧的重复组标记（避免 dup_size 与实际成员数不符）
+            item.pop("duplicate_group_id", None)
+            item.pop("dup_size", None)
+            deduped.append(item)
+            continue
+        best = max(group, key=lambda item: (
+            str(item.get("link_verified_at") or item.get("page_update_date") or ""),
+            len(str(item.get("jd") or ""))))
+        # 同一时间/同一 JD 完整度时取 job_id 最小，保证重建确定性
+        best_rank = (
+            str(best.get("link_verified_at") or best.get("page_update_date") or ""),
+            len(str(best.get("jd") or "")))
+        tied = [item for item in group
+                if (str(item.get("link_verified_at")
+                        or item.get("page_update_date") or ""),
+                    len(str(item.get("jd") or ""))) == best_rank]
+        best = min(tied, key=lambda item: str(item.get("job_id") or ""))
+        kept = dict(best)
+        kept.pop("duplicate_group_id", None)
+        kept.pop("dup_size", None)
+        others = [item for item in group if item is not best]
+        kept["duplicate_count"] = len(group)
+        kept["duplicate_job_ids"] = sorted(
+            str(item.get("job_id")) for item in others)
+        deduped.append(kept)
+        dropped_ids.update(str(item.get("job_id")) for item in others)
+        info["groups"] += 1
+        info["removed"] += len(others)
+        if len(info["examples"]) < 10:
+            info["examples"].append({
+                "title": kept.get("title"), "company": kept.get("company_name"),
+                "kept": kept.get("job_id"), "removed": kept["duplicate_job_ids"],
+            })
+    return deduped, info
 
 
 def load_exclude_ids(path):
@@ -581,6 +656,20 @@ def build(args):
 
     with open(target, encoding="utf-8") as handle:
         final = json.load(handle)
+    if not args.no_dedupe and (prefer_base or args.dedupe):
+        deduped, dedupe_info = _dedupe_jobs(final.get("jobs") or [])
+        if dedupe_info["removed"]:
+            final["jobs"] = deduped
+            final["job_count"] = len(deduped)
+            final["total"] = len(deduped)
+            final["dedupe"] = dedupe_info
+            try:
+                ec.attach_acceptance_result(final, source_path=target)
+            except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+                pass
+            ec._atomic_write_export_json(target, final)
+            print(f"合并重复发布: {dedupe_info['groups']} 组，去掉 "
+                  f"{dedupe_info['removed']} 条（保留 JD 最完整的一条）")
     print(f"最终条数: {final.get('job_count')}")
     print(f"删库: {len(final.get('dropped_junk') or [])} 条")
     print(f"疑似销售(预警): {len(final.get('suspect_sales_jd') or [])} 条")
@@ -671,6 +760,10 @@ def main(argv=None):
                         help="保留销售/技术/噪声岗（排查用，默认删库）")
     parser.add_argument("--no-csv", action="store_true",
                         help="只写 JSON，不写 CSV")
+    parser.add_argument("--no-dedupe", action="store_true",
+                        help="不合并同标题+同公司+同城市的多条重复发布（默认 from-db/from-artifacts 合并）")
+    parser.add_argument("--dedupe", action="store_true",
+                        help="文件模式也合并重复发布（默认只在 from-db/from-artifacts 合并）")
     args = parser.parse_args(argv)
     # 相对路径都按 result-dir 解析
     if args.lists:
