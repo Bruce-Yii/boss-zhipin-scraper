@@ -370,6 +370,7 @@ python3 scripts/boss_cdp_raw.py --daily --json
 - **Agent-session Q&A**: the user only asks in-conversation ("how is today", "why is this job excluded", "diff vs yesterday"); the agent calls internal read-only APIs. `--ask status|today|why <job_id>|diff [scope]|templates` and `--batches` are agent forwarding entry points, not a user-facing command surface. Implementation: `scripts/ask.py`.
 - **Asset store v3**: `boss.db` gains normalized `jobs` columns (title/company/salary/recruit_type/state/content_hash/canonical_id), `job_versions` (JD/title/salary history), `job_flags`, and `runs` metadata (scope/template/ruleset_version/budget); `scripts/assets_migrate.py --json` performs idempotent migration/backfill (`--dry-run` is read-only). Deliverable meta records `ruleset_version`.
 - **Resume**: the detail queue is persisted to `~/.boss-zhipin-scraper/pending/details_<run_id>.json`; after an interruption or budget cutoff the next same-scope run resumes first and never refetches existing JDs. Daily templates support `max_details` (alias `detail_budget`) to cap per-scope detail fetches.
+- **Duplicate-post merge**: `--from-db`/`--from-artifacts` rebuilds merge postings with the same title + company + city into one row (keeping the most complete JD) by default; `duplicate_count`/`duplicate_job_ids` preserve provenance. Disable with `--no-dedupe`; file mode can opt in with `--dedupe`.
 
 ## File Structure
 

@@ -193,7 +193,9 @@
     "tier_evidence",
     "tier",
     "company",
-    "link"
+    "link",
+    "duplicate_count",
+    "duplicate_job_ids"
   ],
   "field_registry_note": "登记字段表是**消费者契约**：登记在这里的字段才允许出现在产物里。它故意**不从实现（job_model.FIELD_INDEX）读取**——2026-10-22 独立审计结论：验收器与被验收物同源时，结构上不可能发现实现自身的错误（模型多一个没人问的字段，验收器照样放行）。平台内部字段（security_id/lid/encrypt_*）**不在**表里，且单列为 forbidden_fields（红线）。",
   "field_types": {
